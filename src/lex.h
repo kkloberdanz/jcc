@@ -3,12 +3,11 @@
 
 #include "token.h"
 
+/* Tokenize the whole input set with lex_set_text; ends with a TOK_EOF */
 TokList *lex(void);
+void lex_cleanup(void);     /* free the list a fatal error interrupted lex() on, if any */
 
-void lex_set_file(FILE *fp);
-
-char *lex_current_line(void);
-
-char *lex_current_filename(void);
+/* the preprocessed translation unit, with `# line "file"` markers; the text is the caller's and is not kept */
+void lex_set_text(const char *text);
 
 #endif /* LEX_H */

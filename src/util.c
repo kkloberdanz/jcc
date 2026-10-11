@@ -1,25 +1,36 @@
-#include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
 
 #include "util.h"
+#include "diag.h"
 
-void err_msg(const char *msg) {
-    const size_t len = strlen(msg);
-    const char *prog_name = "kcc: ";
-
-    if (write(STDERR_FILENO, prog_name, strlen(prog_name)) < 0) {
-        /* if write to stderr failes, something really bad has happened */
-        exit(EXIT_FAILURE);
+void *xmalloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) {
+        fatal("out of memory");
     }
-    if (write(STDERR_FILENO, msg, len) < 0) {
-        exit(EXIT_FAILURE);
-    }
+    return p;
 }
 
-void syntax_error(const char *code, size_t lineno, size_t col) {
-    fprintf(stderr, "syntax error: line: %zu, col: %zu: %s\n",
-        lineno, col, code
-    );
+void *xcalloc(size_t n, size_t size) {
+    void *p = calloc(n, size);
+    if (!p) {
+        fatal("out of memory");
+    }
+    return p;
+}
+
+void *xrealloc(void *p, size_t n) {
+    p = realloc(p, n);
+    if (!p) {
+        fatal("out of memory");
+    }
+    return p;
+}
+
+char *xstrdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = xmalloc(n);
+    memcpy(p, s, n);
+    return p;
 }

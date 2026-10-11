@@ -1,0 +1,218 @@
+# GCC torture tests kcc is known to fail: name, then why (tests/run-gcc-torture.sh reads this;
+# a test that starts passing is reported as XPASS and should be removed here).
+20000223-1 implicit int function declaration in a block
+20000722-1 compound literals
+20000801-3 empty struct or {} initializer
+20000917-1 compound literals
+20001009-2 extended asm
+20010122-1 __builtin_return_address
+20010123-1 compound literals
+20010518-2 compound literals
+20020107-1 extended asm
+20020206-1 compound literals
+20020206-2 compound literals
+20020215-1 compound literals
+20021127-1 expects llabs folded as a builtin even when the program defines it
+20030109-1 empty struct or {} initializer
+20030222-1 extended asm
+20030224-2 compound literals
+20030323-1 __builtin_return_address
+20030408-1 GNU old-style designators (a: value)
+20030811-1 __builtin_return_address
+20040302-1 computed goto
+20040411-1 variable length arrays
+20040709-1 __builtin_classify_type
+20040709-2 __builtin_classify_type
+20040709-3 __builtin_classify_type
+20040811-1 variable length arrays
+20041124-1 _Complex on an integer type (GNU)
+20041201-1 _Complex on an integer type (GNU)
+20041214-1 computed goto
+20050121-1 _Complex on an integer type (GNU)
+20050203-1 extended asm
+20050316-1 vector types
+20050316-2 vector types
+20050316-3 vector types
+20050604-1 vector types
+20050607-1 vector types
+20050929-1 compound literals
+20061031-1 extended asm
+20071029-1 compound literals
+20071120-1 empty struct or {} initializer
+20071202-1 compound literals
+20071210-1 computed goto
+20071211-1 lexical error: expected '('
+20071220-1 extended asm
+20071220-2 extended asm
+20080122-1 extended asm
+20080502-1 __builtin_signbit
+20090113-2 empty struct or {} initializer
+20090113-3 empty struct or {} initializer
+920302-1 computed goto
+920501-3 computed goto
+920501-4 computed goto
+920501-5 computed goto
+920721-2 variable length arrays
+920929-1 variable length arrays
+930406-1 local labels (__label__)
+960312-1 extended asm
+960416-1 cast to non-scalar type union (anonymous)
+970217-1 variable length arrays
+980526-1 computed goto
+990130-1 extended asm
+990208-1 computed goto
+991228-1 GNU old-style designators (a: value)
+align-3 __alignof__ expression
+bcp-1 __builtin_constant_p
+bf-pack-1 attribute after a bit-field width
+bswap-2 compound literals
+builtin-bitops-1 __builtin_clrsb
+builtin-constant __builtin_constant_p
+builtin-types-compatible-p typeof
+comp-goto-1 computed goto
+complex-6 _Complex on an integer type (GNU)
+compndlit-1 compound literals
+enum-3 arithmetic on void *
+frame-address __builtin_frame_address
+memclr variadic macros
+memcpy-a1 variadic macros
+memcpy-a2 variadic macros
+memcpy-a4 variadic macros
+memcpy-a8 variadic macros
+misalign variadic macros
+pr103209 empty struct or {} initializer
+pr103376 extended asm
+pr104604 _Complex on an integer type (GNU)
+pr105613 vector types
+pr108498-1 extended asm
+pr108498-2 compound literals
+pr109040 vector types
+pr110252-2 extended asm
+pr110817-1 vector types
+pr110817-2 vector types
+pr110817-3 vector types
+pr114207 compound literals
+pr114552 extended asm
+pr121957 extended asm
+pr122000 __sync_* atomics
+pr123625 vector types
+pr123625-2 vector types
+pr123625-3 extended asm
+pr123978 C23 attributes [[...]]
+pr124358 C23 attributes [[...]]
+pr125291 C23 attributes [[...]]
+pr126405 vector types
+pr126405-2 vector types
+pr17377 __builtin_return_address
+pr19449 non-constant static initializer GCC folds
+pr19687 empty struct or {} initializer
+pr22061-1 variable length arrays
+pr22061-2 variable length arrays
+pr22098-1 compound literals
+pr22098-2 compound literals
+pr22098-3 compound literals
+pr22141-1 compound literals
+pr22141-2 compound literals
+pr23135 vector types
+pr23324 empty struct or {} initializer
+pr23467 aligned attribute on a member
+pr28982b empty struct or {} initializer
+pr34154 variadic macros
+pr35456 __builtin_signbit
+pr38151 _Complex on an integer type (GNU)
+pr38533 extended asm
+pr40022 extended asm
+pr40657 extended asm
+pr41239 extended asm
+pr43220 variable length arrays
+pr43385 extended asm
+pr43560 extended asm
+pr44164 compound literals
+pr44852 extended asm
+pr45695 extended asm
+pr46309 extended asm
+pr47925 extended asm
+pr49218 extended asm
+pr49279 extended asm
+pr49390 extended asm
+pr51581-1 extended asm
+pr51581-2 extended asm
+pr51877 extended asm
+pr51933 extended asm
+pr52286 extended asm
+pr52979-1 empty struct or {} initializer
+pr52979-2 empty struct or {} initializer
+pr53645 extended asm
+pr53645-2 extended asm
+pr56205 extended asm
+pr56837 _Complex on an integer type (GNU)
+pr56866 extended asm
+pr56982 lexical error: expected '('
+pr57130 compound literals
+pr57344-1 extended asm
+pr57344-2 extended asm
+pr57344-3 extended asm
+pr57344-4 extended asm
+pr57568 empty struct or {} initializer
+pr58277-1 extended asm
+pr58277-2 empty struct or {} initializer
+pr58419 extended asm
+pr60960 vector types
+pr63641 extended asm
+pr65053-1 extended asm
+pr65053-2 extended asm
+pr65427 vector types
+pr65648 extended asm
+pr65956 extended asm
+pr68249 GNU ?: without a middle operand
+pr68328 extended asm
+pr68532 _Alignas
+pr69320-2 extended asm
+pr69691 extended asm
+pr70460 computed goto
+pr70903 vector types
+pr71626-1 vector types
+pr71626-2 subscripted value of type long is not an array or pointer
+pr77767 variable length arrays
+pr78438 extended asm
+pr78726 extended asm
+pr79286 empty struct or {} initializer
+pr79354 extended asm
+pr79737-2 extended asm
+pr80421 extended asm
+pr81588 extended asm
+pr82524 compound literals
+pr82954 extended asm
+pr84478 extended asm
+pr84524 extended asm
+pr85156 extended asm
+pr85169 vector types
+pr85756 extended asm
+pr86714 initializer string longer than the array
+pr88904 extended asm
+pr90949 empty struct or {} initializer
+pr92618 vector types
+pr93945 extended asm
+pr94130 extended asm
+pr94412 vector types
+pr94524-1 vector types
+pr94524-2 vector types
+pr97764 empty struct or {} initializer
+pr98366 compound literals
+restrict-1 compound literals
+return-addr __builtin_return_address
+scal-to-vec1 vector types
+scal-to-vec2 vector types
+scal-to-vec3 vector types
+simd-1 vector types
+simd-2 vector types
+simd-4 vector types
+simd-6 vector types
+stkalign extended asm
+strcpy-2 empty struct or {} initializer
+struct-ini-4 GNU old-style designators (a: value)
+va-arg-22 typeof
+vla-dealloc-1 variable length arrays
+zero-struct-1 empty struct or {} initializer
+zero-struct-2 empty struct or {} initializer
+zerolen-2 __alignof__ expression

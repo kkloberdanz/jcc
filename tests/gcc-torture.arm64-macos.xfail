@@ -1,0 +1,2 @@
+# expected failures on arm64 macOS only
+string-opt-18 mempcpy is not in the macOS libc

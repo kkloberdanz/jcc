@@ -5,3 +5,7 @@ a.out
 core
 src/arch.c
 y.tab.c
+kcc-*
+libkcc.a
+csmith-fail/
+dist/

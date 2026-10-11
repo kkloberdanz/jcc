@@ -1,0 +1,1 @@
+# c-testsuite tests kcc is known to fail on the x86_64 target only (see tests/c-testsuite.xfail).

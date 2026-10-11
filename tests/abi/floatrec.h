@@ -1,0 +1,52 @@
+/* records with floating point members, and __int128, passed and returned by value across the compiler boundary */
+struct F1 { float a; };
+struct F3 { float a, b, c; };
+struct F4 { float a[4]; };
+struct D2 { double a, b; };
+struct D4 { double a, b, c, d; };
+struct FD { float a; double b; };
+struct IF { int a; float b; };
+struct IFF { int a; float b, c; };
+struct DI { double a; int b; };
+struct Big { double a, b, c, d, e; };
+struct CF { char c; float f; };
+union UD { double d; float f[2]; };
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+struct F1 make_f1(float a);
+struct F3 make_f3(float a, float b, float c);
+struct F4 make_f4(float a);
+struct D2 make_d2(double a, double b);
+struct D4 make_d4(double a);
+struct FD make_fd(float a, double b);
+struct IF make_if(int a, float b);
+struct IFF make_iff(int a, float b, float c);
+struct DI make_di(double a, int b);
+struct Big make_big(double a);
+struct CF make_cf(char c, float f);
+union UD make_ud(float a, float b);
+double sum_f1(struct F1 s);
+double sum_f3(struct F3 s);
+double sum_f4(struct F4 s);
+double sum_d2(struct D2 s);
+double sum_d4(struct D4 s);
+double sum_fd(struct FD s);
+double sum_if(struct IF s);
+double sum_iff(struct IFF s);
+double sum_di(struct DI s);
+double sum_big(struct Big s);
+double sum_cf(struct CF s);
+double sum_ud(union UD u);
+/* registers run out: the later records and scalars go on the stack */
+double spill(struct D2 a, struct D4 b, struct F3 c, struct F4 d, int i, struct IF e, double x, struct F1 f, long l, struct D2 g, float h);
+double vsum(int n, ...);
+i128 add_i128(i128 a, i128 b);
+u128 mul_u128(u128 a, u128 b);
+i128 many_i128(int a, i128 b, int c, i128 d, int e, i128 f, i128 g, int h, i128 i);
+i128 vsum_i128(int n, ...);
+double to_double(i128 a);
+i128 from_double(double d);
+/* the caller's side, called back from the callee */
+double caller_sum(struct F3 a, struct D2 b, struct IFF c, struct Big d, i128 e);
+struct D4 caller_make_d4(double a);
