@@ -1,10 +1,10 @@
 #!/bin/sh
 # Build Csmith (github.com/csmith-project/csmith), the random C program
-# generator, into $CSMITH (default ~/.local/share/kcc/csmith) for
+# generator, into $CSMITH (default ~/.local/share/jcc/csmith) for
 # tests/run-csmith.sh: the generator at $CSMITH/bin/csmith and its runtime
 # header csmith.h under $CSMITH/include. Needs cmake and m4. Safe to rerun.
 set -e
-DIR=${CSMITH:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc/csmith}
+DIR=${CSMITH:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/csmith}
 if [ -d "$DIR/src/.git" ]; then
     git -C "$DIR/src" pull -q --ff-only
 else

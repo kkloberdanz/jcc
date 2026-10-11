@@ -3048,7 +3048,7 @@ static void sema_function(AST *fdef) {
         /*
          * GNU89 `extern inline`: a definition that exists only to be inlined
          * and must not produce an external symbol (the macOS headers define
-         * __sputc and the fd_set helpers this way in every unit). kcc never
+         * __sputc and the fd_set helpers this way in every unit). jcc never
          * inlines, so give it internal linkage: emitted once per unit, as a
          * local symbol, and only when something in the unit calls it.
          */

@@ -5,7 +5,7 @@
 #include <stdio.h>
 
 /* the compiler is written for LP64 hosts: `long` carries every 64 bit target value */
-typedef char kcc_requires_64_bit_long[sizeof(long) == 8 ? 1 : -1];
+typedef char jcc_requires_64_bit_long[sizeof(long) == 8 ? 1 : -1];
 
 /*
  * What the front end needs to know about the target: the width and

@@ -331,7 +331,7 @@ static int is_logical_imm32(unsigned long v) {
 static void a64_cg_begin(FILE *out) {
     a64_cg_out = out;
     a64_nlabels = 0;
-    peep_begin(out, a64_peep_rules, getenv("KCC_NOPEEP") == NULL);
+    peep_begin(out, a64_peep_rules, getenv("JCC_NOPEEP") == NULL);
 }
 
 static void a64_cg_end(void) {
@@ -2366,7 +2366,7 @@ static void a64_cg_select(IRFunc *f) {
 #include "predef_arm64_macos.h"
 
 static const char *const a64_system_dirs[] = {
-    KCC_ARM64_MACOS_RESOURCE_INC,   /* the compiler's own headers: stddef.h, stdarg.h, ... */
+    JCC_ARM64_MACOS_RESOURCE_INC,   /* the compiler's own headers: stddef.h, stdarg.h, ... */
     "=/usr/include",
     NULL
 };
@@ -2382,7 +2382,7 @@ static const char *const a64_has_builtins[] = {
 };
 
 static const CppTarget a64_cpp_target = {
-    KCC_ARM64_MACOS_SYSROOT,
+    JCC_ARM64_MACOS_SYSROOT,
     a64_system_dirs,
     a64_predefined_macros,
     a64_nonstrict_macros,

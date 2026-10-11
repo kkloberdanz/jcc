@@ -13,7 +13,7 @@ ARM64_MACOS_SYSROOT?=$(shell xcrun --show-sdk-path)
 ARM64_MACOS_RESOURCE_INC?=$(shell cc -print-resource-dir)/include
 # the Linux sysroot, which tools/sysroot.sh fills from Docker; also used by the x86_64 tests
 # where tools/sysroot.sh puts it: under XDG_DATA_HOME, since the compiler depends on it
-X86_64_SYSROOT?=$(or $(XDG_DATA_HOME),$(HOME)/.local/share)/kcc/x86_64-linux-musl
+X86_64_SYSROOT?=$(or $(XDG_DATA_HOME),$(HOME)/.local/share)/jcc/x86_64-linux-musl
 else
 ARM64_MACOS_SYSROOT?=/
 ARM64_MACOS_RESOURCE_INC?=/
@@ -27,10 +27,10 @@ ifeq ($(X86_64_GCC_VER),)
 X86_64_GCC_VER=13.2.1
 endif
 X86_64_LINUX_GCC_DIR?==/usr/lib/gcc/x86_64-alpine-linux-musl/$(X86_64_GCC_VER)
-TARGET_DEFS=-DKCC_ARM64_MACOS_SYSROOT='"$(ARM64_MACOS_SYSROOT)"' \
-    -DKCC_ARM64_MACOS_RESOURCE_INC='"$(ARM64_MACOS_RESOURCE_INC)"' \
-    -DKCC_X86_64_LINUX_SYSROOT='"$(X86_64_LINUX_SYSROOT)"' \
-    -DKCC_X86_64_LINUX_GCC_DIR='"$(X86_64_LINUX_GCC_DIR)"'
+TARGET_DEFS=-DJCC_ARM64_MACOS_SYSROOT='"$(ARM64_MACOS_SYSROOT)"' \
+    -DJCC_ARM64_MACOS_RESOURCE_INC='"$(ARM64_MACOS_RESOURCE_INC)"' \
+    -DJCC_X86_64_LINUX_SYSROOT='"$(X86_64_LINUX_SYSROOT)"' \
+    -DJCC_X86_64_LINUX_GCC_DIR='"$(X86_64_LINUX_GCC_DIR)"'
 
 SRC=$(wildcard src/*.c)
 ARCH_SRC=$(wildcard src/arch/arch.*.c)
@@ -40,34 +40,34 @@ INC=$(wildcard src/*.h) $(wildcard src/as/*.h)
 
 .PHONY: release
 release: OPT:=-Os -flto -fvisibility=hidden
-release: kcc
+release: jcc
 
 .PHONY: static
 static: OPT:=-Os -flto -fvisibility=hidden -static
 static: CC:=musl-gcc
-static: kcc
+static: jcc
 
 .PHONY: debug
-debug: kcc
+debug: jcc
 debug: OPT:=-O0 -ggdb3 -DDEBUG
 
 .PHONY: sanitize
-sanitize: kcc
+sanitize: jcc
 sanitize: OPT:=-O0 -ggdb3 -fsanitize=address
 
 .PHONY: warn-everything
-warn-everything: kcc
+warn-everything: jcc
 warn-everything: CC=clang -Weverything -Werror -Wno-padded -Wno-switch-enum
 
 # the library is everything but the driver; the driver is its first client
 LIB_OBJ=$(filter-out obj/main.o,$(OBJ)) y.tab.o
 
-libkcc.a: $(LIB_OBJ) Makefile
-	rm -f libkcc.a
-	ar rcs libkcc.a $(LIB_OBJ)
+libjcc.a: $(LIB_OBJ) Makefile
+	rm -f libjcc.a
+	ar rcs libjcc.a $(LIB_OBJ)
 
-kcc: obj/main.o libkcc.a Makefile
-	$(CC) -o kcc $(CFLAGS) obj/main.o libkcc.a $(LFLAGS)
+jcc: obj/main.o libjcc.a Makefile
+	$(CC) -o jcc $(CFLAGS) obj/main.o libjcc.a $(LFLAGS)
 
 y.tab.c: src/grammar.y $(INC)
 	yacc -o y.tab.c src/grammar.y
@@ -92,7 +92,7 @@ obj:
 .PHONY: test test-O0
 test: test-O0 test-O1
 
-test-O0: kcc
+test-O0: jcc
 	sh tests/run.sh
 	sh tests/target.sh
 	sh tests/abi.sh
@@ -104,96 +104,96 @@ test-O0: kcc
 
 # the x86_64 Linux target: cross compile on this machine, assemble here, link and run in Docker
 .PHONY: test-x86_64
-test-x86_64: kcc
+test-x86_64: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/run-x86_64.sh
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/abi.sh x86_64
 
 .PHONY: pewter-x86_64
-pewter-x86_64: kcc
+pewter-x86_64: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/run-x86_64.sh pewter
 
 .PHONY: cpp-check
-cpp-check: kcc
+cpp-check: jcc
 	sh tests/cpp-check.sh
 
 # the c-testsuite conformance tests (tools/c-testsuite.sh fetches them), natively and for Linux
 .PHONY: c-testsuite c-testsuite-x86_64
-c-testsuite: kcc
+c-testsuite: jcc
 	sh tests/run-c-testsuite.sh
-c-testsuite-x86_64: kcc
+c-testsuite-x86_64: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/run-c-testsuite.sh x86_64
 
 # the second real program: Lua 5.4.8 and its test suite (tools/lua.sh fetches them)
 .PHONY: lua lua-x86_64
-lua: kcc
+lua: jcc
 	sh tests/run-lua.sh
-lua-x86_64: kcc
+lua-x86_64: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/run-lua.sh x86_64
 
 # GCC's execute torture tests (tools/gcc-torture.sh fetches them); tests/gcc-torture.xfail lists the known failures
 .PHONY: gcc-torture gcc-torture-x86_64
-gcc-torture: kcc
+gcc-torture: jcc
 	sh tests/run-gcc-torture.sh
-gcc-torture-x86_64: kcc
+gcc-torture-x86_64: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/run-gcc-torture.sh x86_64
 
 # differential testing against the host compiler on N random Csmith programs (tools/csmith.sh builds it)
 N?=100
 .PHONY: csmith csmith-x86_64
-csmith: kcc
+csmith: jcc
 	N='$(N)' SEED='$(SEED)' sh tests/run-csmith.sh
-csmith-x86_64: kcc
+csmith-x86_64: jcc
 	N='$(N)' SEED='$(SEED)' X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/run-csmith.sh x86_64
 
 # the third real program: SQLite 3.53.4's amalgamation and shell (tools/sqlite.sh fetches them)
 .PHONY: sqlite sqlite-x86_64
-sqlite: kcc
+sqlite: jcc
 	sh tests/run-sqlite.sh
-sqlite-x86_64: kcc
+sqlite-x86_64: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/run-sqlite.sh x86_64
 
 # everything: the native suites, the x86_64 ones when Docker and the sysroot are there, the same again at -O1,
 # then ASan (tests/verify.sh)
 .PHONY: verify
-verify: kcc
+verify: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' N='$(N)' sh tests/verify.sh
 
 TARGET_VARS=ARM64_MACOS_SYSROOT='$(ARM64_MACOS_SYSROOT)' ARM64_MACOS_RESOURCE_INC='$(ARM64_MACOS_RESOURCE_INC)' \
     X86_64_LINUX_SYSROOT='$(X86_64_LINUX_SYSROOT)' X86_64_LINUX_GCC_DIR='$(X86_64_LINUX_GCC_DIR)'
 
 .PHONY: selfhost
-selfhost: kcc
+selfhost: jcc
 	$(TARGET_VARS) sh tests/selfhost.sh
 
-# The optimizer under test. kcc-O1 is kcc with -O1 added, so that the
-# suites' KCC hook takes it as it is; `make X-O1` is `make X` with
-# KCC=./kcc-O1 for every suite above (test, lua, csmith-x86_64, ...).
-# The self-host is the exception: its stages are built with KCCFLAGS.
-kcc-O1: kcc Makefile
-	printf '#!/bin/sh\nexec "$$(dirname "$$0")/kcc" -O1 "$$@"\n' >kcc-O1
-	chmod +x kcc-O1
+# The optimizer under test. jcc-O1 is jcc with -O1 added, so that the
+# suites' JCC hook takes it as it is; `make X-O1` is `make X` with
+# JCC=./jcc-O1 for every suite above (test, lua, csmith-x86_64, ...).
+# The self-host is the exception: its stages are built with JCCFLAGS.
+jcc-O1: jcc Makefile
+	printf '#!/bin/sh\nexec "$$(dirname "$$0")/jcc" -O1 "$$@"\n' >jcc-O1
+	chmod +x jcc-O1
 
 .PHONY: selfhost-O1
-selfhost-O1: kcc
-	KCCFLAGS=-O1 $(TARGET_VARS) sh tests/selfhost.sh
+selfhost-O1: jcc
+	JCCFLAGS=-O1 $(TARGET_VARS) sh tests/selfhost.sh
 
-%-O1: kcc-O1
-	$(MAKE) --no-print-directory $* KCC=./kcc-O1
+%-O1: jcc-O1
+	$(MAKE) --no-print-directory $* JCC=./jcc-O1
 
 # explicit, since `make test` is both levels and the pattern rule would recurse
 .PHONY: test-O1
-test-O1: kcc-O1
-	$(MAKE) --no-print-directory test-O0 KCC=./kcc-O1
+test-O1: jcc-O1
+	$(MAKE) --no-print-directory test-O0 JCC=./jcc-O1
 
-# the library as one file (Goal 4): dist/kcc.c and dist/kcc.h, generated by tools/amalgamate.sh
+# the library as one file (Goal 4): dist/jcc.c and dist/jcc.h, generated by tools/amalgamate.sh
 .PHONY: amalgamation
-amalgamation: dist/kcc.c
-dist/kcc.c dist/kcc.h: $(SRC) $(ARCH_SRC) $(AS_SRC) $(INC) $(wildcard src/arch/*.h) y.tab.c tools/amalgamate.sh
+amalgamation: dist/jcc.c
+dist/jcc.c dist/jcc.h: $(SRC) $(ARCH_SRC) $(AS_SRC) $(INC) $(wildcard src/arch/*.h) y.tab.c tools/amalgamate.sh
 	sh tools/amalgamate.sh dist
 
-# the amalgamation built by the host compiler and by kcc, and the embed hosts against it alone (tests/amalgamation.sh)
+# the amalgamation built by the host compiler and by jcc, and the embed hosts against it alone (tests/amalgamation.sh)
 .PHONY: test-amalgamation
-test-amalgamation: kcc amalgamation
+test-amalgamation: jcc amalgamation
 	$(TARGET_VARS) sh tests/amalgamation.sh
 
 # no static name may be defined in two of the library's files, or they could not share a translation unit
@@ -204,7 +204,7 @@ statics:
 .PHONY: clean
 clean:
 	rm -f obj/* obj-*/*
-	rm -f kcc kcc-* libkcc.a
+	rm -f jcc jcc-* libjcc.a
 	rm -rf dist
 	rm -f core
 	rm -f y.tab.*

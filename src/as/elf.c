@@ -8,7 +8,7 @@
  * place of the section's first entry and present only when a relocation
  * refers to it; a relocation against a local symbol going through its
  * section symbol plus the offset, except @PLT and @GOTPCREL ones, which
- * keep the symbol. Differences from clang, on purpose: no .eh_frame (kcc
+ * keep the symbol. Differences from clang, on purpose: no .eh_frame (jcc
  * emits no CFI beyond .cfi_startproc/.cfi_endproc) and the string table
  * is not tail-merged, so st_name and sh_name indexes differ.
  */

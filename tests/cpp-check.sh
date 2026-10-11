@@ -1,6 +1,6 @@
 #!/bin/sh
-# Preprocessor check: for every test program, kcc's own sources and the
-# reference program, the syntax tree kcc builds from its own preprocessing
+# Preprocessor check: for every test program, jcc's own sources and the
+# reference program, the syntax tree jcc builds from its own preprocessing
 # must match the one it builds from clang's. Line and file information is
 # part of the dump, so the line markers are checked too. Run from the
 # repository root (make cpp-check does).
@@ -14,8 +14,8 @@ fail=0
 check() {
     name=$1; std=$2; shift 2
     base=$(basename "$name" .c)
-    if ! ./kcc -ast-dump "-std=$std" "$@" "$name" > "$tmp/$base.own" 2> "$tmp/$base.own.err"; then
-        echo "FAIL $name: kcc could not compile it with its own preprocessor"
+    if ! ./jcc -ast-dump "-std=$std" "$@" "$name" > "$tmp/$base.own" 2> "$tmp/$base.own.err"; then
+        echo "FAIL $name: jcc could not compile it with its own preprocessor"
         sed 's/^/    /' "$tmp/$base.own.err" | head -5
         fail=$((fail + 1))
         return
@@ -24,8 +24,8 @@ check() {
         echo "SKIP $name: cc cannot preprocess it"
         return
     fi
-    # the preprocessed file still goes through kcc's preprocessor, which only has to honour its line markers
-    ./kcc -ast-dump "-std=$std" "$@" "$tmp/$base.cc.c" > "$tmp/$base.ref" 2>/dev/null
+    # the preprocessed file still goes through jcc's preprocessor, which only has to honour its line markers
+    ./jcc -ast-dump "-std=$std" "$@" "$tmp/$base.cc.c" > "$tmp/$base.ref" 2>/dev/null
     # columns depend on how each preprocessor spaces its output, so only lines are compared
     sed 's/<\([^<>]*:\)\{0,1\}\([0-9]*\):[0-9]*>/<\1\2>/g' "$tmp/$base.own" > "$tmp/$base.own.l"
     sed 's/<\([^<>]*:\)\{0,1\}\([0-9]*\):[0-9]*>/<\1\2>/g' "$tmp/$base.ref" > "$tmp/$base.ref.l"
@@ -46,8 +46,8 @@ for src in src/*.c y.tab.c; do
     check "$src" gnu89 -Isrc
 done
 for src in src/arch/arch.*.c; do
-    check "$src" gnu89 -Isrc -DKCC_ARM64_MACOS_SYSROOT='"/"' -DKCC_ARM64_MACOS_RESOURCE_INC='"/"' \
-        -DKCC_X86_64_LINUX_SYSROOT='"/"' -DKCC_X86_64_LINUX_GCC_DIR='"/"'
+    check "$src" gnu89 -Isrc -DJCC_ARM64_MACOS_SYSROOT='"/"' -DJCC_ARM64_MACOS_RESOURCE_INC='"/"' \
+        -DJCC_X86_64_LINUX_SYSROOT='"/"' -DJCC_X86_64_LINUX_GCC_DIR='"/"'
 done
 if [ -f "$HOME/src/pewter/pewter.c" ]; then
     check "$HOME/src/pewter/pewter.c" c90

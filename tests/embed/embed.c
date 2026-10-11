@@ -1,5 +1,5 @@
 /*
- * A host program that links libkcc.a: what Goal 2 of the plan is for.
+ * A host program that links libjcc.a: what Goal 2 of the plan is for.
  * It compiles source it holds in memory, serves a header from memory,
  * checks that diagnostics arrive through the callback, that a fatal
  * error leaves the compiler usable, and that an object it got back
@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "kcc.h"
+#include "jcc.h"
 
 static int failures = 0;
 
@@ -24,14 +24,14 @@ static void check(int ok, const char *what) {
 /* the diagnostics a compile produced: how many, and the last one */
 typedef struct Seen {
     int n;
-    KccLevel level;
+    JccLevel level;
     char file[128];
     size_t line;
     size_t col;
     char message[256];
 } Seen;
 
-static void on_diag(void *user, KccLevel level, const char *file, size_t line, size_t col, const char *message) {
+static void on_diag(void *user, JccLevel level, const char *file, size_t line, size_t col, const char *message) {
     Seen *s = user;
     s->n++;
     s->level = level;
@@ -65,7 +65,7 @@ static const char good_text[] =
     "#include \"gen.h\"\n"
     "int helper(int x) { return x + 1; }\n"
     "int main(void) {\n"
-    "    printf(\"hello from libkcc %d\\n\", helper(ANSWER - 1));\n"
+    "    printf(\"hello from libjcc %d\\n\", helper(ANSWER - 1));\n"
     "    return ANSWER;\n"
     "}\n";
 
@@ -96,8 +96,8 @@ static char *read_file(const char *path) {
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";
-    Kcc *k;
-    Kcc *cross;
+    Jcc *k;
+    Jcc *cross;
     Seen seen;
     Reader reader;
     char *out = NULL;
@@ -108,47 +108,47 @@ int main(int argc, char **argv) {
     int i;
 
     /* unknown targets and options are refused, not fatal */
-    check(kcc_new("no-such-target") == NULL, "an unknown target gives NULL");
-    k = kcc_new(NULL);
+    check(jcc_new("no-such-target") == NULL, "an unknown target gives NULL");
+    k = jcc_new(NULL);
     check(k != NULL, "the host target is available");
     if (!k) {
         return 1;
     }
-    check(kcc_set_option(k, "-fno-such-option", NULL) == -1, "an unknown option is refused");
-    check(kcc_set_option(k, "-std", "gnu89") == 0, "-std is accepted");
-    kcc_set_diag(k, on_diag, &seen);
+    check(jcc_set_option(k, "-fno-such-option", NULL) == -1, "an unknown option is refused");
+    check(jcc_set_option(k, "-std", "gnu89") == 0, "-std is accepted");
+    jcc_set_diag(k, on_diag, &seen);
     memset(&reader, 0, sizeof(reader));
-    kcc_set_reader(k, on_read, &reader);
+    jcc_set_reader(k, on_read, &reader);
 
     /* 1. an error reaches the handler with its location, and the compile fails */
     memset(&seen, 0, sizeof(seen));
-    rc = kcc_compile_to_asm(k, "gen.c", "int main(void) {\n    return nope;\n}\n", &out, &len);
+    rc = jcc_compile_to_asm(k, "gen.c", "int main(void) {\n    return nope;\n}\n", &out, &len);
     check(rc == -1 && out == NULL, "a unit with an error fails");
-    check(seen.n == 1 && kcc_errors(k) == 1, "exactly one diagnostic was reported");
-    check(seen.level == KCC_ERROR, "it is an error");
+    check(seen.n == 1 && jcc_errors(k) == 1, "exactly one diagnostic was reported");
+    check(seen.level == JCC_ERROR, "it is an error");
     check(strcmp(seen.file, "gen.c") == 0 && seen.line == 2 && seen.col == 12, "it has the file, line and column");
     check(strstr(seen.message, "nope") != NULL, "its message names the identifier");
 
     /* 2. a warning is counted and the compile succeeds */
     memset(&seen, 0, sizeof(seen));
-    rc = kcc_compile_to_asm(k, "gen.c", "int;\nint main(void) { return 0; }\n", &out, &len);
+    rc = jcc_compile_to_asm(k, "gen.c", "int;\nint main(void) { return 0; }\n", &out, &len);
     check(rc == 0 && out != NULL && len > 0, "a unit with a warning compiles");
-    check(seen.n == 1 && seen.level == KCC_WARNING && kcc_warnings(k) == 1 && kcc_errors(k) == 0, "the warning was reported and counted");
+    check(seen.n == 1 && seen.level == JCC_WARNING && jcc_warnings(k) == 1 && jcc_errors(k) == 0, "the warning was reported and counted");
     free(out);
 
     /* 3. a fatal error is reported as such, and the compiler is usable afterwards */
     memset(&seen, 0, sizeof(seen));
-    rc = kcc_compile_to_asm(k, "gen.c", "int main(void) {\n    @\n}\n", &out, &len);
+    rc = jcc_compile_to_asm(k, "gen.c", "int main(void) {\n    @\n}\n", &out, &len);
     check(rc == -1 && out == NULL, "a unit with a lexical error fails");
-    check(seen.n == 1 && seen.level == KCC_FATAL && seen.line == 2, "it was reported as fatal, with its line");
+    check(seen.n == 1 && seen.level == JCC_FATAL && seen.line == 2, "it was reported as fatal, with its line");
     memset(&seen, 0, sizeof(seen));
-    rc = kcc_compile_to_asm(k, "gen.c", "int main(void) { return 0; }\n", &out, &len);
+    rc = jcc_compile_to_asm(k, "gen.c", "int main(void) { return 0; }\n", &out, &len);
     check(rc == 0 && seen.n == 0 && out != NULL, "the next unit compiles cleanly after a fatal error");
     free(out);
 
     /* 4. the preprocessor, with a header served from memory */
     memset(&seen, 0, sizeof(seen));
-    rc = kcc_preprocess(k, "gen.c", good_text, &out, &len);
+    rc = jcc_preprocess(k, "gen.c", good_text, &out, &len);
     check(rc == 0 && out != NULL, "preprocessing succeeds");
     check(reader.asked >= 1, reader.asked ? "the header came from the reader" : reader.last);
     check(out && strstr(out, "return 42;") != NULL, "the macro from the in-memory header was expanded");
@@ -156,12 +156,12 @@ int main(int argc, char **argv) {
     free(out);
 
     /* 5. assembly */
-    rc = kcc_compile_to_asm(k, "gen.c", good_text, &out, &len);
+    rc = jcc_compile_to_asm(k, "gen.c", good_text, &out, &len);
     check(rc == 0 && out != NULL && strstr(out, "main") != NULL && strlen(out) == len, "assembly comes back as text");
     free(out);
 
     /* 6. an object that links with cc and runs */
-    rc = kcc_compile_to_obj(k, "gen.c", good_text, &out, &len);
+    rc = jcc_compile_to_obj(k, "gen.c", good_text, &out, &len);
     check(rc == 0 && out != NULL && len > 64, "an object comes back");
     snprintf(path, sizeof(path), "%s/gen.o", dir);
     check(out && write_file(path, out, len) == 0, "the object was written");
@@ -170,23 +170,23 @@ int main(int argc, char **argv) {
     rc = system(cmd);
     check(rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 42, "it links, runs and returns the macro's value");
     snprintf(path, sizeof(path), "%s/gen.out", dir);
-    check(read_file(path) && strcmp(read_file(path), "hello from libkcc 42\n") == 0, "and prints through the system's libc");
+    check(read_file(path) && strcmp(read_file(path), "hello from libjcc 42\n") == 0, "and prints through the system's libc");
 
     /* 7. checking only, and a path read through the file system */
     snprintf(path, sizeof(path), "%s/ondisk.c", dir);
     write_file(path, "int f(void) { return 1; }\n", 26);
-    check(kcc_check(k, path, NULL) == 0, "a unit named by path is read from the file system");
-    check(kcc_check(k, "missing.c", NULL) == -1 && seen.level == KCC_ERROR, "a missing file is an error, not a crash");
+    check(jcc_check(k, path, NULL) == 0, "a unit named by path is read from the file system");
+    check(jcc_check(k, "missing.c", NULL) == -1 && seen.level == JCC_ERROR, "a missing file is an error, not a crash");
 
     /* 8. the state resets between units: alternate failing and good units */
     rc = 0;
     for (i = 0; i < 20; i++) {
         memset(&seen, 0, sizeof(seen));
-        if (kcc_compile_to_asm(k, "gen.c", "int main(void) { return nope; }\n", &out, &len) != -1 || seen.n != 1) {
+        if (jcc_compile_to_asm(k, "gen.c", "int main(void) { return nope; }\n", &out, &len) != -1 || seen.n != 1) {
             rc = 1;
         }
         memset(&seen, 0, sizeof(seen));
-        if (kcc_compile_to_asm(k, "gen.c", good_text, &out, &len) != 0 || seen.n != 0 || !out) {
+        if (jcc_compile_to_asm(k, "gen.c", good_text, &out, &len) != 0 || seen.n != 0 || !out) {
             rc = 1;
         }
         free(out);
@@ -194,20 +194,20 @@ int main(int argc, char **argv) {
     check(rc == 0, "twenty alternating failing and good units behave the same each time");
 
     /* 9. another target from the same process; -nostdinc so no sysroot is needed */
-    cross = kcc_new("x86_64-linux-musl");
-    check(cross != NULL && strcmp(kcc_target(cross), "x86_64-linux-musl") == 0, "a second compiler for another target");
+    cross = jcc_new("x86_64-linux-musl");
+    check(cross != NULL && strcmp(jcc_target(cross), "x86_64-linux-musl") == 0, "a second compiler for another target");
     if (cross) {
-        kcc_set_option(cross, "-nostdinc", NULL);
-        rc = kcc_compile_to_asm(cross, "gen.c", "int main(void) { return 0; }\n", &out, &len);
+        jcc_set_option(cross, "-nostdinc", NULL);
+        rc = jcc_compile_to_asm(cross, "gen.c", "int main(void) { return 0; }\n", &out, &len);
         check(rc == 0 && out && strstr(out, "GNU-stack") != NULL, "it produces that target's assembly");
         free(out);
-        rc = kcc_compile_to_asm(k, "gen.c", "int main(void) { return 0; }\n", &out, &len);
+        rc = jcc_compile_to_asm(k, "gen.c", "int main(void) { return 0; }\n", &out, &len);
         check(rc == 0 && out && strstr(out, "GNU-stack") == NULL, "and the first still produces the host's");
         free(out);
-        kcc_free(cross);
+        jcc_free(cross);
     }
 
-    kcc_free(k);
+    jcc_free(k);
     printf("EMBED: %d failed\n", failures);
     return failures ? 1 : 0;
 }

@@ -2,7 +2,7 @@
 # Generate a target's preprocessor tables (src/arch/predef_<target>.h):
 # the macros the target's compiler predefines, and for clang targets the
 # answers to every __has_feature / __has_builtin / __is_target_* query the
-# SDK headers make. kcc then preprocesses without the host compiler.
+# SDK headers make. jcc then preprocesses without the host compiler.
 #
 #   tools/predef.sh arm64-macos            # from the host's clang and SDK
 #   tools/predef.sh x86_64-linux dM.txt    # from a saved `gcc -E -dM -std=gnu89 - </dev/null`

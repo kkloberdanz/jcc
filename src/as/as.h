@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 /*
- * kcc's assembler (Step 14 of the plan). It reads the subset of assembly
+ * jcc's assembler (Step 14 of the plan). It reads the subset of assembly
  * the backends emit, one fixed table of mnemonics and operand forms per
  * target (src/as/arm64.c, src/as/x86_64.c), and nothing else: a line
  * outside the subset is an error, because the backends are the only

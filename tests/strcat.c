@@ -1,6 +1,6 @@
 /* adjacent string literals are one literal, also inside sizeof and initializers */
 #include <stdio.h>
-#define NAME "kcc"
+#define NAME "jcc"
 static const char banner[] = "usage: " NAME " [-h]\n" "  -h   help";
 static char fixed[8] = "ab" "cd";
 int main(void) {

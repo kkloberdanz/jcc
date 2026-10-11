@@ -1,6 +1,6 @@
 -- The Lua benchmark the plan's performance numbers refer to: recursive
 -- calls, table fill and sum, string splitting and sorting. Each part is
--- sized so the whole run takes a few seconds on a kcc-built Lua; the
+-- sized so the whole run takes a few seconds on a jcc-built Lua; the
 -- point is the ratio against the same Lua built by cc -O0 and -O2.
 -- Run with tests/bench-lua.sh, which builds Lua and times this.
 local clock = os.clock

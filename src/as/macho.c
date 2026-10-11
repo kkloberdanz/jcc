@@ -8,7 +8,7 @@
  * ones, each group sorted by name; relocations in descending address
  * order, each local label resolved to the nearest named symbol before it
  * (every section starts with an `ltmpN` for that) plus an ADDEND entry.
- * Differences from clang, on purpose: no __compact_unwind section (kcc
+ * Differences from clang, on purpose: no __compact_unwind section (jcc
  * emits no CFI beyond .cfi_startproc/.cfi_endproc, so clang's entries
  * would say "frameless" anyway) and LC_BUILD_VERSION says macOS 11.0,
  * the first arm64 release, rather than the host's version.

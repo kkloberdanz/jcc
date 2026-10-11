@@ -1,9 +1,9 @@
 #!/bin/sh
 # Fetch the SQLite 3.53.4 amalgamation (sqlite3.c, shell.c and the headers)
-# into $KCC_DATA (default ~/.local/share/kcc) for tests/run-sqlite.sh. Safe
+# into $JCC_DATA (default ~/.local/share/jcc) for tests/run-sqlite.sh. Safe
 # to rerun.
 set -e
-DATA=${KCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc}
+DATA=${JCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc}
 mkdir -p "$DATA"
 cd "$DATA"
 if [ ! -f sqlite-amalgamation-3530400/sqlite3.c ]; then

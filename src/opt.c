@@ -29,11 +29,11 @@
  * long double values (which the backends keep in memory) are left as
  * they are, along with every instruction that touches one.
  *
- * KCC_NOOPT=1 in the environment turns the optimizer off, and
- * KCC_OPT_LIMIT=n optimizes only the first n functions compiled, for
- * bisecting a miscompilation to one function, and KCC_INLINE_LIMIT=n
+ * JCC_NOOPT=1 in the environment turns the optimizer off, and
+ * JCC_OPT_LIMIT=n optimizes only the first n functions compiled, for
+ * bisecting a miscompilation to one function, and JCC_INLINE_LIMIT=n
  * inlines only the first n calls, to bisect to one inlining;
- * KCC_OPT_TRACE=1 reports each function optimized and each call inlined
+ * JCC_OPT_TRACE=1 reports each function optimized and each call inlined
  * (as notes), to name the nth.
  */
 #include <limits.h>
@@ -114,8 +114,8 @@ static char *opt_mark = NULL;
 
 static int opt_nvars;           /* registers below this were the function's own when it entered SSA */
 static int opt_round;           /* the simplification round, from 0 */
-static int opt_trace = 0;       /* KCC_OPT_TRACE: each function optimized and each call inlined is reported as a note */
-static long opt_inline_limit = -1;  /* KCC_INLINE_LIMIT: inline only this many calls, for bisection */
+static int opt_trace = 0;       /* JCC_OPT_TRACE: each function optimized and each call inlined is reported as a note */
+static long opt_inline_limit = -1;  /* JCC_INLINE_LIMIT: inline only this many calls, for bisection */
 static long opt_ninlined = 0;
 
 static void *opt_grow(void *p, int *cap, int need, size_t elem) {
@@ -1275,7 +1275,7 @@ static void opt_make_fconst(IRInst *i, double v) {
 /*
  * Floating point arithmetic on constants, as the target does it at run
  * time in the default rounding mode (both targets are IEEE 754, and so is
- * every host kcc runs on): float operations in float, double in double.
+ * every host jcc runs on): float operations in float, double in double.
  * Integer conversions out of range are undefined and are left alone.
  */
 static int opt_fold_float(IRInst *i) {
@@ -4093,12 +4093,12 @@ void opt_function(IRFunc *f) {
     int round;
 
     if (disabled < 0) {
-        const char *l = getenv("KCC_OPT_LIMIT");
-        const char *il = getenv("KCC_INLINE_LIMIT");
-        disabled = getenv("KCC_NOOPT") != NULL;
+        const char *l = getenv("JCC_OPT_LIMIT");
+        const char *il = getenv("JCC_INLINE_LIMIT");
+        disabled = getenv("JCC_NOOPT") != NULL;
         limit = l ? atol(l) : -1;
         opt_inline_limit = il ? atol(il) : -1;
-        opt_trace = getenv("KCC_OPT_TRACE") != NULL;
+        opt_trace = getenv("JCC_OPT_TRACE") != NULL;
     }
     if (disabled || (limit >= 0 && count >= limit)) {
         return;

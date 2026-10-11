@@ -1,5 +1,5 @@
-#ifndef KCC_CPP_H
-#define KCC_CPP_H
+#ifndef JCC_CPP_H
+#define JCC_CPP_H
 
 #include <stddef.h>
 #include <stdio.h>

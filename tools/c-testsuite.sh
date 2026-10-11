@@ -1,9 +1,9 @@
 #!/bin/sh
 # Fetch the c-testsuite conformance tests (github.com/c-testsuite/c-testsuite)
-# into $C_TESTSUITE (default ~/.local/share/kcc/c-testsuite) for
+# into $C_TESTSUITE (default ~/.local/share/jcc/c-testsuite) for
 # tests/run-c-testsuite.sh. Safe to rerun.
 set -e
-SUITE=${C_TESTSUITE:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc/c-testsuite}
+SUITE=${C_TESTSUITE:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/c-testsuite}
 if [ -d "$SUITE/.git" ]; then
     git -C "$SUITE" pull -q --ff-only
 else

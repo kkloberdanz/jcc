@@ -1,12 +1,12 @@
 #!/bin/sh
-# The second real-program milestone: build Lua 5.4.8 with kcc and run its
+# The second real-program milestone: build Lua 5.4.8 with jcc and run its
 # test suite. `sh tests/run-lua.sh` builds natively and runs the tests here;
 # `sh tests/run-lua.sh x86_64` cross compiles and links a static Linux
 # binary here and runs the tests in Docker. Needs tools/lua.sh to have run.
 # Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
-KCC=${KCC:-./kcc}
-DATA=${KCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc}
+JCC=${JCC:-./jcc}
+DATA=${JCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc}
 LUA=$DATA/lua-5.4.8
 TESTS=$DATA/lua-5.4.8-tests
 [ -d "$LUA/src" ] && [ -d "$TESTS" ] || { echo "no Lua at $DATA: run tools/lua.sh"; exit 2; }
@@ -19,12 +19,12 @@ trap 'rm -rf "$tmp"' EXIT
 # onelua.c are separate programs.
 srcs=$(ls "$LUA"/src/*.c | grep -v "luac.c\|onelua.c")
 if [ "$mode" = x86_64 ]; then
-    SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc/x86_64-linux-musl}
+    SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
     docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
     command -v ld.lld >/dev/null 2>&1 || { echo "no ld.lld: brew install lld"; exit 2; }
-    X="$KCC --target=x86_64-linux-musl -isysroot $SYSROOT -DLUA_USE_LINUX"
+    X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT -DLUA_USE_LINUX"
 else
-    X="$KCC -DLUA_USE_MACOSX"
+    X="$JCC -DLUA_USE_MACOSX"
 fi
 echo "building lua ($mode)"
 # shellcheck disable=SC2086
@@ -36,7 +36,7 @@ cp -r "$TESTS" "$tmp/testes"
 # test even with a gcc-built Lua, so on Linux non-C locales are reported as
 # unavailable, as they are.
 if [ "$mode" = x86_64 ]; then
-    docker run --rm --platform linux/amd64 -v "$tmp:/w" kcc-x86_64-linux sh -c '
+    docker run --rm --platform linux/amd64 -v "$tmp:/w" jcc-x86_64-linux sh -c '
         cd /w/testes && /w/lua -e "_U=true; local sl = os.setlocale; os.setlocale = function(l, c) if l and l ~= \"C\" and l ~= \"\" then return nil end return sl(l, c) end" all.lua' > "$tmp/out" 2>&1
     rc=$?
 else

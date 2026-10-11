@@ -1,6 +1,6 @@
 /*
  * Step 5 test: variadic callees (va_start, va_arg, va_end, va_copy) and
- * the byte swap builtins. Built with cc and kcc by tests/run.sh; the exit
+ * the byte swap builtins. Built with cc and jcc by tests/run.sh; the exit
  * status and output must agree.
  */
 #include <stdarg.h>

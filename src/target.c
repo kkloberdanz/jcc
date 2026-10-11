@@ -22,7 +22,7 @@ const Target *target_host(void) {
 #elif defined(__linux__) && defined(__aarch64__)
     return &target_x86_64_linux;    /* no arm64 Linux backend: a cross compiler by default */
 #else
-#error "kcc has no backend for this host"
+#error "jcc has no backend for this host"
 #endif
 }
 

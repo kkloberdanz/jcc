@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #include "ast.h"
-#include "kcc.h"
+#include "jcc.h"
 
 /*
  * Every message the compiler produces goes through here. By default they
@@ -14,13 +14,13 @@
  * that links the compiler in installs a handler instead and sees each
  * one as file, line, column, level and text.
  */
-/* the levels and the handler type are the public ones (src/kcc.h) */
-typedef KccLevel DiagLevel;
-#define DIAG_NOTE KCC_NOTE
-#define DIAG_WARNING KCC_WARNING
-#define DIAG_ERROR KCC_ERROR
-#define DIAG_FATAL KCC_FATAL
-typedef KccDiagFn DiagHandler;
+/* the levels and the handler type are the public ones (src/jcc.h) */
+typedef JccLevel DiagLevel;
+#define DIAG_NOTE JCC_NOTE
+#define DIAG_WARNING JCC_WARNING
+#define DIAG_ERROR JCC_ERROR
+#define DIAG_FATAL JCC_FATAL
+typedef JccDiagFn DiagHandler;
 
 /* install a handler; NULL restores printing to stderr */
 void diag_set_handler(DiagHandler handler, void *user);

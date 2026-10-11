@@ -3,7 +3,7 @@
 # fetched by tools/c-testsuite.sh): every tests/single-exec/*.c must build,
 # exit 0 and print exactly its .expected file. With `x86_64` as the argument
 # the tests are cross compiled and linked here and run in Docker. Tests
-# tagged c99 or c11 are reported separately: kcc is a C89 compiler and
+# tagged c99 or c11 are reported separately: jcc is a C89 compiler and
 # passes them only where the feature is a common extension. Failures
 # listed in tests/c-testsuite.xfail (name, then why) are expected and do
 # not fail the run; one that starts passing is reported as XPASS so the
@@ -13,25 +13,25 @@
 # the number of processors).
 # Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
-KCC=${KCC:-./kcc}
+JCC=${JCC:-./jcc}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 XFAIL=tests/c-testsuite.xfail
-SUITE=${C_TESTSUITE:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc/c-testsuite}
+SUITE=${C_TESTSUITE:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/c-testsuite}
 [ -d "$SUITE/tests/single-exec" ] || { echo "no suite at $SUITE: run tools/c-testsuite.sh"; exit 2; }
 mode=${1:-native}
 if [ "$mode" = x86_64 ]; then
-    SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc/x86_64-linux-musl}
+    SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
     docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
-    X="$KCC --target=x86_64-linux-musl -isysroot $SYSROOT"
+    X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
     XFAIL="$XFAIL tests/c-testsuite.x86_64-linux.xfail"
 else
-    X="$KCC"
+    X="$JCC"
 fi
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/res"
 
-# one test: build it with kcc; the outcome is a file under res/, its standard beside the binary
+# one test: build it with jcc; the outcome is a file under res/, its standard beside the binary
 cat >"$tmp/compile1.sh" <<'EOF'
 src=$1; name=$(basename "$src" .c)
 if grep -q "^c89$" "$src.tags"; then std=c89; else std=c99; fi
@@ -56,7 +56,7 @@ cat "$tmp"/res/*.fail >"$tmp/run.out" 2>/dev/null
 # run them: here, or all at once in the container
 if [ -n "$built" ]; then
     if [ "$mode" = x86_64 ]; then
-        docker run --rm --platform linux/amd64 -v "$tmp/bin:/w" kcc-x86_64-linux \
+        docker run --rm --platform linux/amd64 -v "$tmp/bin:/w" jcc-x86_64-linux \
             sh -c 'cd /w && printf "%s\n" $1 | xargs -P "$2" -n 1 sh ./run1.sh' sh "$built" "$JOBS"
     else
         (cd "$tmp/bin" && printf '%s\n' $built | xargs -P "$JOBS" -n 1 sh ./run1.sh)

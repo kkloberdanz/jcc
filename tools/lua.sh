@@ -1,8 +1,8 @@
 #!/bin/sh
-# Fetch Lua 5.4.8 and its test suite into $KCC_DATA (default
-# ~/.local/share/kcc) for tests/run-lua.sh. Safe to rerun.
+# Fetch Lua 5.4.8 and its test suite into $JCC_DATA (default
+# ~/.local/share/jcc) for tests/run-lua.sh. Safe to rerun.
 set -e
-DATA=${KCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc}
+DATA=${JCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc}
 mkdir -p "$DATA"
 cd "$DATA"
 if [ ! -d lua-5.4.8 ]; then

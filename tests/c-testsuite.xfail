@@ -1,4 +1,4 @@
-# c-testsuite tests kcc is known to fail: name, then why (tests/run-c-testsuite.sh reads this;
+# c-testsuite tests jcc is known to fail: name, then why (tests/run-c-testsuite.sh reads this;
 # one that starts passing is reported as XPASS and should be removed here).
 00149 compound literals
 00150 compound literals

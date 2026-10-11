@@ -1,7 +1,7 @@
 /*
  * Step 5 test: structs and unions passed and returned by value, in every
  * size class the ABIs distinguish: one eightbyte, two, and larger ones
- * that go through memory. Built with cc and kcc by tests/run.sh.
+ * that go through memory. Built with cc and jcc by tests/run.sh.
  */
 #include <stdio.h>
 #include <string.h>

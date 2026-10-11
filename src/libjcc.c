@@ -1,5 +1,5 @@
 /*
- * The library interface (src/kcc.h): options, the diagnostic and reader
+ * The library interface (src/jcc.h): options, the diagnostic and reader
  * hooks, and the pipeline preprocess, parse, sema, codegen that the
  * driver's compile_one used to run itself. A fatal error anywhere below
  * longjmps back to run(), which cleans up what it can and reports failure.
@@ -10,7 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "kcc.h"
+#include "jcc.h"
 #include "cpp.h"
 #include "parse.h"
 #include "sema.h"
@@ -29,11 +29,11 @@ typedef struct Strings {
     size_t cap;
 } Strings;
 
-struct Kcc {
+struct Jcc {
     const Target *target;
-    KccDiagFn diag;
+    JccDiagFn diag;
     void *diag_user;
-    KccReadFn read;
+    JccReadFn read;
     void *read_user;
     char *std;
     char *sysroot;
@@ -43,7 +43,7 @@ struct Kcc {
     int ast_dump;
     int symtab_dump;
     int ir_dump;
-    int external_as;        /* -fexternal-as: objects from the host's cc, not kcc's assembler */
+    int external_as;        /* -fexternal-as: objects from the host's cc, not jcc's assembler */
     int opt_level;          /* -O: 0, or 1 for the optimizing pipeline (src/opt.h) */
     /* the unit being compiled, when its text was given rather than a path */
     const char *main_name;
@@ -85,8 +85,8 @@ static void strings_free(Strings *l) {
     l->n = l->cap = 0;
 }
 
-Kcc *kcc_new(const char *name) {
-    Kcc *k;
+Jcc *jcc_new(const char *name) {
+    Jcc *k;
     if (!target_select(name)) {
         return NULL;
     }
@@ -98,7 +98,7 @@ Kcc *kcc_new(const char *name) {
     return k;
 }
 
-void kcc_free(Kcc *k) {
+void jcc_free(Jcc *k) {
     if (!k) {
         return;
     }
@@ -109,21 +109,21 @@ void kcc_free(Kcc *k) {
     free(k);
 }
 
-const char *kcc_target(const Kcc *k) {
+const char *jcc_target(const Jcc *k) {
     return k->target->name;
 }
 
-void kcc_set_diag(Kcc *k, KccDiagFn fn, void *user) {
+void jcc_set_diag(Jcc *k, JccDiagFn fn, void *user) {
     k->diag = fn;
     k->diag_user = user;
 }
 
-void kcc_set_reader(Kcc *k, KccReadFn fn, void *user) {
+void jcc_set_reader(Jcc *k, JccReadFn fn, void *user) {
     k->read = fn;
     k->read_user = user;
 }
 
-int kcc_set_option(Kcc *k, const char *name, const char *value) {
+int jcc_set_option(Jcc *k, const char *name, const char *value) {
     jmp_buf recover;
     jmp_buf *previous = diag_set_recovery(&recover);
     int rc = 0;
@@ -169,17 +169,17 @@ int kcc_set_option(Kcc *k, const char *name, const char *value) {
     return rc;
 }
 
-int kcc_errors(const Kcc *k) {
+int jcc_errors(const Jcc *k) {
     return k->nerrors;
 }
 
-int kcc_warnings(const Kcc *k) {
+int jcc_warnings(const Jcc *k) {
     return k->nwarnings;
 }
 
 /* the preprocessor's reader: the main unit's text, then the host's reader, then (in cpp.c) the file system */
 static const char *read_source(void *user, const char *path, size_t *len) {
-    Kcc *k = user;
+    Jcc *k = user;
     if (k->main_text && strcmp(path, k->main_name) == 0) {
         *len = k->main_len;
         return k->main_text;
@@ -235,12 +235,12 @@ static int spill(const char *path, const char *text, size_t len) {
 /*
  * Assemble `text` with the host's cc, whose integrated assembler knows
  * every target, through a temporary directory; the object comes back as
- * a buffer. The path of -fexternal-as (and of a target kcc's own
+ * a buffer. The path of -fexternal-as (and of a target jcc's own
  * assembler had no object writer for, of which there are none since
  * Step 14 piece 3).
  */
 static int assemble(const char *text, size_t len, char **out, size_t *out_len) {
-    char dir[] = "/tmp/kcc.XXXXXX";
+    char dir[] = "/tmp/jcc.XXXXXX";
     char asm_path[64];
     char obj_path[64];
     char cmd[256];
@@ -286,7 +286,7 @@ static int is_assembly(const char *name) {
  * against the assembler's subset, and (for an object) assembled. Only
  * CHECK and OBJECT apply.
  */
-static int run_assembly(Kcc *k, const char *name, Stage stage, char **out, size_t *out_len) {
+static int run_assembly(Jcc *k, const char *name, Stage stage, char **out, size_t *out_len) {
     const char *text;
     size_t len;
     char *owned = NULL;
@@ -318,7 +318,7 @@ static int run_assembly(Kcc *k, const char *name, Stage stage, char **out, size_
     return rc;
 }
 
-static int run(Kcc *k, const char *name, const char *text, Stage stage, char **out, size_t *out_len) {
+static int run(Jcc *k, const char *name, const char *text, Stage stage, char **out, size_t *out_len) {
     CppOptions cpp;
     /*
      * Everything assigned after setjmp and read after the longjmp is
@@ -423,7 +423,7 @@ static int run(Kcc *k, const char *name, const char *text, Stage stage, char **o
         goto cleanup;
     }
     /*
-     * kcc's own assembler makes the object (Step 14); under -fexternal-as
+     * jcc's own assembler makes the object (Step 14); under -fexternal-as
      * the backend's output is checked against its subset and the host's
      * cc makes the object instead.
      */
@@ -459,18 +459,18 @@ cleanup:
     return status;
 }
 
-int kcc_preprocess(Kcc *k, const char *name, const char *text, char **out, size_t *len) {
+int jcc_preprocess(Jcc *k, const char *name, const char *text, char **out, size_t *len) {
     return run(k, name, text, PREPROCESS, out, len);
 }
 
-int kcc_check(Kcc *k, const char *name, const char *text) {
+int jcc_check(Jcc *k, const char *name, const char *text) {
     return run(k, name, text, CHECK, NULL, NULL);
 }
 
-int kcc_compile_to_asm(Kcc *k, const char *name, const char *text, char **out, size_t *len) {
+int jcc_compile_to_asm(Jcc *k, const char *name, const char *text, char **out, size_t *len) {
     return run(k, name, text, ASSEMBLY, out, len);
 }
 
-int kcc_compile_to_obj(Kcc *k, const char *name, const char *text, char **out, size_t *len) {
+int jcc_compile_to_obj(Jcc *k, const char *name, const char *text, char **out, size_t *len) {
     return run(k, name, text, OBJECT, out, len);
 }

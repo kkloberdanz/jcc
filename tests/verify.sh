@@ -13,7 +13,7 @@
 cd "$(dirname "$0")/.." || exit 1
 LOGS=${VERIFY_LOGS:-$(mktemp -d)}
 mkdir -p "$LOGS"
-DATA=${XDG_DATA_HOME:-$HOME/.local/share}/kcc
+DATA=${XDG_DATA_HOME:-$HOME/.local/share}/jcc
 SYSROOT=${X86_64_SYSROOT:-$DATA/x86_64-linux-musl}
 N=${N:-100}
 failed=0
@@ -43,8 +43,8 @@ skip() {    # skip NAME REASON
 "
 }
 
-echo "kcc verify: logs in $LOGS"
-make -s kcc >"$LOGS/build.log" 2>&1 || { echo "the build failed:"; tail -20 "$LOGS/build.log"; exit 1; }
+echo "jcc verify: logs in $LOGS"
+make -s jcc >"$LOGS/build.log" 2>&1 || { echo "the build failed:"; tail -20 "$LOGS/build.log"; exit 1; }
 
 # native
 stage test          make test-O0
@@ -79,7 +79,7 @@ else
     stage sqlite-x86_64      sh tests/run-sqlite.sh x86_64
 fi
 
-# the same suites with the optimizer: `make X-O1` is `make X` with KCC=./kcc-O1
+# the same suites with the optimizer: `make X-O1` is `make X` with JCC=./jcc-O1
 stage test-O1        make -s test-O1
 stage selfhost-O1    make -s selfhost-O1
 stage c-testsuite-O1 make -s c-testsuite-O1
@@ -105,7 +105,7 @@ asan_suites() {
     (cd "$1" && sh tests/run.sh && sh tests/target.sh && sh tests/abi.sh && sh tests/embed.sh \
         && sh tests/limits.sh && sh tests/c89.sh) || return 1
     if [ -f "$DATA/sqlite-amalgamation-3530400/sqlite3.c" ]; then
-        "$1/kcc" -std=gnu89 -S -o /dev/null "$DATA/sqlite-amalgamation-3530400/sqlite3.c" || return 1
+        "$1/jcc" -std=gnu89 -S -o /dev/null "$DATA/sqlite-amalgamation-3530400/sqlite3.c" || return 1
         echo "sqlite3.c compiled under ASan"
     fi
     grep -l "AddressSanitizer\|LeakSanitizer" "$LOGS/asan.log" >/dev/null 2>&1 && return 1
@@ -116,7 +116,7 @@ stage asan asan_suites "$asan_dir"
 rm -rf "$asan_dir"
 
 echo
-echo "=== kcc verify: $failed failed"
+echo "=== jcc verify: $failed failed"
 printf '%s' "$table"
 if [ "$failed" -eq 0 ]; then
     [ -n "${VERIFY_LOGS:-}" ] || rm -rf "$LOGS"

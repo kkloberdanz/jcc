@@ -1492,7 +1492,7 @@ direct_declarator
         }
     | direct_declarator lbrack array_qualifiers constant_expression ']'
         {
-            /* C99 parameter qualifiers, which say nothing kcc acts on */
+            /* C99 parameter qualifiers, which say nothing jcc acts on */
             spec_pop();
             ast_free($3);
             $$ = ast_declarator(N_DECL_ARRAY, @$, $1);

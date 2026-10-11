@@ -1,13 +1,13 @@
 #!/bin/sh
-# Collect the assembly corpus for the assembler (Step 14): every .s kcc
+# Collect the assembly corpus for the assembler (Step 14): every .s jcc
 # produces for the test suites, pewter, c-testsuite, the gcc torture
-# tests, Lua, SQLite and kcc's own sources, for both targets, under
-# DATA/as-corpus/<arch>/. A source kcc cannot compile is skipped. Needs
+# tests, Lua, SQLite and jcc's own sources, for both targets, under
+# DATA/as-corpus/<arch>/. A source jcc cannot compile is skipped. Needs
 # the suites fetched by the other tools/*.sh scripts. Run from the
 # repository root; sh tools/as-corpus.sh [arm64|x86_64] does one target.
 cd "$(dirname "$0")/.." || exit 1
-KCC=${KCC:-./kcc}
-DATA=${KCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc}
+JCC=${JCC:-./jcc}
+DATA=${JCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc}
 SYSROOT=${X86_64_SYSROOT:-$DATA/x86_64-linux-musl}
 OUT=${AS_CORPUS:-$DATA/as-corpus}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
@@ -21,8 +21,8 @@ MK
 
 for arch in ${1:-arm64 x86_64}; do
     case $arch in
-        arm64) X="$KCC"; osdef=-DLUA_USE_MACOSX ;;
-        x86_64) X="$KCC --target=x86_64-linux-musl -isysroot $SYSROOT"; osdef=-DLUA_USE_LINUX ;;
+        arm64) X="$JCC"; osdef=-DLUA_USE_MACOSX ;;
+        x86_64) X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"; osdef=-DLUA_USE_LINUX ;;
         *) echo "unknown target $arch"; exit 1 ;;
     esac
     rm -rf "$OUT/$arch"
@@ -46,7 +46,7 @@ for arch in ${1:-arm64 x86_64}; do
         echo "sqlite-$(basename "$f" .c)|-std=gnu99|$f"
     done >>"$list"
     for f in src/*.c src/arch/arch.*.c y.tab.c; do
-        echo "kcc-$(basename "$f" .c)|-std=gnu89 -Isrc $TARGET_DEFS|$f"
+        echo "jcc-$(basename "$f" .c)|-std=gnu89 -Isrc $TARGET_DEFS|$f"
     done >>"$list"
     echo "$arch: $(wc -l <"$list" | tr -d ' ') sources"
     export X OUT arch list

@@ -1,9 +1,9 @@
 #!/bin/sh
-# The assembler's object writers (Step 14, pieces 2 and 3): every .s kcc's
-# backends produce is assembled by both `cc -c` and `kcc -c`, and the
+# The assembler's object writers (Step 14, pieces 2 and 3): every .s jcc's
+# backends produce is assembled by both `cc -c` and `jcc -c`, and the
 # objects must agree on every section's bytes, the symbol table and the
 # relocations. The reference is clang's output for the same text minus
-# the .cfi_startproc/.cfi_endproc lines, since kcc writes no unwind
+# the .cfi_startproc/.cfi_endproc lines, since jcc writes no unwind
 # tables (clang's would describe every function as frameless anyway).
 # The arm64 Mach-O comparison runs on an arm64 host; the x86_64 ELF one
 # runs anywhere clang can target x86_64-linux-musl (the sysroot is only
@@ -11,13 +11,13 @@
 # of tests/*.c and tests/abi/*.c, then the corpus tools/as-corpus.sh
 # collects when it is present. From the repository root (make test does).
 cd "$(dirname "$0")/.." || exit 1
-KCC=${KCC:-./kcc}
-DATA=${KCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc}
+JCC=${JCC:-./jcc}
+DATA=${JCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc}
 SYSROOT=${X86_64_SYSROOT:-$DATA/x86_64-linux-musl}
 JOBS=${JOBS:-8}
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
-export KCC tmp
+export JCC tmp
 
 # dump-macho OBJ: the parts compared (sections, their contents, symbols, relocations)
 cat >"$tmp/dump-macho.sh" <<'DUMP'
@@ -30,7 +30,7 @@ otool -rv "$o" | sed 1d
 DUMP
 
 # dump-elf OBJ: the section headers (type, flags, size, link, info, alignment, entry size; not the string
-# table's size nor any offset, since kcc's string table is laid out differently), contents, symbols, relocations
+# table's size nor any offset, since jcc's string table is laid out differently), contents, symbols, relocations
 cat >"$tmp/dump-elf.sh" <<'DUMP'
 #!/bin/sh
 o=$1
@@ -53,13 +53,13 @@ cat >"$tmp/one.sh" <<'ONE'
 arch=$1; name=$2; src=$3
 d=$tmp/$arch-$name; mkdir -p "$d"
 grep -v '^\s*\.cfi_' "$src" >"$d/ref.s"
-if [ "$arch" = arm64 ]; then ref="cc"; x="$KCC"; dump=dump-macho; else ref="cc --target=x86_64-linux-musl"; x="$KCC --target=x86_64-linux-musl"; dump=dump-elf; fi
+if [ "$arch" = arm64 ]; then ref="cc"; x="$JCC"; dump=dump-macho; else ref="cc --target=x86_64-linux-musl"; x="$JCC --target=x86_64-linux-musl"; dump=dump-elf; fi
 $ref -c -o "$d/ref.o" "$d/ref.s" 2>"$d/cc.err" || { echo "FAIL $arch $name: cc rejects it"; head -3 "$d/cc.err"; exit 1; }
-$x -c -o "$d/kcc.o" "$src" 2>"$d/kcc.err" || { echo "FAIL $arch $name: kcc rejects it"; head -3 "$d/kcc.err"; exit 1; }
+$x -c -o "$d/jcc.o" "$src" 2>"$d/jcc.err" || { echo "FAIL $arch $name: jcc rejects it"; head -3 "$d/jcc.err"; exit 1; }
 sh "$tmp/$dump.sh" "$d/ref.o" >"$d/ref.dump"
-sh "$tmp/$dump.sh" "$d/kcc.o" >"$d/kcc.dump"
-if ! cmp -s "$d/ref.dump" "$d/kcc.dump"; then
-    echo "FAIL $arch $name: the objects differ"; diff "$d/ref.dump" "$d/kcc.dump" | head -8 | sed 's/^/    /'; exit 1
+sh "$tmp/$dump.sh" "$d/jcc.o" >"$d/jcc.dump"
+if ! cmp -s "$d/ref.dump" "$d/jcc.dump"; then
+    echo "FAIL $arch $name: the objects differ"; diff "$d/ref.dump" "$d/jcc.dump" | head -8 | sed 's/^/    /'; exit 1
 fi
 rm -rf "$d"
 ONE
@@ -68,9 +68,9 @@ fail=0
 for arch in arm64 x86_64; do
     if [ "$arch" = arm64 ]; then
         case "$(uname -m)" in arm64) ;; *) echo "arm64: skipped (not an arm64 host)"; continue ;; esac
-        X="$KCC"
+        X="$JCC"
     else
-        X="$KCC --target=x86_64-linux-musl -isysroot $SYSROOT"
+        X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
         [ -d "$SYSROOT/usr/include" ] || X=""
     fi
     n=0

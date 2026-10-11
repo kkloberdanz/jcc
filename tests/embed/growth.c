@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "kcc.h"
+#include "jcc.h"
 
 /* AddressSanitizer quarantines freed memory, so its heap only grows: nothing to measure */
 #if defined(__SANITIZE_ADDRESS__)
@@ -36,7 +36,7 @@ static long heap_in_use(void) { struct mallinfo2 m = mallinfo2(); return (long)m
 static long heap_in_use(void) { return -1; }
 #endif
 
-static void on_diag(void *user, enum KccLevel level, const char *file, unsigned long line, unsigned long col, const char *msg) {
+static void on_diag(void *user, enum JccLevel level, const char *file, unsigned long line, unsigned long col, const char *msg) {
     (void)user; (void)level; (void)file; (void)line; (void)col; (void)msg;
 }
 
@@ -65,16 +65,16 @@ int main(void) {
     enum { WINDOW = 200, WINDOWS = 6, PER_COMPILE = 32 };
     int failed = 0;
     int u;
-    Kcc *k = kcc_new(NULL);
+    Jcc *k = jcc_new(NULL);
 
     if (!k) {
-        printf("FAIL growth: kcc_new\n");
+        printf("FAIL growth: jcc_new\n");
         return 1;
     }
-    kcc_set_diag(k, on_diag, NULL);
+    jcc_set_diag(k, on_diag, NULL);
     if (heap_in_use() < 0) {
         printf("GROWTH skipped: no usable malloc statistics here\n");
-        kcc_free(k);
+        jcc_free(k);
         return 0;
     }
     for (u = 0; units[u]; u += 2) {
@@ -87,7 +87,7 @@ int main(void) {
             for (i = 0; i < WINDOW; i++) {
                 char *out = NULL;
                 size_t len = 0;
-                kcc_compile_to_asm(k, "unit.c", units[u + 1], &out, &len);
+                jcc_compile_to_asm(k, "unit.c", units[u + 1], &out, &len);
                 free(out);
             }
             after = heap_in_use();
@@ -102,7 +102,7 @@ int main(void) {
             failed++;
         }
     }
-    kcc_free(k);
+    jcc_free(k);
     printf("GROWTH: %d failed\n", failed);
     return failed != 0;
 }

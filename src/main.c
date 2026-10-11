@@ -3,8 +3,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "kcc.h"
-#include "target.h"     /* --target and the link tables; the compile itself goes through kcc.h */
+#include "jcc.h"
+#include "target.h"     /* --target and the link tables; the compile itself goes through jcc.h */
 
 struct Options {
     char dont_link;
@@ -32,7 +32,7 @@ struct Options {
     int nostdinc;
 };
 
-static const char *prg_name = "kcc";
+static const char *prg_name = "jcc";
 
 /* a message from the driver itself, as opposed to a diagnostic about the source */
 static void err_msg(const char *msg) {
@@ -74,7 +74,7 @@ static const char *const help_text[] = {
     "              Print each function's IR to stdout as it is compiled",
     "",
     "        -fexternal-as",
-    "              Assemble with the host's cc instead of kcc's own assembler",
+    "              Assemble with the host's cc instead of jcc's own assembler",
     "",
     "        -fsyntax-only",
     "              Stop after parsing and semantic analysis",
@@ -102,7 +102,7 @@ static const char *const help_text[] = {
 
 static void print_help(void) {
     size_t i;
-    printf("\nkcc -- Kyle's C Compiler\n");
+    printf("\njcc -- an embeddable C compiler\n");
     printf("\n%s: [-c] [-E] [-h] [-S] [-ast-dump] [-symtab-dump] [-fdump-ir] [-fexternal-as] [-fsyntax-only] [-Olevel] [--target=triple] [-o outfile] [-lNAME] file...\n\n", prg_name);
     for (i = 0; i < sizeof(help_text) / sizeof(help_text[0]); i++) {
         printf("%s\n", help_text[i]);
@@ -279,7 +279,7 @@ static const char *default_output(const char *infile, const char *ext) {
     return buf;
 }
 
-/* run the host toolchain for the steps kcc does not do itself yet */
+/* run the host toolchain for the steps jcc does not do itself yet */
 /* append `s` to the command in `buf`, quoted, with "=/dir" made relative to the sysroot */
 static void add_arg(char *buf, size_t size, const char *s, const char *sysroot) {
     size_t n = strlen(buf);
@@ -399,25 +399,25 @@ static int write_output(const char *path, const char *data, size_t len) {
  * One translation unit, through the library: preprocess, check, assembly
  * or the object `obj_out`, as the options say. Returns 0 on success.
  */
-static int compile_one(const struct Options *options, Kcc *k, const char *infile, const char *obj_out) {
+static int compile_one(const struct Options *options, Jcc *k, const char *infile, const char *obj_out) {
     char *out = NULL;
     size_t len = 0;
     int rc;
 
     if (options->preprocess_only) {
-        rc = kcc_preprocess(k, infile, NULL, &out, &len);
+        rc = jcc_preprocess(k, infile, NULL, &out, &len);
         if (rc == 0) {
             rc = write_output(options->outfile, out, len);
         }
     } else if (options->ast_dump || options->symtab_dump || options->syntax_only) {
-        rc = kcc_check(k, infile, NULL);
+        rc = jcc_check(k, infile, NULL);
     } else if (options->assembly_output) {
-        rc = kcc_compile_to_asm(k, infile, NULL, &out, &len);
+        rc = jcc_compile_to_asm(k, infile, NULL, &out, &len);
         if (rc == 0) {
             rc = write_output(options->outfile ? options->outfile : default_output(infile, ".s"), out, len);
         }
     } else {
-        rc = kcc_compile_to_obj(k, infile, NULL, &out, &len);
+        rc = jcc_compile_to_obj(k, infile, NULL, &out, &len);
         if (rc == 0) {
             rc = write_output(obj_out, out, len);
         }
@@ -427,58 +427,58 @@ static int compile_one(const struct Options *options, Kcc *k, const char *infile
 }
 
 /* the compiler the options describe */
-static Kcc *make_compiler(const struct Options *options) {
-    Kcc *k = kcc_new(options->target);
+static Jcc *make_compiler(const struct Options *options) {
+    Jcc *k = jcc_new(options->target);
     size_t i;
     if (!k) {
         err_msg("out of memory\n");
         exit(EXIT_FAILURE);
     }
     for (i = 0; i < options->n_include_dirs; i++) {
-        kcc_set_option(k, "-I", options->include_dirs[i]);
+        jcc_set_option(k, "-I", options->include_dirs[i]);
     }
     for (i = 0; i < options->n_macros; i++) {
         char name[3];
         name[0] = options->macros[i][0];
         name[1] = options->macros[i][1];
         name[2] = '\0';
-        kcc_set_option(k, name, options->macros[i] + 2);
+        jcc_set_option(k, name, options->macros[i] + 2);
     }
     if (options->std) {
-        kcc_set_option(k, "-std", options->std);
+        jcc_set_option(k, "-std", options->std);
     }
     if (options->sysroot) {
-        kcc_set_option(k, "-isysroot", options->sysroot);
+        jcc_set_option(k, "-isysroot", options->sysroot);
     }
     if (options->nostdinc) {
-        kcc_set_option(k, "-nostdinc", NULL);
+        jcc_set_option(k, "-nostdinc", NULL);
     }
     if (options->ast_dump) {
-        kcc_set_option(k, "-ast-dump", NULL);
+        jcc_set_option(k, "-ast-dump", NULL);
     }
     if (options->symtab_dump) {
-        kcc_set_option(k, "-symtab-dump", NULL);
+        jcc_set_option(k, "-symtab-dump", NULL);
     }
     if (options->external_as) {
-        kcc_set_option(k, "-fexternal-as", NULL);
+        jcc_set_option(k, "-fexternal-as", NULL);
     }
     if (options->ir_dump) {
-        kcc_set_option(k, "-fdump-ir", NULL);
+        jcc_set_option(k, "-fdump-ir", NULL);
     }
     if (options->opt_level != '0') {
         char level[2];
         level[0] = options->opt_level;
         level[1] = '\0';
-        kcc_set_option(k, "-O", level);
+        jcc_set_option(k, "-O", level);
     }
     return k;
 }
 
 int main(int argc, char **argv) {
     struct Options options;
-    Kcc *k;
+    Jcc *k;
     int status = 1;
-    char tmpdir[] = "/tmp/kcc.XXXXXX";
+    char tmpdir[] = "/tmp/jcc.XXXXXX";
     const char *objs[256];      /* what the linker gets, in order */
     char *temps[256];           /* objects compiled into the temporary directory */
     size_t nobjs = 0;
@@ -510,7 +510,7 @@ int main(int argc, char **argv) {
         }
         if (options.dont_link) {
             obj = options.outfile ? options.outfile : xstrdup(default_output(infile, ".o"));
-        } else if (tmpdir[0] == '/' && strcmp(tmpdir, "/tmp/kcc.XXXXXX") != 0) {
+        } else if (tmpdir[0] == '/' && strcmp(tmpdir, "/tmp/jcc.XXXXXX") != 0) {
             char buf[1200];
             snprintf(buf, sizeof(buf), "%s/%lu-%s", tmpdir, (unsigned long)i, default_output(infile, ".o"));
             obj = temps[ntemps++] = xstrdup(buf);
@@ -544,12 +544,12 @@ int main(int argc, char **argv) {
     status = 0;
 
 cleanup:
-    kcc_free(k);
+    jcc_free(k);
     for (i = 0; i < ntemps; i++) {
         unlink(temps[i]);
         free(temps[i]);
     }
-    if (strcmp(tmpdir, "/tmp/kcc.XXXXXX") != 0) {
+    if (strcmp(tmpdir, "/tmp/jcc.XXXXXX") != 0) {
         rmdir(tmpdir);
     }
     return status;

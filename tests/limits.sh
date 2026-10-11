@@ -3,10 +3,10 @@
 # a conforming compiler must translate and execute at least one program
 # that contains one instance of every minimum limit at once. This script
 # generates that program (and its 8 nested headers), builds it with the
-# host compiler and with kcc, and compares the output. Run from the
+# host compiler and with jcc, and compares the output. Run from the
 # repository root (make test does).
 cd "$(dirname "$0")/.." || exit 1
-KCC=${KCC:-./kcc}
+JCC=${JCC:-./jcc}
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 # 8 nesting levels for #included files: the innermost defines INC_DEPTH
@@ -115,12 +115,12 @@ if ! cc -std=c89 -w -o "$tmp/ref" "$tmp/limits.c" 2>"$tmp/cc.err"; then
     echo "LIMITS: cc does not accept the program"; cat "$tmp/cc.err"; exit 1
 fi
 "$tmp/ref" >"$tmp/ref.out" 2>&1
-if ! "$KCC" -o "$tmp/kcc" "$tmp/limits.c" 2>"$tmp/kcc.err"; then
-    echo "LIMITS FAIL: kcc rejected the program"; sed 's/^/    /' "$tmp/kcc.err"; exit 1
+if ! "$JCC" -o "$tmp/jcc" "$tmp/limits.c" 2>"$tmp/jcc.err"; then
+    echo "LIMITS FAIL: jcc rejected the program"; sed 's/^/    /' "$tmp/jcc.err"; exit 1
 fi
-"$tmp/kcc" >"$tmp/kcc.out" 2>&1
-if cmp -s "$tmp/ref.out" "$tmp/kcc.out"; then
+"$tmp/jcc" >"$tmp/jcc.out" 2>&1
+if cmp -s "$tmp/ref.out" "$tmp/jcc.out"; then
     echo "LIMITS OK ($(wc -l <"$tmp/limits.c" | tr -d ' ') lines)"
 else
-    echo "LIMITS FAIL: output differs from cc's"; diff "$tmp/ref.out" "$tmp/kcc.out" | sed 's/^/    /'; exit 1
+    echo "LIMITS FAIL: output differs from cc's"; diff "$tmp/ref.out" "$tmp/jcc.out" | sed 's/^/    /'; exit 1
 fi

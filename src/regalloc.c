@@ -1,7 +1,7 @@
 /*
  * Register allocation (src/regalloc.h): move coalescing, liveness, one
  * interval per virtual register, linear scan in three tiers,
- * callee-saved bookkeeping and the frame layout. KCC_NOREGALLOC=1 in
+ * callee-saved bookkeeping and the frame layout. JCC_NOREGALLOC=1 in
  * the environment skips the scan, so every value lives in a slot: when
  * a program works that way and not otherwise, the bug is in here. Positions are the instructions in the order the
  * backends emit them (block order, each block contiguous), so an
@@ -634,12 +634,12 @@ int regalloc_has_wide(const IRFunc *f, const IRInst *i) {
 }
 
 void regalloc(IRFunc *f, const RegTarget *t) {
-    static int bypass = -1;     /* KCC_NOREGALLOC set: every value gets a slot, as in Step 17 */
+    static int bypass = -1;     /* JCC_NOREGALLOC set: every value gets a slot, as in Step 17 */
     int v, k;
     int maxargs = 0;
 
     if (bypass < 0) {
-        bypass = getenv("KCC_NOREGALLOC") != NULL;
+        bypass = getenv("JCC_NOREGALLOC") != NULL;
     }
     RF = f;
     T = t;

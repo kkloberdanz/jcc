@@ -5,7 +5,7 @@
 # apply: a test it does not accept as gnu89, or that fails when it built it,
 # is skipped (nested functions, vector types, GCC-only builtins); its verdict
 # and output are cached under $GCC_TORTURE/ref. Every other test must build
-# with kcc and behave the same. Failures listed in tests/gcc-torture.xfail
+# with jcc and behave the same. Failures listed in tests/gcc-torture.xfail
 # (name, then why), or in the target's own list (tests/gcc-torture.arm64-macos.xfail,
 # tests/gcc-torture.x86_64-linux.xfail), are expected and do not fail the
 # run; one that starts passing is reported as XPASS so the list can be
@@ -14,9 +14,9 @@
 # the number of processors).
 # Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
-KCC=${KCC:-./kcc}
+JCC=${JCC:-./jcc}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
-ROOT=${GCC_TORTURE:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc/gcc-torture}
+ROOT=${GCC_TORTURE:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/gcc-torture}
 SUITE=$ROOT/gcc/testsuite/gcc.c-torture/execute
 REF=$ROOT/ref
 XFAIL=tests/gcc-torture.xfail
@@ -24,11 +24,11 @@ XFAIL=tests/gcc-torture.xfail
 mode=${1:-native}
 if [ "$mode" = x86_64 ]; then
     XFAIL="$XFAIL tests/gcc-torture.x86_64-linux.xfail"
-    SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/kcc/x86_64-linux-musl}
+    SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
     docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
-    X="$KCC --target=x86_64-linux-musl -isysroot $SYSROOT"
+    X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
 else
-    X="$KCC"
+    X="$JCC"
     XFAIL="$XFAIL tests/gcc-torture.arm64-macos.xfail"
 fi
 if command -v timeout >/dev/null 2>&1; then T="timeout 10"; else T=""; fi
@@ -37,7 +37,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/res" "$REF"
 
 # one test: the host compiler's verdict, cached as ref/NAME.out when the test
-# applies, then the kcc build; the outcome is a file under res/
+# applies, then the jcc build; the outcome is a file under res/
 cat >"$tmp/compile1.sh" <<'EOF'
 src=$1; name=$(basename "$src" .c)
 if [ ! -f "$REF/$name.out" ] && [ ! -f "$REF/$name.skip" ]; then
@@ -73,7 +73,7 @@ cat "$tmp"/res/*.fail >"$tmp/run.out" 2>/dev/null
 # run them: here, or all at once in the container
 if [ -n "$built" ]; then
     if [ "$mode" = x86_64 ]; then
-        docker run --rm --platform linux/amd64 -v "$tmp/bin:/w" kcc-x86_64-linux \
+        docker run --rm --platform linux/amd64 -v "$tmp/bin:/w" jcc-x86_64-linux \
             sh -c 'cd /w && printf "%s\n" $1 | xargs -P "$2" -n 1 sh ./run1.sh' sh "$built" "$JOBS"
     else
         (cd "$tmp/bin" && printf '%s\n' $built | xargs -P "$JOBS" -n 1 sh ./run1.sh)

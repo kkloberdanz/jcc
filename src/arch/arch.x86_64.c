@@ -167,7 +167,7 @@ static const char *xmm(int n) {
 
 static void x64_cg_begin(FILE *out) {
     x64_cg_out = out;
-    peep_begin(out, x64_peep_rules, getenv("KCC_NOPEEP") == NULL);
+    peep_begin(out, x64_peep_rules, getenv("JCC_NOPEEP") == NULL);
 }
 
 static void x64_cg_end(void) {
@@ -2262,10 +2262,10 @@ static void x64_cg_select(IRFunc *f) {
 #include "cpp.h"
 #include "predef_x86_64_linux.h"
 
-/* KCC_X86_64_LINUX_GCC_DIR is gcc's own directory, /usr/lib/gcc/<triple>/<version> */
+/* JCC_X86_64_LINUX_GCC_DIR is gcc's own directory, /usr/lib/gcc/<triple>/<version> */
 static const char *const x64_system_dirs[] = {
     "=/usr/include",
-    KCC_X86_64_LINUX_GCC_DIR "/include",   /* gcc's own headers, after the libc's as the distribution orders them */
+    JCC_X86_64_LINUX_GCC_DIR "/include",   /* gcc's own headers, after the libc's as the distribution orders them */
     NULL
 };
 
@@ -2276,7 +2276,7 @@ static const char *const x64_has_builtins[] = {
 };
 
 static const CppTarget x64_cpp_target = {
-    KCC_X86_64_LINUX_SYSROOT,
+    JCC_X86_64_LINUX_SYSROOT,
     x64_system_dirs,
     x64_predefined_macros,
     x64_nonstrict_macros,
@@ -2311,19 +2311,19 @@ static const Backend x64_backend = {
 
 /* the static link line of Alpine's gcc, less the stack protector library */
 static const char *const link_startfiles[] = {
-    "=/usr/lib/crt1.o", "=/usr/lib/crti.o", KCC_X86_64_LINUX_GCC_DIR "/crtbeginT.o", NULL
+    "=/usr/lib/crt1.o", "=/usr/lib/crti.o", JCC_X86_64_LINUX_GCC_DIR "/crtbeginT.o", NULL
 };
-static const char *const link_lib_dirs[] = { "=/usr/lib", KCC_X86_64_LINUX_GCC_DIR, NULL };
+static const char *const link_lib_dirs[] = { "=/usr/lib", JCC_X86_64_LINUX_GCC_DIR, NULL };
 static const char *const link_endfiles[] = {
     "--start-group", "-lgcc", "-lgcc_eh", "-lc", "--end-group",
-    KCC_X86_64_LINUX_GCC_DIR "/crtend.o", "=/usr/lib/crtn.o", NULL
+    JCC_X86_64_LINUX_GCC_DIR "/crtend.o", "=/usr/lib/crtn.o", NULL
 };
 /* the dynamic one: musl's loader and libc.so (the sysroot's symlink to it), libgcc still static */
 static const char *const dyn_startfiles[] = {
-    "=/usr/lib/crt1.o", "=/usr/lib/crti.o", KCC_X86_64_LINUX_GCC_DIR "/crtbegin.o", NULL
+    "=/usr/lib/crt1.o", "=/usr/lib/crti.o", JCC_X86_64_LINUX_GCC_DIR "/crtbegin.o", NULL
 };
 static const char *const dyn_endfiles[] = {
-    "-lc", "-lgcc", KCC_X86_64_LINUX_GCC_DIR "/crtend.o", "=/usr/lib/crtn.o", NULL
+    "-lc", "-lgcc", JCC_X86_64_LINUX_GCC_DIR "/crtend.o", "=/usr/lib/crtn.o", NULL
 };
 static const TargetLink x64_link = {
     "elf_x86_64", link_startfiles, link_lib_dirs, link_endfiles,

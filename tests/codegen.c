@@ -1,5 +1,5 @@
 /*
- * Step 4 test: integer code generation. Built with cc and kcc by
+ * Step 4 test: integer code generation. Built with cc and jcc by
  * tests/run.sh; the exit status and output must agree.
  */
 #include <stdio.h>

@@ -1,8 +1,8 @@
 /*
  * Step 3 test: types, conversions, initializers, constant expressions.
- * `kcc -fsyntax-only tests/sema.c` must be silent; built with cc it exits 0.
+ * `jcc -fsyntax-only tests/sema.c` must be silent; built with cc it exits 0.
  * It uses floating point, which the code generator does not do yet.
- * kcc: syntax-only
+ * jcc: syntax-only
  */
 
 struct Point { int x, y; };

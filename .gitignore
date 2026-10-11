@@ -1,11 +1,11 @@
 *.o
 *.sw?
-kcc
+jcc
 a.out
 core
 src/arch.c
 y.tab.c
-kcc-*
-libkcc.a
+jcc-*
+libjcc.a
 csmith-fail/
 dist/
