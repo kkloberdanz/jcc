@@ -1,5 +1,5 @@
 # Sourced by the scripts that compile jcc's backends outside the Makefile
-# (tests/selfhost.sh, tests/amalgamation.sh): sets TARGET_DEFS, the four
+# (tests/selfhost.sh, tests/amalgamation.sh): sets TARGET_DEFS, the
 # -D macros naming each target's default header locations, from the
 # variables of the same names, which default as in the Makefile (the make
 # targets pass them, so a build from make and one from a script agree).
@@ -7,10 +7,17 @@ if [ "$(uname -s)" = Darwin ]; then
     : "${ARM64_MACOS_SYSROOT:=$(xcrun --show-sdk-path)}"
     : "${ARM64_MACOS_RESOURCE_INC:=$(cc -print-resource-dir)/include}"
     : "${X86_64_LINUX_SYSROOT:=${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}"
+    : "${X86_64_FREEBSD_SYSROOT:=${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-freebsd}"
+elif [ "$(uname -s)" = FreeBSD ]; then
+    : "${ARM64_MACOS_SYSROOT:=/}"
+    : "${ARM64_MACOS_RESOURCE_INC:=/}"
+    : "${X86_64_LINUX_SYSROOT:=${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}"
+    : "${X86_64_FREEBSD_SYSROOT:=/}"
 else
     : "${ARM64_MACOS_SYSROOT:=/}"
     : "${ARM64_MACOS_RESOURCE_INC:=/}"
     : "${X86_64_LINUX_SYSROOT:=/}"
+    : "${X86_64_FREEBSD_SYSROOT:=${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-freebsd}"
 fi
 if [ -z "$X86_64_LINUX_GCC_DIR" ]; then
     ver=$(ls -d "$X86_64_LINUX_SYSROOT"/usr/lib/gcc/x86_64-alpine-linux-musl/*/include 2>/dev/null | head -1)
@@ -18,4 +25,5 @@ if [ -z "$X86_64_LINUX_GCC_DIR" ]; then
     X86_64_LINUX_GCC_DIR="=/usr/lib/gcc/x86_64-alpine-linux-musl/$ver"
 fi
 TARGET_DEFS="-DJCC_ARM64_MACOS_SYSROOT=\"$ARM64_MACOS_SYSROOT\" -DJCC_ARM64_MACOS_RESOURCE_INC=\"$ARM64_MACOS_RESOURCE_INC\" \
-    -DJCC_X86_64_LINUX_SYSROOT=\"$X86_64_LINUX_SYSROOT\" -DJCC_X86_64_LINUX_GCC_DIR=\"$X86_64_LINUX_GCC_DIR\""
+    -DJCC_X86_64_LINUX_SYSROOT=\"$X86_64_LINUX_SYSROOT\" -DJCC_X86_64_LINUX_GCC_DIR=\"$X86_64_LINUX_GCC_DIR\" \
+    -DJCC_X86_64_FREEBSD_SYSROOT=\"$X86_64_FREEBSD_SYSROOT\""

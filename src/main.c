@@ -200,6 +200,7 @@ static void parse_options(int argc, char **argv, struct Options *options) {
     options->n_include_dirs = 0;
     options->n_macros = 0;
     options->nostdinc = 0;
+    options->dynamic = 0;
     options->opt_level = '0';
 
     parse_long_options(&argc, argv, options);

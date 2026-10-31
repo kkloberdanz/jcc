@@ -3176,6 +3176,8 @@ int sema(AST *tu, SymTab *st) {
             sema_function(item);
         } else if (item->kind == N_DECLARATION) {
             sema_declaration(item, 1);
+        } else if (item->kind == N_ATTRIBUTE) {
+            free(sema_file_asm(item));
         } else {
             diag_error(item->loc, "internal error: %s at file scope", node_kind_name(item->kind));
         }
@@ -3419,6 +3421,60 @@ static Type *builtin_type(const char *name) {
 
 int sema_const_eval_float(AST *expr, long double *value) {
     return float_eval(expr, value);
+}
+
+char *sema_file_asm(const AST *item) {
+    const char *p = item->u.text;
+    char *lits = xmalloc(strlen(p) + 1);
+    size_t n = 0;
+    char *text;
+
+    /* the keyword, then ( "..." "..." ): the literals are gathered space-separated, as decode_literal reads them */
+    while (*p == '_' || isalpha((unsigned char)*p)) {
+        p++;
+    }
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (*p++ != '(') {
+        goto bad;
+    }
+    for (;;) {
+        while (isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (*p == ')') {
+            break;
+        }
+        if (*p != '"') {
+            goto bad;
+        }
+        if (n > 0) {
+            lits[n++] = ' ';
+        }
+        lits[n++] = *p++;
+        while (*p && *p != '"') {
+            if (*p == '\\' && p[1]) {
+                lits[n++] = *p++;
+            }
+            lits[n++] = *p++;
+        }
+        if (*p != '"') {
+            goto bad;
+        }
+        lits[n++] = *p++;
+    }
+    if (n == 0) {
+        goto bad;
+    }
+    lits[n] = '\0';
+    sema_string_bytes(lits, &text);
+    free(lits);
+    return text;
+bad:
+    free(lits);
+    diag_error(item->loc, "a file-scope asm takes one string literal");
+    return NULL;
 }
 
 size_t sema_string_width(const char *text) {

@@ -14,7 +14,7 @@
 cd "$(dirname "$0")/.." || exit 1
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
-defs='-DJCC_ARM64_MACOS_SYSROOT="" -DJCC_ARM64_MACOS_RESOURCE_INC="" -DJCC_X86_64_LINUX_SYSROOT="" -DJCC_X86_64_LINUX_GCC_DIR=""'
+defs='-DJCC_ARM64_MACOS_SYSROOT="" -DJCC_ARM64_MACOS_RESOURCE_INC="" -DJCC_X86_64_LINUX_SYSROOT="" -DJCC_X86_64_LINUX_GCC_DIR="" -DJCC_X86_64_FREEBSD_SYSROOT=""'
 [ -f y.tab.c ] || { echo "no y.tab.c: run make first"; exit 1; }
 for src in src/*.c src/arch/arch.*.c src/as/*.c y.tab.c; do
     [ "$src" != src/main.c ] || continue

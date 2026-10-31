@@ -489,6 +489,36 @@ static int directive(As *a, const AsmTok *t, size_t n) {
         it->u.sym = sym;
         return 0;
     }
+    if (as_tok_is(d, ".symver")) {
+        /* .symver impl, name@ver (or name@@@ver, the same for an undefined impl), as FreeBSD's headers write */
+        AsmSymver *v;
+        size_t ats = 0, len;
+        if (a->arch->secsym != SECSYM_SECTION) {
+            as_error(a, ".symver is only for ELF");
+            return -1;
+        }
+        if (n < 6 || t[1].kind != ATOK_IDENT || t[2].kind != ATOK_PUNCT || t[2].punct != ',' || t[3].kind != ATOK_IDENT) goto junk;
+        for (i = 4; i < n && t[i].kind == ATOK_PUNCT && t[i].punct == '@'; i++) {
+            ats++;
+        }
+        if ((ats != 1 && ats != 3) || i + 1 != n || t[i].kind != ATOK_IDENT) goto junk;
+        if (a->nsymvers == a->symvers_cap) {
+            a->symvers_cap = a->symvers_cap ? a->symvers_cap * 2 : 8;
+            a->symvers = xrealloc(a->symvers, a->symvers_cap * sizeof(AsmSymver));
+        }
+        v = &a->symvers[a->nsymvers++];
+        v->impl = xrealloc(NULL, t[1].len + 1);
+        memcpy(v->impl, t[1].s, t[1].len);
+        v->impl[t[1].len] = '\0';
+        len = t[3].len + 1 + t[i].len;
+        v->versioned = xrealloc(NULL, len + 1);
+        memcpy(v->versioned, t[3].s, t[3].len);
+        v->versioned[t[3].len] = '@';
+        memcpy(v->versioned + t[3].len + 1, t[i].s, t[i].len);
+        v->versioned[len] = '\0';
+        v->line = a->line;
+        return 0;
+    }
     if (as_tok_is(d, ".cfi_startproc") || as_tok_is(d, ".cfi_endproc")) {
         if (n != 1) goto junk;
         return 0;   /* no unwind tables are written */
@@ -613,6 +643,43 @@ static void as_free(As *a) {
     }
     free(a->syms);
     free(a->buckets);
+    for (i = 0; i < a->nsymvers; i++) {
+        free(a->symvers[i].impl);
+        free(a->symvers[i].versioned);
+    }
+    free(a->symvers);
+}
+
+/*
+ * Apply the .symver bindings, as the GNU assembler does for an undefined
+ * symbol: the unit's references to it become references to the versioned
+ * name, and a binding for a symbol the unit never mentions does nothing.
+ * Versioning a symbol the unit defines (an alias in the object) is not
+ * supported.
+ */
+static void apply_symvers(As *a) {
+    size_t k, i;
+    int renamed = 0;
+    for (k = 0; k < a->nsymvers; k++) {
+        const AsmSymver *v = &a->symvers[k];
+        for (i = 0; i < a->nsyms && strcmp(a->syms[i].name, v->impl) != 0; i++) {
+        }
+        if (i == a->nsyms) {
+            continue;
+        }
+        if (a->syms[i].section >= 0) {
+            a->line = v->line;
+            as_error(a, ".symver of %s, which this unit defines, is not supported", v->impl);
+            continue;
+        }
+        free(a->syms[i].name);
+        a->syms[i].name = xrealloc(NULL, strlen(v->versioned) + 1);
+        strcpy(a->syms[i].name, v->versioned);
+        renamed = 1;
+    }
+    if (renamed) {
+        rehash(a, a->nbuckets);
+    }
 }
 
 static int define_symbol(As *a, const char *s, size_t len) {
@@ -685,6 +752,7 @@ int as_check(const char *name, const char *text, size_t len) {
     int rc;
     as_init(&a, name);
     parse_unit(&a, text, len);
+    apply_symvers(&a);
     rc = a.errors ? -1 : 0;
     as_free(&a);
     return rc;
@@ -858,6 +926,7 @@ int as_assemble(const char *name, const char *text, size_t len, char **out, size
     *out_len = 0;
     as_init(&a, name);
     parse_unit(&a, text, len);
+    apply_symvers(&a);
     if (a.errors == 0 && !a.arch->write) {
         as_error(&a, "no object writer for %s yet", a.arch->name);
     }

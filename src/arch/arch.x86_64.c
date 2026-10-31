@@ -2331,3 +2331,59 @@ static const TargetLink x64_link = {
 };
 
 const Target target_x86_64_linux = { "x86_64-linux-musl", x64_aliases, &x64_info, &x64_cpp_target, &x64_backend, &x64_link, &as_x86_64 };
+
+/*
+ * x86_64 FreeBSD: the same code generator and System V ABI, with FreeBSD's
+ * headers, C runtime and libraries. Its system compiler is clang, whose
+ * predefined macros and feature answers the tables give; its own headers
+ * are only intrinsics, so the libc's directory is the only system one.
+ */
+
+#include "predef_x86_64_freebsd.h"
+
+static const char *const x64fb_system_dirs[] = { "=/usr/include", NULL };
+
+static const CppTarget x64fb_cpp_target = {
+    JCC_X86_64_FREEBSD_SYSROOT,
+    x64fb_system_dirs,
+    x64fb_predefined_macros,
+    x64fb_nonstrict_macros,
+    x64fb_has_answers,
+    x64_has_builtins
+};
+
+static const char *const x64fb_aliases[] = {
+    "x86_64-freebsd", "x86_64-pc-freebsd", "amd64-freebsd", "amd64-unknown-freebsd", "x86_64-unknown-freebsd14", NULL
+};
+
+/*
+ * clang's link lines on FreeBSD: libgcc is LLVM's compiler-rt under that
+ * name. crt1.o carries the note that brands the executable as FreeBSD's.
+ */
+static const char *const x64fb_startfiles[] = {
+    "=/usr/lib/crt1.o", "=/usr/lib/crti.o", "=/usr/lib/crtbeginT.o", NULL
+};
+static const char *const x64fb_lib_dirs[] = { "=/usr/lib", NULL };
+static const char *const x64fb_endfiles[] = {
+    "--start-group", "-lgcc", "-lgcc_eh", "-lc", "--end-group", "=/usr/lib/crtend.o", "=/usr/lib/crtn.o", NULL
+};
+static const char *const x64fb_dyn_startfiles[] = {
+    "=/usr/lib/crt1.o", "=/usr/lib/crti.o", "=/usr/lib/crtbegin.o", NULL
+};
+/*
+ * the shared libc by name rather than -lc: the sysroot's libc.so is a
+ * linker script naming /lib/libc.so.7, which ld.lld would look for on this
+ * machine. --as-needed for libgcc_s, as clang does.
+ */
+static const char *const x64fb_dyn_endfiles[] = {
+    "-lgcc", "--as-needed", "-lgcc_s", "--no-as-needed", "=/lib/libc.so.7", "=/usr/lib/libc_nonshared.a",
+    "-lgcc", "--as-needed", "-lgcc_s", "--no-as-needed", "=/usr/lib/crtend.o", "=/usr/lib/crtn.o", NULL
+};
+static const TargetLink x64fb_link = {
+    "elf_x86_64_fbsd", x64fb_startfiles, x64fb_lib_dirs, x64fb_endfiles,
+    x64fb_dyn_startfiles, x64fb_dyn_endfiles, "/libexec/ld-elf.so.1"
+};
+
+const Target target_x86_64_freebsd = {
+    "x86_64-unknown-freebsd", x64fb_aliases, &x64_info, &x64fb_cpp_target, &x64_backend, &x64fb_link, &as_x86_64
+};

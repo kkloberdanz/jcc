@@ -36,7 +36,7 @@ build() {
     done
     for src in src/arch/arch.*.c; do
         name=$(basename "$src" .c)
-        # the four -D values contain spaces only if the paths do; word splitting is intended
+        # the -D values contain spaces only if the paths do; word splitting is intended
         "$1" $JCCFLAGS -std=gnu89 -Isrc $TARGET_DEFS -c -o "$2/$name.o" "$src" || return 1
     done
     for src in src/as/*.c; do

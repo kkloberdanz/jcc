@@ -207,7 +207,17 @@ typedef struct As {
     size_t syms_cap;
     int *buckets;           /* the symbol hash table: indices into syms, -1 for empty */
     size_t nbuckets;
+    struct AsmSymver *symvers;  /* .symver bindings, applied once the unit is parsed */
+    size_t nsymvers;
+    size_t symvers_cap;
 } As;
+
+/* .symver impl, name@ver: a reference to `impl` (undefined here) is to the versioned `name@ver` */
+typedef struct AsmSymver {
+    char *impl;
+    char *versioned;
+    unsigned line;
+} AsmSymver;
 
 /*
  * A target: its register names, how an operand is spelled, and its table

@@ -1003,6 +1003,18 @@ int codegen(AST *tu, SymTab *symtab, FILE *output) {
     nstatics = 0;
     cg->begin(output);
 
+    /* file-scope asm, first and in source order; everything after sets its own section */
+    for (i = 0; i < tu->u.list->len; i++) {
+        AST *item = tu->u.list->items[i];
+        if (item->kind == N_ATTRIBUTE) {
+            char *text = sema_file_asm(item);
+            if (text) {
+                fprintf(output, "%s\n", text);
+                free(text);
+            }
+        }
+    }
+
     for (s = symtab->file->first; s; s = s->next) {
         if (s->ns == NS_ORDINARY && s->kind == SYM_VARIABLE && s->def) {
             mark_refs(s->def->u.init_decl.init);

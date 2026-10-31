@@ -32,6 +32,13 @@ int sema_const_eval_complex(AST *expr, long double *re, long double *im);
 size_t sema_string_bytes(const char *text, char **out);    /* bytes before the terminator */
 size_t sema_string_width(const char *text);                /* bytes per element: 1, or wchar_t's for L"..." */
 
+/*
+ * The text of a file-scope basic asm (`__asm__("...");`, an N_ATTRIBUTE
+ * at file scope), decoded; NULL, with a diagnostic, if its operand is not
+ * plain string literals. The caller frees it.
+ */
+char *sema_file_asm(const AST *item);
+
 /* `e` names a bit-field member */
 int sema_is_bitfield(const AST *e);
 /* `v` reduced to the width and signedness of integer type `t` */

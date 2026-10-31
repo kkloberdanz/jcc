@@ -40,7 +40,8 @@ system=$(grep -h '^#include <' src/*.c src/*.h src/arch/*.c src/arch/*.h src/as/
  * (also embedded below). Build it with any C89 compiler, for example
  *     cc -std=gnu89 -c jcc.c
  * with the JCC_ARM64_MACOS_SYSROOT, JCC_ARM64_MACOS_RESOURCE_INC,
- * JCC_X86_64_LINUX_SYSROOT and JCC_X86_64_LINUX_GCC_DIR macros naming
+ * JCC_X86_64_LINUX_SYSROOT, JCC_X86_64_LINUX_GCC_DIR and
+ * JCC_X86_64_FREEBSD_SYSROOT macros naming
  * each target's default header locations (see the Makefile); a host
  * can override them at run time with -isysroot and -I.
  */

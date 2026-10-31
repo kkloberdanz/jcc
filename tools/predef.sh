@@ -6,6 +6,8 @@
 #
 #   tools/predef.sh arm64-macos            # from the host's clang and SDK
 #   tools/predef.sh x86_64-linux dM.txt    # from a saved `gcc -E -dM -std=gnu89 - </dev/null`
+#   tools/predef.sh x86_64-freebsd         # from the host's clang, aimed at FreeBSD, and
+#                                          # the sysroot tools/sysroot-freebsd.sh made
 #
 # Lines are stored without `#define `; a backslash or quote in a body is
 # escaped. `__STRICT_ANSI__` is left out (it depends on -std) and macros
@@ -14,20 +16,29 @@
 set -e
 target=$1
 case "$target" in
-    arm64-macos|x86_64-linux) ;;
-    *) echo "usage: tools/predef.sh arm64-macos | x86_64-linux dM.txt" >&2; exit 2 ;;
+    arm64-macos|x86_64-linux|x86_64-freebsd) ;;
+    *) echo "usage: tools/predef.sh arm64-macos | x86_64-linux dM.txt | x86_64-freebsd" >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
 out=src/arch/predef_$(echo "$target" | tr - _).h
 # the tables carry the backend's prefix, so both backends can live in one translation unit (the amalgamation)
-case "$target" in arm64-macos) prefix=a64_ ;; *) prefix=x64_ ;; esac
+case "$target" in arm64-macos) prefix=a64_ ;; x86_64-freebsd) prefix=x64fb_ ;; *) prefix=x64_ ;; esac
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
-if [ "$target" = arm64-macos ]; then
-    echo | cc -E -dM -std=c90 - > "$tmp/dm"
-    sdk=$(xcrun --show-sdk-path)
-    res=$(cc -print-resource-dir)/include
+if [ "$target" != x86_64-linux ]; then
+    if [ "$target" = arm64-macos ]; then
+        clang="cc"
+        sdk=$(xcrun --show-sdk-path)
+        res=$(cc -print-resource-dir)/include
+    else
+        # FreeBSD's system compiler is clang; its own headers are only intrinsics, so the libc's are all there is
+        sdk=${X86_64_FREEBSD_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-freebsd}
+        [ -f "$sdk/VERSION" ] || { echo "no FreeBSD sysroot at $sdk: run tools/sysroot-freebsd.sh" >&2; exit 2; }
+        clang="cc --target=x86_64-unknown-freebsd$(cat "$sdk/VERSION")"
+        res=$sdk/usr/include
+    fi
+    echo | $clang -E -dM -std=c90 - > "$tmp/dm"
     # every feature query spelled in the headers, with whitespace removed
     grep -rhoE "(__has_(feature|extension|attribute|builtin|cpp_attribute|declspec_attribute|c_attribute|warning)|__is_target_[a-z_]+|__building_module|__is_identifier)[[:space:]]*\([[:space:]]*[^()]+[[:space:]]*\)" \
         "$sdk/usr/include" "$res" 2>/dev/null | sed 's/[[:space:]]//g' | grep -v '\.\.\.' > "$tmp/q1"
@@ -39,7 +50,7 @@ if [ "$target" = arm64-macos ]; then
     cat "$tmp/q1" "$tmp/q2" "$tmp/q3" | sort -u > "$tmp/queries"
     # ask clang about each one; the index survives macro expansion where the query would not
     awk '{printf "#if %s\nHAS %d 1\n#else\nHAS %d 0\n#endif\n", $0, NR, NR}' "$tmp/queries" > "$tmp/has.c"
-    cc -E -P -std=c90 "$tmp/has.c" 2>"$tmp/has.err" | awk '$1 == "HAS" {print $2, $3}' > "$tmp/has.idx"
+    $clang -E -P -std=c90 "$tmp/has.c" 2>"$tmp/has.err" | awk '$1 == "HAS" {print $2, $3}' > "$tmp/has.idx"
     # a query clang itself rejects is dropped
     grep -oE 'has\.c:[0-9]+' "$tmp/has.err" | sed 's/.*://' | awk '{print int(($1 - 1) / 5) + 1}' | sort -u > "$tmp/bad"
     awk 'NR == FNR {v[$1] = $2; next} FILENAME == ARGV[2] {bad[$1] = 1; next} !(FNR in bad) {print $0, v[FNR]}' \

@@ -14,10 +14,18 @@ ARM64_MACOS_RESOURCE_INC?=$(shell cc -print-resource-dir)/include
 # the Linux sysroot, which tools/sysroot.sh fills from Docker; also used by the x86_64 tests
 # where tools/sysroot.sh puts it: under XDG_DATA_HOME, since the compiler depends on it
 X86_64_SYSROOT?=$(or $(XDG_DATA_HOME),$(HOME)/.local/share)/jcc/x86_64-linux-musl
+# the FreeBSD sysroot, which tools/sysroot-freebsd.sh extracts from the release
+X86_64_FREEBSD_SYSROOT?=$(or $(XDG_DATA_HOME),$(HOME)/.local/share)/jcc/x86_64-freebsd
+else ifeq ($(HOST_OS),FreeBSD)
+ARM64_MACOS_SYSROOT?=/
+ARM64_MACOS_RESOURCE_INC?=/
+X86_64_SYSROOT?=$(or $(XDG_DATA_HOME),$(HOME)/.local/share)/jcc/x86_64-linux-musl
+X86_64_FREEBSD_SYSROOT?=/
 else
 ARM64_MACOS_SYSROOT?=/
 ARM64_MACOS_RESOURCE_INC?=/
 X86_64_SYSROOT?=/
+X86_64_FREEBSD_SYSROOT?=$(or $(XDG_DATA_HOME),$(HOME)/.local/share)/jcc/x86_64-freebsd
 endif
 X86_64_LINUX_SYSROOT?=$(X86_64_SYSROOT)
 # gcc's own directory (its headers, crt*.o and libgcc) is under a version
@@ -30,7 +38,8 @@ X86_64_LINUX_GCC_DIR?==/usr/lib/gcc/x86_64-alpine-linux-musl/$(X86_64_GCC_VER)
 TARGET_DEFS=-DJCC_ARM64_MACOS_SYSROOT='"$(ARM64_MACOS_SYSROOT)"' \
     -DJCC_ARM64_MACOS_RESOURCE_INC='"$(ARM64_MACOS_RESOURCE_INC)"' \
     -DJCC_X86_64_LINUX_SYSROOT='"$(X86_64_LINUX_SYSROOT)"' \
-    -DJCC_X86_64_LINUX_GCC_DIR='"$(X86_64_LINUX_GCC_DIR)"'
+    -DJCC_X86_64_LINUX_GCC_DIR='"$(X86_64_LINUX_GCC_DIR)"' \
+    -DJCC_X86_64_FREEBSD_SYSROOT='"$(X86_64_FREEBSD_SYSROOT)"'
 
 SRC=$(wildcard src/*.c)
 ARCH_SRC=$(wildcard src/arch/arch.*.c)
@@ -159,7 +168,8 @@ verify: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' N='$(N)' sh tests/verify.sh
 
 TARGET_VARS=ARM64_MACOS_SYSROOT='$(ARM64_MACOS_SYSROOT)' ARM64_MACOS_RESOURCE_INC='$(ARM64_MACOS_RESOURCE_INC)' \
-    X86_64_LINUX_SYSROOT='$(X86_64_LINUX_SYSROOT)' X86_64_LINUX_GCC_DIR='$(X86_64_LINUX_GCC_DIR)'
+    X86_64_LINUX_SYSROOT='$(X86_64_LINUX_SYSROOT)' X86_64_LINUX_GCC_DIR='$(X86_64_LINUX_GCC_DIR)' \
+    X86_64_FREEBSD_SYSROOT='$(X86_64_FREEBSD_SYSROOT)'
 
 .PHONY: selfhost
 selfhost: jcc

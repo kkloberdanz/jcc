@@ -2148,6 +2148,11 @@ external_declaration
         {
             $$ = NULL;
         }
+    | ASM ';'
+        {
+            /* file-scope basic asm: its text goes to the assembly as it is (sema checks it, codegen writes it) */
+            $$ = $1;
+        }
     ;
 
 /*

@@ -6,6 +6,7 @@
 const Target *const targets[] = {
     &target_arm64_macos,
     &target_x86_64_linux,
+    &target_x86_64_freebsd,
     NULL
 };
 
@@ -19,6 +20,8 @@ const Target *target_host(void) {
     return &target_arm64_macos;
 #elif defined(__linux__) && defined(__x86_64__)
     return &target_x86_64_linux;
+#elif defined(__FreeBSD__) && defined(__x86_64__)
+    return &target_x86_64_freebsd;
 #elif defined(__linux__) && defined(__aarch64__)
     return &target_x86_64_linux;    /* no arm64 Linux backend: a cross compiler by default */
 #else
