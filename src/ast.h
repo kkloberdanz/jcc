@@ -141,7 +141,7 @@ typedef enum QualKind {
     X(N_INIT_LIST, "InitList")           /* list: initializers */ \
     X(N_DESIGNATED, "Designated")        /* desig: path (designators), init */ \
     X(N_DESIG_MEMBER, "DesigMember")     /* name: `.name` */ \
-    X(N_DESIG_INDEX, "DesigIndex")       /* cast: expr = `[expr]` */ \
+    X(N_DESIG_INDEX, "DesigIndex")       /* cast: expr = `[expr]`; type = the last index of a GNU range `[expr ... last]`, or NULL */ \
     X(N_DECL_NAME, "DeclName")           /* declarator: name, attrs */ \
     X(N_DECL_POINTER, "DeclPointer")     /* declarator: inner, quals, block, attrs */ \
     X(N_DECL_ARRAY, "DeclArray")         /* declarator: inner, size (may be NULL), attrs */ \
@@ -280,6 +280,7 @@ struct AST {
             ASTList *attrs;
             int variadic;
             int kr;     /* params is a K&R identifier list */
+            int star;   /* DeclArray: C99 `[*]` */
             int block;  /* `^` rather than `*` */
             struct Scope *scope;  /* DeclFunc: the parameters' scope */
         } declarator;

@@ -530,6 +530,7 @@ typedef struct InitCursor {
     ASTList *list;
     size_t pos;
     size_t path_pos;
+    int anon;   /* the designator selected an anonymous member and applies inside it */
 } InitCursor;
 
 static int pieces_unordered = 0;    /* a designator was used: pieces may be out of order */
@@ -551,12 +552,23 @@ static AST *gen_cur_designator(InitCursor *c) {
 }
 
 static int gen_cur_is_fresh_designation(InitCursor *c) {
-    return c->list->items[c->pos]->kind == N_DESIGNATED && c->path_pos == 0;
+    return c->list->items[c->pos]->kind == N_DESIGNATED && c->path_pos == 0 && !c->anon;
 }
 
 static void gen_advance(InitCursor *c) {
     c->pos++;
     c->path_pos = 0;
+    c->anon = 0;
+}
+
+static void gen_apply(InitCursor *c, int through_anon) {
+    if (through_anon) {
+        c->anon = 1;
+    } else {
+        c->path_pos++;
+        c->anon = 0;
+    }
+    pieces_unordered = 1;
 }
 
 /* the designated index or member, which sema has checked */
@@ -566,14 +578,15 @@ static long gen_designated_index(AST *d) {
     return (long)v;
 }
 
-static long gen_designated_member(AST *d, Record *r) {
-    size_t i;
-    for (i = 0; i < r->nmembers; i++) {
-        if (r->members[i].name && strcmp(r->members[i].name, d->u.name) == 0) {
-            return (long)i;
-        }
-    }
-    return -1;
+/* the last index of a range designator */
+static long gen_designated_last(AST *d) {
+    long v = 0;
+    sema_const_eval(d->u.cast.type, &v);
+    return (long)v;
+}
+
+static long gen_designated_member(AST *d, Record *r, int *through_anon) {
+    return record_designator_index(r, d->u.name, through_anon);
 }
 
 static void gen_init_object(Type *t, InitCursor *c, long off, int top);
@@ -633,6 +646,7 @@ static void gen_init_braced(Type *t, AST *list, long off) {
     c.list = list->u.list;
     c.pos = 0;
     c.path_pos = 0;
+    c.anon = 0;
     gen_init_object(t, &c, off, 1);
 }
 
@@ -688,8 +702,18 @@ static void gen_init_object(Type *t, InitCursor *c, long off, int top) {
             d = gen_cur_designator(c);
             if (d) {
                 n = gen_designated_index(d);
-                c->path_pos++;
-                pieces_unordered = 1;
+                gen_apply(c, 0);
+                if (d->u.cast.type) {
+                    /* a GNU range: every element in it takes the item's initializer, read afresh from the same place */
+                    long last = gen_designated_last(d);
+                    size_t pos = c->pos, path_pos = c->path_pos;
+                    for (; n < last; n++) {
+                        gen_init_elem(t->base, c, off + n * size);
+                        c->pos = pos;
+                        c->path_pos = path_pos;
+                        c->anon = 0;
+                    }
+                }
             } else if (t->length >= 0 && n >= t->length) {
                 break;
             }
@@ -709,14 +733,14 @@ static void gen_init_object(Type *t, InitCursor *c, long off, int top) {
             }
             d = gen_cur_designator(c);
             if (d) {
-                long k = gen_designated_member(d, r);
+                int through_anon;
+                long k = gen_designated_member(d, r, &through_anon);
                 if (k < 0) {
                     gen_advance(c);
                     continue;
                 }
                 i = (size_t)k;
-                c->path_pos++;
-                pieces_unordered = 1;
+                gen_apply(c, through_anon);
             } else if (i >= r->nmembers) {
                 break;
             } else if (!r->members[i].name && r->members[i].bits >= 0) {
@@ -734,29 +758,34 @@ static void gen_init_object(Type *t, InitCursor *c, long off, int top) {
         return;
     }
     if (t->kind == TY_UNION) {
+        /* as in sema: one member, unless designators name more */
         Record *r = t->record;
-        if (r->nmembers && c->pos < c->list->len) {
+        int done = 0;
+        while (r->nmembers && c->pos < c->list->len) {
             AST *d;
             size_t i = 0;
             if (!top && gen_cur_is_fresh_designation(c)) {
-                return;
+                break;
             }
             d = gen_cur_designator(c);
             if (d) {
-                long k = gen_designated_member(d, r);
+                int through_anon;
+                long k = gen_designated_member(d, r, &through_anon);
                 if (k < 0) {
                     gen_advance(c);
-                    return;
+                    continue;
                 }
                 i = (size_t)k;
-                c->path_pos++;
-                pieces_unordered = 1;
+                gen_apply(c, through_anon);
+            } else if (done) {
+                break;
             }
             if (r->members[i].bits >= 0) {
                 init_bitfield(&r->members[i], c, off + (long)r->members[i].offset);
             } else {
                 gen_init_elem(r->members[i].type, c, off + (long)r->members[i].offset);
             }
+            done = 1;
         }
         return;
     }
@@ -773,6 +802,7 @@ static void gen_initializer(Type *t, AST *init, long off) {
             c.list = init->u.list;
             c.pos = 0;
             c.path_pos = 0;
+            c.anon = 0;
             if (c.list->len) {
                 gen_init_elem(t, &c, off);
             }

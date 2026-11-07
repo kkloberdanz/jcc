@@ -175,6 +175,22 @@ Member *record_lookup(const Record *r, const char *name, Member **path, size_t *
     return lookup_in(r, name, path, depth, 0);
 }
 
+long record_designator_index(const Record *r, const char *name, int *through_anon) {
+    Member *path[RECORD_PATH_MAX];
+    size_t depth = 0;
+    Member *m = record_lookup(r, name, path, &depth);
+
+    *through_anon = 0;
+    if (!m) {
+        return -1;
+    }
+    if (depth > 0) {
+        *through_anon = 1;
+        return (long)(path[0] - r->members);
+    }
+    return (long)(m - r->members);
+}
+
 int record_has_unaligned(const Record *r) {
     size_t i;
     for (i = 0; i < r->nmembers; i++) {

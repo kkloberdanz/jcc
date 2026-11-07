@@ -1217,6 +1217,30 @@ static unsigned quals_of(ASTList *list) {
     return q;
 }
 
+/*
+ * C99 lets a parameter's outermost array declarator carry qualifiers and
+ * `static` (`int a[const static 4]`), and lets a prototype's say `[*]`.
+ * array_param_top is that declarator while a parameter is analysed, and
+ * star_ok is set inside a prototype that is not a definition's.
+ */
+static AST *array_param_top;
+static int star_ok;
+
+/* the declarator node that makes the outermost type of declarator `d`, or NULL */
+static AST *declarator_top(AST *d) {
+    AST *top = NULL;
+    for (; d && d->kind != N_DECL_NAME; d = d->u.declarator.inner) {
+        top = d;
+    }
+    return top;
+}
+
+/* the qualifiers `[const 5]` gives the pointer a parameter declared by `d` becomes */
+static unsigned array_param_quals(AST *d) {
+    AST *top = declarator_top(d);
+    return top && top->kind == N_DECL_ARRAY ? quals_of(top->u.declarator.quals) : 0;
+}
+
 /* a parameter's type after the array and function adjustments */
 static Type *adjust_param(Type *t) {
     if (t->kind == TY_ARRAY) {
@@ -1285,6 +1309,24 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
                     }
                     length = (long)n;
                 }
+                if (node->u.declarator.quals && node != array_param_top) {
+                    diag_error(node->loc, "static or type qualifiers in an array declarator are only allowed in a parameter's outermost one");
+                }
+                if (node->u.declarator.star) {
+                    size_t qi;
+                    for (qi = 0; node->u.declarator.quals && qi < node->u.declarator.quals->len; qi++) {
+                        if (node->u.declarator.quals->items[qi]->kind == N_STORAGE_CLASS) {
+                            diag_error(node->loc, "'static' may not be used with an unspecified variable length array size");
+                            break;
+                        }
+                    }
+                    if (!star_ok) {
+                        diag_error(node->loc, "'[*]' is only allowed in a function prototype");
+                    } else if (node != array_param_top) {
+                        /* sized by nothing: a prototype's types are compared, never laid out */
+                        vla = 1;
+                    }
+                }
                 t = vla ? type_vla(t, node->u.declarator.size) : type_array(t, length);
                 node->type = t;
                 node = node->u.declarator.inner;
@@ -1324,7 +1366,13 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
                         }
                         pt = sp.type;
                         if (p->u.typed.declarator) {
+                            AST *saved_top = array_param_top;
+                            int saved_star = star_ok;
+                            array_param_top = declarator_top(p->u.typed.declarator);
+                            star_ok = node != defining_fn;
                             pt = sema_declarator(p->u.typed.declarator, sp.type, &pname);
+                            array_param_top = saved_top;
+                            star_ok = saved_star;
                         }
                         if (pt->kind == TY_VOID && plist->len == 1 && !pname && !pt->quals) {
                             /* f(void) */
@@ -1335,6 +1383,9 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
                             pt = int_type();
                         }
                         pt = adjust_param(pt);
+                        if (pt->kind == TY_POINTER && p->u.typed.declarator) {
+                            pt = type_qualify(pt, array_param_quals(p->u.typed.declarator));
+                        }
                         p->type = pt;
                         if (p->sym) {
                             p->sym->type = pt;
@@ -2177,6 +2228,11 @@ static Type *sema_member(AST *e) {
     return e->type;
 }
 
+/* an analysed cast of a struct or union to its own type */
+static int record_cast(const AST *e) {
+    return e->type && type_is_record(e->type) && e->u.cast.expr->type && type_is_record(e->u.cast.expr->type);
+}
+
 static Type *sema_cast(AST *e) {
     Type *to = sema_type_name(e->u.cast.type);
     Type *from = sema_rvalue(&e->u.cast.expr);
@@ -2185,6 +2241,9 @@ static Type *sema_cast(AST *e) {
     e->type = type_unqualified(to);
     if (to->kind == TY_VOID) {
         return e->type;
+    }
+    if (type_is_record(to) && type_compatible_unqual(from, to)) {
+        return e->type;     /* record_cast: sema_expr drops the cast */
     }
     if (!type_is_scalar(to)) {
         diag_error(e->loc, "cast to non-scalar type %s", ts(to));
@@ -2396,7 +2455,14 @@ static Type *sema_expr(AST **slot) {
             return sema_member(e);
 
         case N_CAST:
-            return sema_cast(e);
+            if (sema_cast(e) && record_cast(e)) {
+                /* GNU: a cast of a struct or union to its own type is the operand itself, as a value */
+                *slot = e->u.cast.expr;
+                e->u.cast.expr = NULL;
+                ast_free(e);
+                (*slot)->lvalue = 0;
+            }
+            return (*slot)->type;
 
         case N_COMPOUND_LIT:
             return sema_compound_lit(e);
@@ -2508,12 +2574,15 @@ static Type *sema_rvalue(AST **slot) {
  * A cursor walks a brace-enclosed list. An item may carry C99 designators
  * (`.a[2].b = x`); `path_pos` is how many of them the walk has already
  * applied to position itself, and the item's own initializer is reached
- * once all of them are.
+ * once all of them are. A `.name` naming a member of an anonymous struct
+ * or union selects that anonymous member without being applied; `anon`
+ * says so, and the designator then applies inside it.
  */
 typedef struct Cursor {
     ASTList *list;
     size_t pos;
     size_t path_pos;
+    int anon;
 } Cursor;
 
 /* the initializer at the cursor, inside its designation if it has one */
@@ -2536,26 +2605,33 @@ static AST *cur_designator(Cursor *c) {
 
 /* a designation none of which has been applied: it addresses the brace level, not an elided sub-aggregate */
 static int cur_is_fresh_designation(Cursor *c) {
-    return c->list->items[c->pos]->kind == N_DESIGNATED && c->path_pos == 0;
+    return c->list->items[c->pos]->kind == N_DESIGNATED && c->path_pos == 0 && !c->anon;
 }
 
 static void cur_advance(Cursor *c) {
     c->pos++;
     c->path_pos = 0;
+    c->anon = 0;
+}
+
+/* apply the designator at the cursor: it selected the member it names, or (`through_anon`) the anonymous one holding it */
+static void cur_apply(Cursor *c, int through_anon) {
+    if (through_anon) {
+        c->anon = 1;
+    } else {
+        c->path_pos++;
+        c->anon = 0;
+    }
 }
 
 /* `top`: the list belongs to this object's own braces, so designators address it */
 static void init_object(Type *t, Cursor *c, int is_static, long *count_out, int top);
 
-/* resolve `[expr]` to an index; -1 if it is not usable */
-static long designated_index(AST *d, Type *array) {
+/* one index of an array designator; -1 if it is not usable */
+static long designator_bound(AST *d, AST **slot, Type *array) {
     long v;
-    if (d->kind != N_DESIG_INDEX) {
-        diag_error(d->loc, "field designator cannot initialize an array");
-        return -1;
-    }
-    sema_rvalue(&d->u.cast.expr);
-    if (!type_is_integer(d->u.cast.expr->type) || !sema_const_eval(d->u.cast.expr, &v)) {
+    sema_rvalue(slot);
+    if (!type_is_integer((*slot)->type) || !sema_const_eval(*slot, &v)) {
         diag_error(d->loc, "array designator is not an integer constant expression");
         return -1;
     }
@@ -2566,17 +2642,39 @@ static long designated_index(AST *d, Type *array) {
     return (long)v;
 }
 
-/* resolve `.name` to a member index; -1 if there is none */
-static long designated_member(AST *d, Record *r) {
-    size_t i;
+/* resolve `[expr]` to an index, and `*last` to the end of a GNU range `[expr ... last]` (expr itself otherwise); -1 if it is not usable */
+static long designated_index(AST *d, Type *array, long *last) {
+    long first;
+    if (d->kind != N_DESIG_INDEX) {
+        diag_error(d->loc, "field designator cannot initialize an array");
+        return -1;
+    }
+    first = designator_bound(d, &d->u.cast.expr, array);
+    *last = first;
+    if (first >= 0 && d->u.cast.type) {
+        *last = designator_bound(d, &d->u.cast.type, array);
+        if (*last < 0) {
+            return -1;
+        }
+        if (*last < first) {
+            diag_error(d->loc, "empty index range in initializer");
+            return -1;
+        }
+    }
+    return first;
+}
+
+/* resolve `.name` to a member index (see record_designator_index); -1 if there is none */
+static long designated_member(AST *d, Record *r, int *through_anon) {
+    long k;
+    *through_anon = 0;
     if (d->kind != N_DESIG_MEMBER) {
         diag_error(d->loc, "array designator cannot initialize %s", type_kind_name(r->kind));
         return -1;
     }
-    for (i = 0; i < r->nmembers; i++) {
-        if (r->members[i].name && strcmp(r->members[i].name, d->u.name) == 0) {
-            return (long)i;
-        }
+    k = record_designator_index(r, d->u.name, through_anon);
+    if (k >= 0) {
+        return k;
     }
     diag_error(d->loc, "%s %s has no member named '%s'", type_kind_name(r->kind), r->tag ? r->tag : "", d->u.name);
     return -1;
@@ -2628,6 +2726,7 @@ static void init_braced(Type **pt, AST *list, int is_static) {
     c.list = list->u.list;
     c.pos = 0;
     c.path_pos = 0;
+    c.anon = 0;
     init_object(*pt, &c, is_static, &count, 1);
     if (c.pos < c.list->len) {
         diag_warning(c.list->items[c.pos]->loc, "excess elements in %s initializer",
@@ -2669,8 +2768,8 @@ static void init_elem(Type *t, Cursor *c, int is_static) {
     }
     if (t->kind == TY_ARRAY || type_is_record(t)) {
         /* brace elision: the aggregate takes as many items as it needs */
-        if (type_is_record(t) && (*slot)->kind != N_INIT_LIST) {
-            /* a struct expression initialises the whole member */
+        if (type_is_record(t) && (*slot)->kind != N_STRING) {
+            /* a struct expression initialises the whole member (a string literal cannot be one: it starts an elided char array) */
             Type *et = sema_rvalue(slot);
             if (type_is_record(et) && type_compatible_unqual(et, t)) {
                 cur_advance(c);
@@ -2699,13 +2798,18 @@ static void init_object(Type *t, Cursor *c, int is_static, long *count_out, int 
             }
             d = cur_designator(c);
             if (d) {
-                long k = designated_index(d, t);
+                long last;
+                long k = designated_index(d, t, &last);
                 if (k < 0) {
                     cur_advance(c);
                     continue;
                 }
                 n = k;
-                c->path_pos++;
+                cur_apply(c, 0);
+                if (last > k) {
+                    /* a range: each element takes the same initializer, so checking it once checks them all */
+                    n = last;
+                }
             } else if (t->length >= 0 && n >= t->length) {
                 break;
             }
@@ -2730,13 +2834,14 @@ static void init_object(Type *t, Cursor *c, int is_static, long *count_out, int 
             }
             d = cur_designator(c);
             if (d) {
-                long k = designated_member(d, r);
+                int through_anon;
+                long k = designated_member(d, r, &through_anon);
                 if (k < 0) {
                     cur_advance(c);
                     continue;
                 }
                 i = (size_t)k;
-                c->path_pos++;
+                cur_apply(c, through_anon);
             } else if (i >= r->nmembers) {
                 break;
             } else if (!r->members[i].name && r->members[i].bits >= 0) {
@@ -2749,24 +2854,30 @@ static void init_object(Type *t, Cursor *c, int is_static, long *count_out, int 
         return;
     }
     if (t->kind == TY_UNION) {
+        /* one member, unless designators (which may follow one another in the union's own braces) name more */
         Record *r = t->record;
-        if (r->nmembers && c->pos < c->list->len) {
+        int done = 0;
+        while (r->nmembers && c->pos < c->list->len) {
             AST *d;
             size_t i = 0;
             if (!top && cur_is_fresh_designation(c)) {
-                return;
+                break;
             }
             d = cur_designator(c);
             if (d) {
-                long k = designated_member(d, r);
+                int through_anon;
+                long k = designated_member(d, r, &through_anon);
                 if (k < 0) {
                     cur_advance(c);
-                    return;
+                    continue;
                 }
                 i = (size_t)k;
-                c->path_pos++;
+                cur_apply(c, through_anon);
+            } else if (done) {
+                break;
             }
             init_elem(r->members[i].type, c, is_static);
+            done = 1;
         }
         return;
     }
@@ -2889,10 +3000,17 @@ static void sema_declaration(AST *decl, int file_scope) {
         AST *id = decl->u.decl.declarators->items[i];
         AST **init = &id->u.init_decl.init;
         const char *name = NULL;
-        Type *t = sema_declarator(id->u.init_decl.declarator, sp.type, &name);
         Symbol *sym = id->sym;
+        AST *saved_top = array_param_top;
+        Type *t;
         int is_static;
         StorageKind prev;   /* a redeclaration's linkage comes from the earlier one */
+
+        if (sym && sym->kind == SYM_PARAM) {
+            array_param_top = declarator_top(id->u.init_decl.declarator);    /* a K&R parameter's */
+        }
+        t = sema_declarator(id->u.init_decl.declarator, sp.type, &name);
+        array_param_top = saved_top;
 
         id->type = t;
         if (!sym || !name) {
@@ -3002,6 +3120,9 @@ static void sema_declaration(AST *decl, int file_scope) {
                 diag_error(id->loc, "invalid storage class for parameter '%s'", name);
             }
             sym->type = adjust_param(t);
+            if (sym->type->kind == TY_POINTER) {
+                sym->type = type_qualify(sym->type, array_param_quals(id->u.init_decl.declarator));
+            }
             continue;
         }
         if (sym->type && sym->decl != id && sym->tls != sp.is_thread) {

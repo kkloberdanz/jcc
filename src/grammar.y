@@ -251,7 +251,7 @@ char *strdup(const char *s);
         ast_free($$);
     }
 } IDENTIFIER CONSTANT STRING_LITERAL TYPE_NAME ATTRIBUTE ASM PRAGMA
-    abstract_declarator additive_expression and_expression any_identifier argument_expression_list array_qualifiers assignment_expression assignment_operator
+    abstract_declarator additive_expression and_expression any_identifier argument_expression_list array_qualifiers array_suffix assignment_expression assignment_operator
     attribute_list basic_type_specifier block_item block_item_list cast_expression compound_statement conditional_expression
     constant_expression declaration declaration_list declaration_specifiers declarator designated_initializer designator designator_list
     direct_abstract_declarator direct_declarator enum_keyword enum_specifier enum_underlying enum_underlying_list enumerator enumerator_list
@@ -271,6 +271,17 @@ char *strdup(const char *s);
  */
 %nonassoc DECLARATOR_END
 %nonassoc ATTRIBUTE ASM
+
+/*
+ * The dangling else: `if (a) if (b) x; else y;` gives the else to the
+ * inner if, as C requires. An if without an else ranks below ELSE, so
+ * the parser shifts the else rather than closing the inner if.
+ */
+%nonassoc LOWER_THAN_ELSE
+%nonassoc ELSE
+
+/* the grammar has no unresolved conflicts: a new one fails the build */
+%expect 0
 
 %start translation_unit
 %%
@@ -1555,30 +1566,11 @@ direct_declarator
         {
             $$ = $2;
         }
-    | direct_declarator lbrack constant_expression ']'
+    | direct_declarator array_suffix
         {
-            spec_pop();
-            $$ = ast_declarator(N_DECL_ARRAY, @$, $1);
-            $$->u.declarator.size = $3;
-        }
-    | direct_declarator lbrack ']'
-        {
-            spec_pop();
-            $$ = ast_declarator(N_DECL_ARRAY, @$, $1);
-        }
-    | direct_declarator lbrack array_qualifiers constant_expression ']'
-        {
-            /* C99 parameter qualifiers, which say nothing jcc acts on */
-            spec_pop();
-            ast_free($3);
-            $$ = ast_declarator(N_DECL_ARRAY, @$, $1);
-            $$->u.declarator.size = $4;
-        }
-    | direct_declarator lbrack array_qualifiers ']'
-        {
-            spec_pop();
-            ast_free($3);
-            $$ = ast_declarator(N_DECL_ARRAY, @$, $1);
+            $$ = $2;
+            $$->u.declarator.inner = $1;
+            $$->loc = @$;
         }
     | direct_declarator param_lparen parameter_type_list ')'
         {
@@ -1625,7 +1617,59 @@ lbrack
         }
     ;
 
-/* `[static const 5]`: qualifiers and `static`, in any order */
+/*
+ * An array declarator's brackets, with no inner declarator yet. C99 lets
+ * a parameter's outermost one hold qualifiers and `static` (`[const 5]`
+ * is a const pointer), and `[*]`, a VLA of unspecified size, appear in a
+ * prototype; sema checks where they are.
+ */
+array_suffix
+    : lbrack ']'
+        {
+            spec_pop();
+            $$ = ast_declarator(N_DECL_ARRAY, @$, NULL);
+        }
+    | lbrack constant_expression ']'
+        {
+            spec_pop();
+            $$ = ast_declarator(N_DECL_ARRAY, @$, NULL);
+            $$->u.declarator.size = $2;
+        }
+    | lbrack '*' ']'
+        {
+            spec_pop();
+            $$ = ast_declarator(N_DECL_ARRAY, @$, NULL);
+            $$->u.declarator.star = 1;
+        }
+    | lbrack array_qualifiers ']'
+        {
+            spec_pop();
+            $$ = ast_declarator(N_DECL_ARRAY, @$, NULL);
+            $$->u.declarator.quals = $2->u.list;
+            $2->u.list = NULL;
+            ast_free($2);
+        }
+    | lbrack array_qualifiers constant_expression ']'
+        {
+            spec_pop();
+            $$ = ast_declarator(N_DECL_ARRAY, @$, NULL);
+            $$->u.declarator.quals = $2->u.list;
+            $$->u.declarator.size = $3;
+            $2->u.list = NULL;
+            ast_free($2);
+        }
+    | lbrack array_qualifiers '*' ']'
+        {
+            spec_pop();
+            $$ = ast_declarator(N_DECL_ARRAY, @$, NULL);
+            $$->u.declarator.quals = $2->u.list;
+            $$->u.declarator.star = 1;
+            $2->u.list = NULL;
+            ast_free($2);
+        }
+    ;
+
+/* `[static const 5]`: qualifiers and `static` (kept as a storage class node), in any order */
 array_qualifiers
     : type_qualifier
         {
@@ -1633,7 +1677,9 @@ array_qualifiers
         }
     | STATIC
         {
-            $$ = ast_list_node(N_INIT_LIST, @$, NULL);
+            AST *st = ast_new(N_STORAGE_CLASS, @$);
+            st->u.storage = STORAGE_STATIC;
+            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_push(NULL, st));
         }
     | array_qualifiers type_qualifier
         {
@@ -1642,6 +1688,9 @@ array_qualifiers
         }
     | array_qualifiers STATIC
         {
+            AST *st = ast_new(N_STORAGE_CLASS, @2);
+            st->u.storage = STORAGE_STATIC;
+            ast_list_push($1->u.list, st);
             $$ = $1;
         }
     ;
@@ -1839,27 +1888,15 @@ direct_abstract_declarator
         {
             $$ = $2;
         }
-    | lbrack ']'
+    | array_suffix
         {
-            spec_pop();
-            $$ = ast_declarator(N_DECL_ARRAY, @$, NULL);
+            $$ = $1;
         }
-    | lbrack constant_expression ']'
+    | direct_abstract_declarator array_suffix
         {
-            spec_pop();
-            $$ = ast_declarator(N_DECL_ARRAY, @$, NULL);
-            $$->u.declarator.size = $2;
-        }
-    | direct_abstract_declarator lbrack ']'
-        {
-            spec_pop();
-            $$ = ast_declarator(N_DECL_ARRAY, @$, $1);
-        }
-    | direct_abstract_declarator lbrack constant_expression ']'
-        {
-            spec_pop();
-            $$ = ast_declarator(N_DECL_ARRAY, @$, $1);
-            $$->u.declarator.size = $3;
+            $$ = $2;
+            $$->u.declarator.inner = $1;
+            $$->loc = @$;
         }
     | '('
         {
@@ -1942,7 +1979,7 @@ initializer_list
         }
     ;
 
-/* C99 designators: `.member = x`, `[index] = x`, and paths of them */
+/* C99 designators: `.member = x`, `[index] = x`, and paths of them; GNU ranges `[a ... b] = x` */
 designated_initializer
     : initializer
         {
@@ -1975,6 +2012,13 @@ designator
         {
             $$ = ast_new(N_DESIG_INDEX, @$);
             $$->u.cast.expr = $2;
+        }
+    /* GNU: `[first ... last] = x` initializes each element of the range */
+    | '[' constant_expression ELLIPSIS constant_expression ']'
+        {
+            $$ = ast_new(N_DESIG_INDEX, @$);
+            $$->u.cast.expr = $2;
+            $$->u.cast.type = $4;
         }
     | '.' any_identifier
         {
@@ -2109,7 +2153,7 @@ expression_statement
     ;
 
 selection_statement
-    : IF '(' expression ')' statement
+    : IF '(' expression ')' statement %prec LOWER_THAN_ELSE
         {
             $$ = ast_cond(N_IF, @$, $3, $5, NULL);
         }
@@ -2299,6 +2343,14 @@ function_body
 static int is_func_name(const char *name) {
     return strcmp(name, "__func__") == 0 || strcmp(name, "__FUNCTION__") == 0
         || strcmp(name, "__PRETTY_FUNCTION__") == 0;
+}
+
+/* is `t` an attribute followed, past any more of them, by `*` or `^`? */
+static int attrs_then_pointer(const TokList *t) {
+    while (t && t->tok.kind == TOK_ATTRIBUTE) {
+        t = t->next;
+    }
+    return t && (t->tok.kind == TOK_STAR || t->tok.kind == TOK_HAT);
 }
 
 /* does the token begin a type, as the underlying type of an enum needs? */
@@ -2624,6 +2676,16 @@ static int yylex(void) {
      * them apart by what follows the colon. (An attribute may come between
      * `enum` and the colon.)
      */
+    /*
+     * `int (ATTR *)(void)`: an attribute between a grouping parenthesis and
+     * the `*` of an abstract declarator. The parser cannot tell it from
+     * one that starts a parameter's specifiers without looking past it,
+     * and it says nothing jcc acts on, so it is dropped here.
+     */
+    while (tok == ATTRIBUTE && prev_tok == '(' && attrs_then_pointer(current_token)) {
+        current_token = current_token->next;
+        tok = translate_tok(&current_token->tok);
+    }
     if (tok == ':' && (prev_tok == ENUM || prev_tok == IDENTIFIER || prev_tok == TYPE_NAME || prev_tok == ATTRIBUTE)
             && current_token->next && starts_type(&current_token->next->tok)) {
         tok = ENUM_COLON;

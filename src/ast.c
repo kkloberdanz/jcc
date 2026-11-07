@@ -330,6 +330,7 @@ void ast_free(AST *ast) {
 
         case N_DESIG_INDEX:
             ast_free(ast->u.cast.expr);
+            ast_free(ast->u.cast.type);
             break;
 
         case N_COMPOUND:
@@ -719,6 +720,9 @@ static void dump_node(FILE *out, int depth, const char *label, const AST *ast) {
 
         case N_DESIG_INDEX:
             dump_node(out, d, NULL, ast->u.cast.expr);
+            if (ast->u.cast.type) {
+                dump_node(out, d, "last", ast->u.cast.type);
+            }
             break;
 
         case N_TRANSLATION_UNIT:

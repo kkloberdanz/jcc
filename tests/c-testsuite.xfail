@@ -1,5 +1,2 @@
 # c-testsuite tests jcc is known to fail: name, then why (tests/run-c-testsuite.sh reads this;
 # one that starts passing is reported as XPASS and should be removed here).
-00162 int x[const 5] in an abstract declarator
-00210 attribute between ( and * in a function pointer type
-00216 GNU range designators [a ... b]

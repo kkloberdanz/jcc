@@ -162,6 +162,12 @@ Member *record_find(const Record *r, const char *name);
 /* find a member by name, also inside anonymous struct and union members (C11; a common extension before it) */
 #define RECORD_PATH_MAX 8
 Member *record_lookup(const Record *r, const char *name, Member **path, size_t *depth);
+/*
+ * the index of the member of `r` a `.name` designator selects: the member
+ * itself, or the anonymous member it is inside (*through_anon is then set,
+ * and the designator goes on to apply inside that member); -1 if none
+ */
+long record_designator_index(const Record *r, const char *name, int *through_anon);
 /* whether some member sits at an offset that is not a multiple of its alignment (packed), also in nested records */
 int record_has_unaligned(const Record *r);
 /* compute offsets, size and alignment; marks the record complete */
