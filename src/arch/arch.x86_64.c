@@ -106,7 +106,7 @@ static int x64_peep_rules(void) {
     if (n >= 2 && parse_slot_store(peep_lines[n - 2], sreg, &soff) && parse_slot_load(peep_lines[n - 1], reg, &off)
             && off == soff && sreg[1] == reg[1]) {
         if (strcmp(sreg, reg) == 0) {
-            peep_replace(n - 1, 1, with, 0);
+            peep_replace(n - 1, 1, NULL, 0);
         } else {
             snprintf(buf, sizeof(buf), "\t%s %s, %s", reg[1] == 'x' ? "movaps" : "movq", sreg, reg);
             with[0] = buf;

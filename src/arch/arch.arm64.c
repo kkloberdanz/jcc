@@ -97,7 +97,7 @@ static int a64_peep_rules(void) {
             && parse_frame_access(peep_lines[n - 1], op, reg, &base, &off) && op[0] == 'l' && off == soff && base == sbase
             && sreg[0] == reg[0]) {
         if (strcmp(sreg, reg) == 0) {
-            peep_replace(n - 1, 1, with, 0);
+            peep_replace(n - 1, 1, NULL, 0);
         } else {
             snprintf(buf, sizeof(buf), "\t%s %s, %s", reg[0] == 'x' || reg[0] == 'w' ? "mov" : "fmov", reg, sreg);
             with[0] = buf;
