@@ -29,6 +29,8 @@ typedef struct CppTarget {
     const char *const *nonstrict;   /* macros defined only outside strict ISO mode */
     const CppHasAnswer *has;        /* answers to feature queries; anything not listed is 0 */
     const char *const *has_builtins; /* the __has_* pseudo macros the target's compiler knows */
+    int gcc_paths;                  /* a quoted include beside a file in the current directory is
+                                       "x.h", as gcc names it, not clang's "./x.h" */
 } CppTarget;
 
 

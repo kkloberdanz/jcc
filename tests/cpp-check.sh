@@ -15,6 +15,12 @@ check() {
     name=$1; std=$2; shift 2
     base=$(basename "$name" .c)
     if ! ./jcc -ast-dump "-std=$std" "$@" "$name" > "$tmp/$base.own" 2> "$tmp/$base.own.err"; then
+        # as tests/run.sh: a program the host's own headers reject in this mode (glibc's
+        # two-argument _Static_assert macro under -std=c90, say) is no test of the preprocessor
+        if ! cc -fsyntax-only -w "-std=$std" "$@" "$name" 2>/dev/null; then
+            echo "SKIP $name: cc does not accept it"
+            return
+        fi
         echo "FAIL $name: jcc could not compile it with its own preprocessor"
         sed 's/^/    /' "$tmp/$base.own.err" | head -5
         fail=$((fail + 1))

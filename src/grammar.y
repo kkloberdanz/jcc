@@ -221,7 +221,7 @@ char *strdup(const char *s);
 %define parse.lac full
 %locations
 
-%token IDENTIFIER CONSTANT STRING_LITERAL SIZEOF
+%token IDENTIFIER CONSTANT STRING_LITERAL SIZEOF ALIGNOF
 %token PTR_OP INC_OP DEC_OP LEFT_OP RIGHT_OP LE_OP GE_OP EQ_OP NE_OP
 %token AND_OP OR_OP MUL_ASSIGN DIV_ASSIGN MOD_ASSIGN ADD_ASSIGN
 %token SUB_ASSIGN LEFT_ASSIGN RIGHT_ASSIGN AND_ASSIGN
@@ -234,7 +234,7 @@ char *strdup(const char *s);
 %token CASE DEFAULT IF ELSE SWITCH WHILE DO FOR GOTO CONTINUE BREAK RETURN
 
 %token GENERIC THREAD_LOCAL STATIC_ASSERT
-%token BUILTIN_VA_LIST BUILTIN_VA_ARG INLINE RESTRICT NULLABILITY INT128 UINT128 BOOL FLOAT16 BUILTIN_OFFSETOF COMPLEX
+%token BUILTIN_VA_LIST BUILTIN_VA_ARG INLINE RESTRICT NULLABILITY INT128 UINT128 BOOL FLOAT16 FLOAT32 FLOAT64 FLOAT64X FLOAT128 BUILTIN_OFFSETOF COMPLEX
 %token REAL_OP IMAG_OP
 %token BAD_TOKEN
 
@@ -459,6 +459,19 @@ unary_expression
         {
             $$ = ast_new(N_SIZEOF_TYPE, @$);
             $$->u.cast.type = $3;
+        }
+    | ALIGNOF unary_expression
+        {
+            /* GNU __alignof__ of an object: its alignment, an aligned attribute included */
+            $$ = ast_new(N_SIZEOF_EXPR, @$);
+            $$->u.cast.expr = $2;
+            $$->u.cast.align = 1;
+        }
+    | ALIGNOF '(' type_name ')'
+        {
+            $$ = ast_new(N_SIZEOF_TYPE, @$);
+            $$->u.cast.type = $3;
+            $$->u.cast.align = 1;
         }
     | BUILTIN_VA_ARG '(' assignment_expression ',' type_name ')'
         {
@@ -1033,6 +1046,32 @@ basic_type_specifier
             spec_seen_type = 1;
             $$ = ast_new(N_TYPE_SPEC, @$);
             $$->u.type_spec = TS_FLOAT16;
+        }
+    | FLOAT32
+        {
+            /* _Float32: float's format on every target */
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPE_SPEC, @$);
+            $$->u.type_spec = TS_FLOAT;
+        }
+    | FLOAT64
+        {
+            /* _Float64 and _Float32x: double's format on every target */
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPE_SPEC, @$);
+            $$->u.type_spec = TS_DOUBLE;
+        }
+    | FLOAT64X
+        {
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPE_SPEC, @$);
+            $$->u.type_spec = TS_FLOAT64X;
+        }
+    | FLOAT128
+        {
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPE_SPEC, @$);
+            $$->u.type_spec = TS_FLOAT128;
         }
     | COMPLEX
         {
@@ -2464,6 +2503,8 @@ static int translate_tok(const Token *tok) {
             return SIGNED;
         case TOK_SIZEOF:
             return SIZEOF;
+        case TOK_ALIGNOF:
+            return ALIGNOF;
         case TOK_REAL:
             return REAL_OP;
         case TOK_IMAG:
@@ -2511,6 +2552,14 @@ static int translate_tok(const Token *tok) {
             return BOOL;
         case TOK_FLOAT16:
             return FLOAT16;
+        case TOK_FLOAT32:
+            return FLOAT32;
+        case TOK_FLOAT64:
+            return FLOAT64;
+        case TOK_FLOAT64X:
+            return FLOAT64X;
+        case TOK_FLOAT128:
+            return FLOAT128;
         case TOK_COMPLEX:
             return COMPLEX;
         case TOK_BUILTIN_OFFSETOF:

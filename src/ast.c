@@ -464,6 +464,8 @@ const char *type_spec_name(TypeSpecKind type) {
         case TS_INT128: return "__int128";
         case TS_BOOL: return "_Bool";
         case TS_FLOAT16: return "_Float16";
+        case TS_FLOAT64X: return "_Float64x";
+        case TS_FLOAT128: return "_Float128";
         case TS_COMPLEX: return "_Complex";
         case TS_UINT128: return "__uint128_t";
     }

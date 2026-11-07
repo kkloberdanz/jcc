@@ -24,7 +24,13 @@ X86_64_FREEBSD_SYSROOT?=/
 else
 ARM64_MACOS_SYSROOT?=/
 ARM64_MACOS_RESOURCE_INC?=/
+# the musl target is the host's own only on a musl distribution (Alpine); on a
+# glibc one (Debian, Fedora, ...) it is a cross target with its own sysroot, as on macOS
+ifneq ($(findstring musl,$(shell $(CC) -dumpmachine 2>/dev/null)),)
 X86_64_SYSROOT?=/
+else
+X86_64_SYSROOT?=$(or $(XDG_DATA_HOME),$(HOME)/.local/share)/jcc/x86_64-linux-musl
+endif
 X86_64_FREEBSD_SYSROOT?=$(or $(XDG_DATA_HOME),$(HOME)/.local/share)/jcc/x86_64-freebsd
 endif
 X86_64_LINUX_SYSROOT?=$(X86_64_SYSROOT)

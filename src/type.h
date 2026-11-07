@@ -23,6 +23,8 @@ typedef enum TypeSpecKind {
     TS_UINT128,
     TS_BOOL,
     TS_FLOAT16,
+    TS_FLOAT64X,    /* _Float64x: long double */
+    TS_FLOAT128,
     TS_COMPLEX
 } TypeSpecKind;
 
@@ -55,9 +57,11 @@ typedef enum TypeSpecKind {
     X(TY_FLOAT, "float") \
     X(TY_DOUBLE, "double") \
     X(TY_LDOUBLE, "long double") \
+    X(TY_FLOAT128, "_Float128") \
     X(TY_CFLOAT, "float _Complex") \
     X(TY_CDOUBLE, "double _Complex") \
     X(TY_CLDOUBLE, "long double _Complex") \
+    X(TY_CFLOAT128, "_Float128 _Complex") \
     X(TY_VA_LIST, "__builtin_va_list") \
     X(TY_ENUM, "enum") \
     X(TY_STRUCT, "struct") \
@@ -141,6 +145,8 @@ struct Type {
     int variadic;
     int has_proto;      /* function: declared with a parameter type list */
     Vla *vla;           /* array: a variable length one, else NULL */
+    size_t align;       /* __attribute__((aligned(n))) on a typedef, member or object: the
+                           alignment in place of the natural one; 0 for the natural one */
     Type *next_alloc;
 };
 
@@ -152,6 +158,8 @@ Type *type_array(Type *elem, long length);
 Type *type_vla(Type *elem, struct AST *size);
 Type *type_func(Type *ret, Param *params, size_t nparams, int variadic, int has_proto);
 Type *type_record(Record *record);
+/* a copy of `t` aligned to `align` bytes (a typedef's, member's or object's aligned attribute) */
+Type *type_with_align(Type *t, size_t align);
 /* a copy of `t` with `quals` added; `t` itself when nothing changes */
 Type *type_qualify(Type *t, unsigned quals);
 Type *type_unqualified(Type *t);

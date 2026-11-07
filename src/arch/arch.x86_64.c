@@ -268,10 +268,12 @@ static void x64_cg_args_begin(ArgAlloc *a, size_t nfixed, int sret) {
     a->index = 0;
 }
 
-/* every stack argument takes whole eightbytes */
+/* every stack argument takes whole eightbytes, at its own alignment (past 16 bytes too, as gcc
+   places a 32 byte aligned record: the call then aligns rsp to match, see x64_select_call) */
 static void x64_stack_bytes(ArgAlloc *a, size_t n, size_t align, ArgLoc *loc) {
     if (align > 8) {
-        a->nstack = (a->nstack + 15) & ~(size_t)15;
+        size_t al = align > 16 ? align : 16;
+        a->nstack = (a->nstack + al - 1) & ~(al - 1);
     }
     loc->in_regs = 0;
     loc->offset = a->nstack;
@@ -1069,6 +1071,7 @@ static void x64_select_call(const IRInst *ins) {
     ArgAlloc alloc;
     size_t nstack;
     size_t area;
+    size_t realign = 0;
     int k;
     size_t m;
 
@@ -1083,7 +1086,22 @@ static void x64_select_call(const IRInst *ins) {
     }
     nstack = x64_cg_args_end(&alloc, locs, (size_t)c->nargs);
     area = (nstack + 15) & ~(size_t)15;
-    if (area) {
+    for (k = 0; k < c->nargs; k++) {
+        if (!locs[k].in_regs && locs[k].type.align > realign) {
+            realign = locs[k].type.align;
+        }
+    }
+    if (realign > 16) {
+        /*
+         * A stack argument aligned past 16 bytes, where the frame keeps only 16: rsp is
+         * aligned down for this call, and the rsp to return to kept just above the
+         * arguments. rax is free here (a scratch register, set for a variadic call later).
+         */
+        x64_emit("movq %%rsp, %%rax");
+        x64_emit("subq $%lu, %%rsp", (unsigned long)(area + 8));
+        x64_emit("andq $-%lu, %%rsp", (unsigned long)realign);
+        x64_emit("movq %%rax, %lu(%%rsp)", (unsigned long)area);
+    } else if (area) {
         x64_emit("subq $%lu, %%rsp", (unsigned long)area);
     }
     /* what goes in memory */
@@ -1191,7 +1209,9 @@ static void x64_select_call(const IRInst *ins) {
     } else {
         x64_emit("call *%%r10");
     }
-    if (area) {
+    if (realign > 16) {
+        x64_emit("movq %lu(%%rsp), %%rsp", (unsigned long)area);
+    } else if (area) {
         x64_emit("addq $%lu, %%rsp", (unsigned long)area);
     }
     free(locs);
@@ -2315,7 +2335,8 @@ static const CppTarget x64_cpp_target = {
     x64_predefined_macros,
     x64_nonstrict_macros,
     x64_has_answers,
-    x64_has_builtins
+    x64_has_builtins,
+    1
 };
 
 #include "target.h"
@@ -2397,7 +2418,8 @@ static const CppTarget x64gnu_cpp_target = {
     x64gnu_predefined_macros,
     x64gnu_nonstrict_macros,
     x64gnu_has_answers,
-    x64_has_builtins
+    x64_has_builtins,
+    1
 };
 
 static const char *const x64gnu_aliases[] = {
@@ -2425,7 +2447,8 @@ static const CppTarget x64fb_cpp_target = {
     x64fb_predefined_macros,
     x64fb_nonstrict_macros,
     x64fb_has_answers,
-    x64_has_builtins
+    x64_has_builtins,
+    0
 };
 
 static const char *const x64fb_aliases[] = {

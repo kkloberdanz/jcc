@@ -96,7 +96,11 @@ int lower_check_value_type(Loc loc, const Type *t) {
         unsupported(loc, "_Float16");
         return 0;
     }
-    if (t->kind == TY_CFLOAT || t->kind == TY_CDOUBLE || t->kind == TY_CLDOUBLE) {
+    if (t->kind == TY_FLOAT128) {
+        unsupported(loc, "_Float128");
+        return 0;
+    }
+    if (type_is_complex(t)) {
         unsupported(loc, "_Complex");
         return 0;
     }
@@ -253,7 +257,8 @@ static void vla_eval(AST *d) {
             Type *t = d->type;
             AST *n = t->vla->size;
             int v = convert(expr(n), n->type, type_basic(TY_ULONG));
-            ir_store(F, IR_I64, addr_local(t->vla->slot), scale_by(v, t->base), 8);
+            int slot = addr_local(t->vla->slot);
+            ir_store(F, IR_I64, slot, scale_by(v, t->base), 8);
         }
         if (d->kind == N_DECL_NAME) {
             break;
@@ -268,6 +273,7 @@ static void vla_alloc(Symbol *s) {
     int save = ir_block(F);
     int join = ir_block(F);
     int sp;
+    int addr;
     ir_condbr(F, ir_icmp_imm(F, IR_NE, IR_I64, old, 0), restore, save);
     ir_place(F, restore);
     ir_emit(F, IR_SPRESTORE, IR_VOID, -1, old, -1);
@@ -278,7 +284,8 @@ static void vla_alloc(Symbol *s) {
     ir_store(F, IR_I64, addr_local(s->offset + 8), sp, 8);
     ir_br(F, join);
     ir_place(F, join);
-    ir_store(F, IR_I64, addr_local(s->offset), ir_unop(F, IR_ALLOCA, IR_I64, size_of(s->type)), 8);
+    addr = addr_local(s->offset);
+    ir_store(F, IR_I64, addr, ir_unop(F, IR_ALLOCA, IR_I64, size_of(s->type)), 8);
 }
 
 /*
@@ -1634,13 +1641,13 @@ static int expr(AST *e) {
         }
 
         case N_SIZEOF_TYPE:
-            if (e->u.cast.type->type && type_is_vla(e->u.cast.type->type)) {
+            if (!e->u.cast.align && e->u.cast.type->type && type_is_vla(e->u.cast.type->type)) {
                 vla_eval(e->u.cast.type->u.typed.declarator);
                 return size_of(e->u.cast.type->type);
             }
             /* fall through */
         case N_SIZEOF_EXPR:
-            if (e->kind == N_SIZEOF_EXPR && e->u.cast.expr->type && type_is_vla(e->u.cast.expr->type)) {
+            if (e->kind == N_SIZEOF_EXPR && !e->u.cast.align && e->u.cast.expr->type && type_is_vla(e->u.cast.expr->type)) {
                 return size_of(e->u.cast.expr->type);
             }
             /* fall through */
@@ -1879,7 +1886,9 @@ static int complex_binary(AST *e) {
         case OP_ADD:
         case OP_SUB:
             for (k = 0; k < 2; k++) {
-                int v = ir_binop(F, op == OP_ADD ? IR_FADD : IR_FSUB, ty(base), load_comp(ls + k * cs, base), load_comp(rs + k * cs, base));
+                int a = load_comp(ls + k * cs, base);
+                int b = load_comp(rs + k * cs, base);
+                int v = ir_binop(F, op == OP_ADD ? IR_FADD : IR_FSUB, ty(base), a, b);
                 store_comp(e->temp + k * cs, base, v);
             }
             return addr_local(e->temp);
@@ -1893,8 +1902,11 @@ static int complex_binary(AST *e) {
             int both;
             for (k = 0; k < 2; k++) {
                 IRInst *i;
+                int a, b;
                 eq[k] = ir_vreg(F, IR_I32);
-                i = ir_inst(F, ir_emit(F, IR_FCMP, ty(base), eq[k], load_comp(ls + k * cs, base), load_comp(rs + k * cs, base)));
+                a = load_comp(ls + k * cs, base);
+                b = load_comp(rs + k * cs, base);
+                i = ir_inst(F, ir_emit(F, IR_FCMP, ty(base), eq[k], a, b));
                 i->cc = IR_EQ;
             }
             both = ir_binop(F, IR_AND, IR_I32, eq[0], eq[1]);
@@ -1968,6 +1980,22 @@ static int complex_compound(AST *e) {
 /* local initializers (the walker is in codegen.c)                    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Where a local's initializer writes. Initializers address the object by
+ * frame offset; an over-aligned local (see overaligned_local) is instead at
+ * an address computed at run time, so while its initializer is lowered
+ * init_base holds that address and init_base_off the offset it stands for.
+ */
+static int init_base = -1;
+static long init_base_off;
+
+static int init_addr(long off) {
+    if (init_base < 0) {
+        return addr_local(off);
+    }
+    return off == init_base_off ? init_base : ir_binop_imm(F, IR_ADD, IR_I64, init_base, off - init_base_off);
+}
+
 void lower_init_scalar(long off, Type *t, AST *e) {
     int v;
     if (!by_address(t) && !lower_check_value_type(e->loc, t)) {
@@ -1975,18 +2003,21 @@ void lower_init_scalar(long off, Type *t, AST *e) {
     }
     v = expr(e);
     if (by_address(t)) {
-        copy_bytes(addr_local(off), v, type_size(t));
+        copy_bytes(init_addr(off), v, type_size(t));
     } else {
-        store_value(t, addr_local(off), v);
+        store_value(t, init_addr(off), v);
     }
 }
 
 void lower_init_string(long off, AST *s, size_t n) {
-    copy_bytes(addr_local(off), addr_string(codegen_add_string(s)), n);
+    /* one at a time: the order arguments are evaluated in is the host compiler's choice */
+    int dst = init_addr(off);
+    int src = addr_string(codegen_add_string(s));
+    copy_bytes(dst, src, n);
 }
 
 void lower_init_bitfield(long off, Member *m, AST *item) {
-    int a = addr_local(off);
+    int a = init_addr(off);
     int v = expr(item);
     store_bits(m, m->type, a, v);
 }
@@ -2022,11 +2053,16 @@ static void local_decl(AST *decl) {
             }
             continue;
         }
+        if (s->by_ref) {
+            init_base = ir_load(F, IR_I64, addr_local(s->offset), 8, 0);    /* an over-aligned local */
+            init_base_off = s->offset;
+        }
         if (init->kind == N_INIT_LIST || (s->type->kind == TY_ARRAY && init->kind == N_STRING)) {
             /* members the initializer leaves out are zero */
-            zero_bytes(addr_local(s->offset), type_size(s->type));
+            zero_bytes(init_addr(s->offset), type_size(s->type));
         }
         codegen_local_initializer(s->type, init, s->offset);
+        init_base = -1;
     }
 }
 
@@ -2465,6 +2501,24 @@ static void alloc_local(Symbol *s) {
     s->offset = alloc_slot(type_size(s->type), type_align(s->type));
 }
 
+/*
+ * A local aligned past the 16 bytes every target keeps its frame to
+ * (__attribute__((aligned(32))), say): a frame offset cannot promise it,
+ * so the object goes in a slot with room to spare and its address,
+ * rounded up at function entry, in a slot of its own; it is reached
+ * through that address, as a VLA is (Symbol.by_ref).
+ */
+static void overaligned_local(Symbol *s) {
+    size_t align = type_align(s->type);
+    long raw = alloc_slot(type_size(s->type) + align - 16, 16);
+    int a;
+    s->by_ref = 1;
+    s->offset = alloc_slot(8, 8);
+    a = ir_binop_imm(F, IR_ADD, IR_I64, addr_local(raw), (long)align - 1);
+    a = ir_binop_imm(F, IR_AND, IR_I64, a, -(long)align);
+    ir_store(F, IR_I64, addr_local(s->offset), a, 8);
+}
+
 /* can this local live in a register: a scalar whose address is never taken, in a function without setjmp */
 static int promotable(const Symbol *s) {
     if (all_in_memory || s->vreg == -1 || s->by_ref || !s->type) {
@@ -2476,7 +2530,7 @@ static int promotable(const Symbol *s) {
     if (!is_value_type(s->type)) {
         return 0;
     }
-    if (s->type->kind == TY_FLOAT16 || (s->type->kind == TY_LDOUBLE && arch_info->ldouble_size > 8 && !arch_info->ldouble_x87)) {
+    if (s->type->kind == TY_FLOAT16 || s->type->kind == TY_FLOAT128 || (s->type->kind == TY_LDOUBLE && arch_info->ldouble_size > 8 && !arch_info->ldouble_x87)) {
         return 0;
     }
     return 1;
@@ -2735,7 +2789,10 @@ static void assign_locals(AST *s) {
                         sym->vreg = 0;
                         sym->by_ref = 1;
                         sym->offset = alloc_slot(16, 8);
-                        ir_store(F, IR_I64, addr_local(sym->offset + 8), iconst(IR_I64, 0), 8);
+                        {
+                            int addr = addr_local(sym->offset + 8);
+                            ir_store(F, IR_I64, addr, iconst(IR_I64, 0), 8);
+                        }
                     } else if (promotable(sym)) {
                         sym->vreg = ir_vreg_local(F, ty(sym->type), sym->name) + 1;
                         if (!id->u.init_decl.init && type_is_integer(sym->type) && type_size(sym->type) < 4) {
@@ -2747,6 +2804,9 @@ static void assign_locals(AST *s) {
                              */
                             ir_mov(F, sym->vreg - 1, iconst(IR_I32, 0));
                         }
+                    } else if (type_align(sym->type) > 16) {
+                        sym->vreg = 0;
+                        overaligned_local(sym);
                     } else {
                         sym->vreg = 0;
                         alloc_local(sym);

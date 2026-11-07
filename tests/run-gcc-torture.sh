@@ -7,7 +7,9 @@
 # and output are cached under $GCC_TORTURE/ref. Every other test must build
 # with jcc and behave the same. Failures listed in tests/gcc-torture.xfail
 # (name, then why), or in the target's own list (tests/gcc-torture.arm64-macos.xfail,
-# tests/gcc-torture.x86_64-linux.xfail), are expected and do not fail the
+# tests/gcc-torture.x86_64-linux.xfail, and for a glibc host
+# tests/gcc-torture.x86_64-linux-gnu.xfail), or at -O0 in tests/gcc-torture.O0.xfail,
+# are expected and do not fail the
 # run; one that starts passing is reported as XPASS so the list can be
 # pruned. With `x86_64` as the argument the tests are cross compiled here
 # and run in Docker. Tests are compiled and run JOBS at a time (default:
@@ -30,8 +32,16 @@ if [ "$mode" = x86_64 ]; then
     X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
 else
     X="$JCC"
-    XFAIL="$XFAIL tests/gcc-torture.arm64-macos.xfail"
+    # the host target's own list; a glibc host runs the x86_64 Linux list too
+    case "$($JCC --print-targets | grep '(host)')" in
+        *arm64-apple-macos*) XFAIL="$XFAIL tests/gcc-torture.arm64-macos.xfail" ;;
+        *x86_64-linux-gnu*) XFAIL="$XFAIL tests/gcc-torture.x86_64-linux.xfail tests/gcc-torture.x86_64-linux-gnu.xfail" ;;
+        *x86_64-linux-musl*) XFAIL="$XFAIL tests/gcc-torture.x86_64-linux.xfail" ;;
+        *x86_64-unknown-freebsd*) XFAIL="$XFAIL tests/gcc-torture.x86_64-freebsd.xfail" ;;
+    esac
 fi
+# failures only without the optimizer (make gcc-torture-O1 runs this with JCC=./jcc-O1)
+case "$JCC" in *-O1) ;; *) XFAIL="$XFAIL tests/gcc-torture.O0.xfail" ;; esac
 if command -v timeout >/dev/null 2>&1; then T="timeout 10"; else T=""; fi
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT

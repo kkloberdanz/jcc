@@ -37,7 +37,7 @@ cat >"$tmp/compile1.sh" <<'EOF'
 src=$1; name=$(basename "$src" .c)
 if grep -q "^c89$" "$src.tags"; then std=c89; else std=c99; fi
 echo "$std" >"$tmp/bin/$name.std"
-if $X -std=gnu89 -o "$tmp/bin/$name" "$src" >"$tmp/$name.cc" 2>&1; then
+if $X -std=gnu89 -o "$tmp/bin/$name" "$src" -lm >"$tmp/$name.cc" 2>&1; then
     cp "$src.expected" "$tmp/bin/$name.expected"
     : >"$tmp/res/$name.built"
 else

@@ -240,6 +240,7 @@ struct AST {
         struct {
             AST *type;
             AST *expr;
+            int align;          /* N_SIZEOF_*: _Alignof / __alignof__ rather than sizeof */
         } cast;
         struct {
             char *name;

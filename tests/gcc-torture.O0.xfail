@@ -1,0 +1,3 @@
+# expected failures at -O0 only (tests/run-gcc-torture.sh adds this list unless JCC is ./jcc-O1):
+# tests that rely on dead code being removed, which jcc does only in its optimizer.
+medce-1 expects the call under `if (0)` (reached only by a case label inside it) to be removed at -O0, as gcc does

@@ -10,6 +10,10 @@
  *
  *     lua-jit [-O level] <lua src dir> <lua arguments...>
  */
+/* snprintf, which glibc hides under -std=c89 */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

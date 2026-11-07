@@ -50,7 +50,12 @@ if [ "$mode" = jit ] || [ "$mode" = jit-x86_64 ]; then
             gcc -std=c89 -Wall -Wextra -Werror -o lua-jit lua.c jcc.o' || { echo "FAIL: the host did not build"; exit 1; }
     else
         [ -f libjcc.a ] || { echo "no libjcc.a: run make first"; exit 1; }
-        cc -std=c89 -Wall -Wextra -Werror -Isrc -o "$tmp/lua-jit" tests/jit/lua.c libjcc.a || { echo "FAIL: the host did not build"; exit 1; }
+        # the JIT finds the C library's functions in the process: glibc's math functions are in a
+        # libm of their own, which the host never calls, so the linker would drop it but for
+        # --no-as-needed (macOS's are in libSystem, musl's in libc)
+        libm=""
+        case "$(uname -s)" in Darwin) ;; *) libm="-Wl,--no-as-needed -lm" ;; esac
+        cc -std=c89 -Wall -Wextra -Werror -Isrc -o "$tmp/lua-jit" tests/jit/lua.c libjcc.a $libm || { echo "FAIL: the host did not build"; exit 1; }
     fi
     fail=0
     for level in 0 1; do

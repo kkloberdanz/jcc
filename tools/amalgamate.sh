@@ -47,6 +47,13 @@ system=$(grep -h '^#include <' src/*.c src/*.h src/arch/*.c src/arch/*.h src/as/
  */
 #define JCC_AMALGAMATION 1
 
+/* glibc hides POSIX, BSD and C99 interfaces (snprintf, strdup, realpath,
+   MAP_ANONYMOUS, ...) from a strict -std=c89 build unless asked; musl
+   reads the same macro, and macOS and FreeBSD ignore it */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+
 $system
 
 END

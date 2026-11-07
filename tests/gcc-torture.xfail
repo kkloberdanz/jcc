@@ -1,6 +1,5 @@
 # GCC torture tests jcc is known to fail: name, then why (tests/run-gcc-torture.sh reads this;
 # a test that starts passing is reported as XPASS and should be removed here).
-20000223-1 implicit int function declaration in a block
 20001009-2 extended asm
 20010122-1 __builtin_return_address
 20020107-1 extended asm
@@ -83,7 +82,6 @@ pr126405-2 vector types
 pr17377 __builtin_return_address
 pr19449 non-constant static initializer GCC folds
 pr23135 vector types
-pr23467 aligned attribute on a member
 pr34154 variadic macros
 pr35456 __builtin_signbit
 pr38151 _Complex on an integer type (GNU)
@@ -165,4 +163,3 @@ simd-6 vector types
 stkalign extended asm
 struct-ini-4 GNU old-style designators (a: value)
 va-arg-22 typeof
-zerolen-2 __alignof__ expression

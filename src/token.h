@@ -38,6 +38,7 @@
     X(TOK_SHORT) \
     X(TOK_SIGNED) \
     X(TOK_SIZEOF) \
+    X(TOK_ALIGNOF) \
     X(TOK_STATIC) \
     X(TOK_STRUCT) \
     X(TOK_SWITCH) \
@@ -58,6 +59,10 @@
     X(TOK_INT128) \
     X(TOK_BOOL) \
     X(TOK_FLOAT16) \
+    X(TOK_FLOAT32) \
+    X(TOK_FLOAT64) \
+    X(TOK_FLOAT64X) \
+    X(TOK_FLOAT128) \
     X(TOK_BUILTIN_OFFSETOF) \
     X(TOK_UINT128) \
     X(TOK_EXTENSION) \

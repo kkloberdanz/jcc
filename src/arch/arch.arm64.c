@@ -2440,7 +2440,8 @@ static const CppTarget a64_cpp_target = {
     a64_predefined_macros,
     a64_nonstrict_macros,
     a64_has_answers,
-    a64_has_builtins
+    a64_has_builtins,
+    0
 };
 
 #include "target.h"

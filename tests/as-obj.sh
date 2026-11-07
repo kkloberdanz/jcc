@@ -7,7 +7,8 @@
 # tables (clang's would describe every function as frameless anyway).
 # The arm64 Mach-O comparison runs on an arm64 host; the x86_64 ELF one
 # runs anywhere clang can target x86_64-linux-musl (the sysroot is only
-# needed to compile the C tests to assembly). Each compares the assembly
+# needed to compile the C tests to assembly, and an x86_64 host's own
+# target serves without it). Each compares the assembly
 # of tests/*.c and tests/abi/*.c, then the corpus tools/as-corpus.sh
 # collects when it is present. From the repository root (make test does).
 cd "$(dirname "$0")/.." || exit 1
@@ -17,7 +18,10 @@ SYSROOT=${X86_64_SYSROOT:-$DATA/x86_64-linux-musl}
 JOBS=${JOBS:-8}
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
-export JCC tmp
+# the reference assembler is clang's: cc where cc is clang (macOS, FreeBSD), else clang if installed
+REFCC=""
+if cc --version 2>/dev/null | grep -q clang; then REFCC=cc; elif command -v clang >/dev/null 2>&1; then REFCC=clang; fi
+export JCC tmp REFCC
 
 # dump-macho OBJ: the parts compared (sections, their contents, symbols, relocations)
 cat >"$tmp/dump-macho.sh" <<'DUMP'
@@ -53,7 +57,7 @@ cat >"$tmp/one.sh" <<'ONE'
 arch=$1; name=$2; src=$3
 d=$tmp/$arch-$name; mkdir -p "$d"
 grep -v '^\s*\.cfi_' "$src" >"$d/ref.s"
-if [ "$arch" = arm64 ]; then ref="cc"; x="$JCC"; dump=dump-macho; else ref="cc --target=x86_64-linux-musl"; x="$JCC --target=x86_64-linux-musl"; dump=dump-elf; fi
+if [ "$arch" = arm64 ]; then ref="$REFCC"; x="$JCC"; dump=dump-macho; else ref="$REFCC --target=x86_64-linux-musl"; x="$JCC --target=x86_64-linux-musl"; dump=dump-elf; fi
 $ref -c -o "$d/ref.o" "$d/ref.s" 2>"$d/cc.err" || { echo "FAIL $arch $name: cc rejects it"; head -3 "$d/cc.err"; exit 1; }
 $x -c -o "$d/jcc.o" "$src" 2>"$d/jcc.err" || { echo "FAIL $arch $name: jcc rejects it"; head -3 "$d/jcc.err"; exit 1; }
 sh "$tmp/$dump.sh" "$d/ref.o" >"$d/ref.dump"
@@ -66,12 +70,16 @@ ONE
 
 fail=0
 for arch in arm64 x86_64; do
+    if [ -z "$REFCC" ]; then echo "$arch: skipped (no clang to assemble the reference)"; continue; fi
     if [ "$arch" = arm64 ]; then
         case "$(uname -m)" in arm64) ;; *) echo "arm64: skipped (not an arm64 host)"; continue ;; esac
         X="$JCC"
     else
         X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
-        [ -d "$SYSROOT/usr/include" ] || X=""
+        if ! [ -d "$SYSROOT/usr/include" ]; then
+            # no musl sysroot: an x86_64 host's own target writes the same backend's assembly
+            case "$($JCC --print-targets | grep '(host)')" in *x86_64*) X="$JCC" ;; *) X="" ;; esac
+        fi
     fi
     n=0
     if [ -n "$X" ]; then

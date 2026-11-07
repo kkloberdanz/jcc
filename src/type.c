@@ -98,6 +98,26 @@ Type *type_qualify(Type *t, unsigned quals) {
     q->variadic = t->variadic;
     q->has_proto = t->has_proto;
     q->vla = t->vla;
+    q->align = t->align;
+    return q;
+}
+
+Type *type_with_align(Type *t, size_t align) {
+    Type *q;
+    if (t->align == align) {
+        return t;
+    }
+    q = type_alloc(t->kind);
+    q->quals = t->quals;
+    q->base = t->base;
+    q->length = t->length;
+    q->record = t->record;
+    q->params = t->params;
+    q->nparams = t->nparams;
+    q->variadic = t->variadic;
+    q->has_proto = t->has_proto;
+    q->vla = t->vla;
+    q->align = align;
     return q;
 }
 
@@ -106,7 +126,7 @@ Type *type_unqualified(Type *t) {
     if (!t->quals) {
         return t;
     }
-    if (t->kind <= TY_VA_LIST) {
+    if (t->kind <= TY_VA_LIST && !t->align) {
         return type_basic(t->kind);
     }
     q = type_alloc(t->kind);
@@ -118,6 +138,7 @@ Type *type_unqualified(Type *t) {
     q->variadic = t->variadic;
     q->has_proto = t->has_proto;
     q->vla = t->vla;
+    q->align = t->align;
     return q;
 }
 
@@ -375,7 +396,7 @@ int type_is_unsigned(const Type *t) {
 }
 
 int type_is_floating(const Type *t) {
-    return t->kind >= TY_FLOAT16 && t->kind <= TY_LDOUBLE;
+    return t->kind >= TY_FLOAT16 && t->kind <= TY_FLOAT128;
 }
 
 int type_is_wide(const Type *t) {
@@ -383,7 +404,7 @@ int type_is_wide(const Type *t) {
 }
 
 int type_is_complex(const Type *t) {
-    return t->kind == TY_CFLOAT || t->kind == TY_CDOUBLE || t->kind == TY_CLDOUBLE;
+    return t->kind == TY_CFLOAT || t->kind == TY_CDOUBLE || t->kind == TY_CLDOUBLE || t->kind == TY_CFLOAT128;
 }
 
 int type_is_arithmetic(const Type *t) {
@@ -394,6 +415,7 @@ Type *type_complex_base(const Type *t) {
     switch (t->kind) {
         case TY_CFLOAT: return type_basic(TY_FLOAT);
         case TY_CDOUBLE: return type_basic(TY_DOUBLE);
+        case TY_CFLOAT128: return type_basic(TY_FLOAT128);
         default: return type_basic(TY_LDOUBLE);
     }
 }
@@ -402,6 +424,7 @@ Type *type_complex_of(const Type *real) {
     switch (real->kind) {
         case TY_FLOAT: return type_basic(TY_CFLOAT);
         case TY_DOUBLE: return type_basic(TY_CDOUBLE);
+        case TY_FLOAT128: return type_basic(TY_CFLOAT128);
         default: return type_basic(TY_CLDOUBLE);
     }
 }
@@ -514,12 +537,16 @@ size_t type_size(const Type *t) {
             return arch_info->double_size;
         case TY_LDOUBLE:
             return arch_info->ldouble_size;
+        case TY_FLOAT128:
+            return 16;   /* IEEE binary128, as gcc's on x86_64 and arm64 */
         case TY_CFLOAT:
             return 2 * arch_info->float_size;
         case TY_CDOUBLE:
             return 2 * arch_info->double_size;
         case TY_CLDOUBLE:
             return 2 * arch_info->ldouble_size;
+        case TY_CFLOAT128:
+            return 32;
         case TY_VA_LIST:
             return arch_info->va_list_size;
         case TY_STRUCT:
@@ -538,6 +565,9 @@ size_t type_size(const Type *t) {
 }
 
 size_t type_align(const Type *t) {
+    if (t->align) {
+        return t->align;
+    }
     switch (t->kind) {
         case TY_INT128:
         case TY_UINT128:
@@ -550,6 +580,8 @@ size_t type_align(const Type *t) {
             return arch_info->double_size;
         case TY_CLDOUBLE:
             return arch_info->ldouble_align;
+        case TY_CFLOAT128:
+            return 16;
         case TY_VA_LIST:
             return arch_info->va_list_align;
         case TY_STRUCT:
@@ -636,6 +668,9 @@ Type *type_arith_common(Type *a, Type *b) {
         Type *c = type_arith_common(type_is_complex(a) ? type_complex_base(a) : a,
                                     type_is_complex(b) ? type_complex_base(b) : b);
         return type_complex_of(type_is_floating(c) ? c : type_basic(TY_DOUBLE));
+    }
+    if (a->kind == TY_FLOAT128 || b->kind == TY_FLOAT128) {
+        return type_basic(TY_FLOAT128);
     }
     if (a->kind == TY_LDOUBLE || b->kind == TY_LDOUBLE) {
         return type_basic(TY_LDOUBLE);

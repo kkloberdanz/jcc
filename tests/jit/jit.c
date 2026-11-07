@@ -15,6 +15,10 @@
  * tests/jit.sh (make test), natively on each host; the units include no
  * headers, so that the Linux run needs no header paths.
  */
+/* snprintf, which glibc hides under -std=c89 */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -819,7 +819,7 @@ static void replace_trigraphs(char *buf, size_t *len) {
 static char *dir_of(const char *path) {
     const char *slash = strrchr(path, '/');
     if (!slash) {
-        return pp_strdup(".");
+        return pp_strdup(P.target->gcc_paths ? "" : ".");   /* join_path spells "" as nothing, "." as "./" */
     }
     if (slash == path) {
         return pp_strdup("/");
@@ -2472,7 +2472,11 @@ static void do_include(Source *s, Loc loc, int next, int once) {
         return;
     }
     if (next && (!s->prev || s->dir_index < 0)) {
-        diag_warning(loc, "#include_next in file found relative to primary source file or found by absolute path; will search from start of include path");
+        /* gcc's own limits.h reaches syslimits.h with a quoted #include, and syslimits.h does
+           #include_next <limits.h>: searching from the start is what gcc does there, silently */
+        if (!s->prev) {
+            diag_warning(loc, "#include_next in primary source file; will search from start of include path");
+        }
         next = 0;
     }
     if (!find_include(b.s, angle, next, &path, &dir_index, &is_system)) {
@@ -3023,7 +3027,7 @@ static void setup(const CppOptions *opts) {
     P.nuser = P.ndirs;
     sysroot = opts->sysroot ? opts->sysroot : P.target->default_sysroot;
     sn = strlen(sysroot);
-    while (sn > 1 && sysroot[sn - 1] == '/') {
+    while (sn > 0 && sysroot[sn - 1] == '/') {    /* "/" itself joins as "" */
         sn--;
     }
     if (!opts->nostdinc) {

@@ -12,15 +12,20 @@ SYSROOT=${X86_64_SYSROOT:-$DATA/x86_64-linux-musl}
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 fail=0
+# each target named, not the host's default: the arm64 lines below are no x86_64 assembly
+ARM="$JCC --target=arm64-apple-macos"
 X86="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
-[ -d "$SYSROOT/usr/include" ] || X86=""
+if ! [ -d "$SYSROOT/usr/include" ]; then
+    # no musl sysroot: an x86_64 host's own target and headers serve
+    case "$($JCC --print-targets | grep '(host)')" in *x86_64*) X86="$JCC" ;; *) X86="" ;; esac
+fi
 
 # every test program's assembly is accepted
 n=0
 for src in tests/*.c tests/abi/*.c; do
     name=$(basename "$src" .c)
     for mode in arm64 x86_64; do
-        if [ "$mode" = arm64 ]; then X="$JCC"; else X="$X86"; fi
+        if [ "$mode" = arm64 ]; then X="$ARM"; else X="$X86"; fi
         [ -n "$X" ] || continue
         $X -S -o "$tmp/$name.$mode.s" "$src" 2>/dev/null || continue
         n=$((n + 1))
@@ -40,13 +45,13 @@ reject() {    # reject TARGET-FLAGS LINE-NUMBER MESSAGE
         echo "FAIL rejection: line $2 ($3), got:"; sed 's/^/    /' "$tmp/err"; fail=$((fail + 1))
     fi
 }
-printf '\t.text\n\tfrob x0, x1\n' >"$tmp/bad.s"; reject "$JCC" 2 "unsupported instruction form"
-printf '\t.text\n\tmov x0, [x1]\n' >"$tmp/bad.s"; reject "$JCC" 2 "unsupported instruction form"
-printf '\t.text\n\tldr x0, [x1, #8, lsl #3]\n' >"$tmp/bad.s"; reject "$JCC" 2 "cannot parse operand"
-printf '\t.text\n_f:\n\t.weak _f\n' >"$tmp/bad.s"; reject "$JCC" 3 "unsupported directive"
-printf '\t.data\n\tadd x0, x0, #1\n' >"$tmp/bad.s"; reject "$JCC" 2 "an instruction outside .text"
-printf '\t.text\n\tmov x0, ~1\n' >"$tmp/bad.s"; reject "$JCC" 2 "unexpected character"
-printf '\t.bss\n_x:\n\t.byte 1\n' >"$tmp/bad.s"; reject "$JCC" 3 "non-zero data in .bss"
+printf '\t.text\n\tfrob x0, x1\n' >"$tmp/bad.s"; reject "$ARM" 2 "unsupported instruction form"
+printf '\t.text\n\tmov x0, [x1]\n' >"$tmp/bad.s"; reject "$ARM" 2 "unsupported instruction form"
+printf '\t.text\n\tldr x0, [x1, #8, lsl #3]\n' >"$tmp/bad.s"; reject "$ARM" 2 "cannot parse operand"
+printf '\t.text\n_f:\n\t.weak _f\n' >"$tmp/bad.s"; reject "$ARM" 3 "unsupported directive"
+printf '\t.data\n\tadd x0, x0, #1\n' >"$tmp/bad.s"; reject "$ARM" 2 "an instruction outside .text"
+printf '\t.text\n\tmov x0, ~1\n' >"$tmp/bad.s"; reject "$ARM" 2 "unexpected character"
+printf '\t.bss\n_x:\n\t.byte 1\n' >"$tmp/bad.s"; reject "$ARM" 3 "non-zero data in .bss"
 if [ -n "$X86" ]; then
     printf '\t.text\n\tmovq %%rax, %%rbx, %%rcx\n' >"$tmp/bad.s"; reject "$X86" 2 "unsupported instruction form"
     printf '\t.text\n\tmovq 8(%%rax,%%rbx,3), %%rcx\n' >"$tmp/bad.s"; reject "$X86" 2 "cannot parse operand"
@@ -56,7 +61,7 @@ fi
 # the collected corpus, when it is there
 for mode in arm64 x86_64; do
     [ -d "$DATA/as-corpus/$mode" ] || continue
-    if [ "$mode" = arm64 ]; then X="$JCC"; else X="$X86"; fi
+    if [ "$mode" = arm64 ]; then X="$ARM"; else X="$X86"; fi
     [ -n "$X" ] || continue
     count=0
     for f in "$DATA/as-corpus/$mode"/*.s; do

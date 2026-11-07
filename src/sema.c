@@ -512,18 +512,15 @@ int sema_const_eval(AST *e, long *out) {
         }
 
         case N_SIZEOF_EXPR:
-            if (!e->u.cast.expr->type || type_is_vla(e->u.cast.expr->type)) {
+        case N_SIZEOF_TYPE: {
+            /* an alignment is constant even for a variable length array */
+            Type *t = e->kind == N_SIZEOF_EXPR ? e->u.cast.expr->type : e->u.cast.type->type;
+            if (!t || (!e->u.cast.align && type_is_vla(t))) {
                 return 0;
             }
-            *out = (long)type_size(e->u.cast.expr->type);
+            *out = (long)(e->u.cast.align ? type_align(t) : type_size(t));
             return 1;
-
-        case N_SIZEOF_TYPE:
-            if (!e->u.cast.type->type || type_is_vla(e->u.cast.type->type)) {
-                return 0;
-            }
-            *out = (long)type_size(e->u.cast.type->type);
-            return 1;
+        }
 
         default:
             return 0;
@@ -792,7 +789,7 @@ static void scan_attribute(const char *text, int *packed, size_t *aligned) {
     p = strstr(text, "aligned");
     if (p) {
         p += strlen("aligned");
-        while (*p == '_') {
+        while (*p == '_' || *p == ' ' || *p == '\t' || *p == '\n') {   /* __aligned__ (8) */
             p++;
         }
         if (*p == '(') {
@@ -804,6 +801,38 @@ static void scan_attribute(const char *text, int *packed, size_t *aligned) {
             *aligned = 16;  /* bare aligned: the largest alignment on either target */
         }
     }
+}
+
+/* the alignment __attribute__((aligned)) asks for in a declarator's attributes or its
+   declaration's specifiers (`int __attribute__((aligned(8))) x`); 0 when none does */
+static size_t decl_aligned(AST *d, const Specs *sp) {
+    size_t aligned = sp->aligned;
+    int packed = 0;
+    size_t i;
+    for (; d; d = d->kind == N_DECL_NAME ? NULL : d->u.declarator.inner) {
+        if (!d->u.declarator.attrs) {
+            continue;
+        }
+        for (i = 0; i < d->u.declarator.attrs->len; i++) {
+            AST *a = d->u.declarator.attrs->items[i];
+            if (a->kind == N_ATTRIBUTE) {
+                scan_attribute(a->u.text, &packed, &aligned);
+            }
+        }
+    }
+    return aligned;
+}
+
+/* the type a declaration's aligned attribute gives what it declares: a typedef takes the
+   alignment as asked (gcc lets it lower one too), a member or an object only ever gains */
+static Type *apply_aligned(Type *t, size_t aligned, int is_typedef) {
+    if (!aligned || t->kind == TY_FUNC || (aligned & (aligned - 1)) != 0) {
+        return t;
+    }
+    if (is_typedef || aligned > type_align(t)) {
+        return type_with_align(t, aligned);
+    }
+    return t;
 }
 
 static void sema_enum_spec(AST *spec, Type *type) {
@@ -913,6 +942,9 @@ static void sema_struct_spec(AST *spec, Type *type, const Specs *attrs) {
             if (declarator) {
                 mt = sema_declarator(declarator, base, &name);
             }
+            if (!sd->u.init_decl.init) {
+                mt = apply_aligned(mt, decl_aligned(declarator, &sp), 0);   /* not a bit-field */
+            }
             if (sd->u.init_decl.init) {
                 long w;
                 sema_rvalue(&sd->u.init_decl.init);
@@ -1013,7 +1045,7 @@ static Type *tag_type(AST *spec) {
 static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
     int n_void = 0, n_char = 0, n_short = 0, n_int = 0, n_long = 0;
     int n_float = 0, n_double = 0, n_signed = 0, n_unsigned = 0;
-    int n_va_list = 0, n_int128 = 0, n_uint128 = 0, n_bool = 0, n_float16 = 0, n_complex = 0;
+    int n_va_list = 0, n_int128 = 0, n_uint128 = 0, n_bool = 0, n_float16 = 0, n_float128 = 0, n_complex = 0;
     int n_other = 0;        /* struct, union, enum, typedef name */
     AST *other = NULL;
     unsigned quals = 0;
@@ -1082,6 +1114,8 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
                     case TS_UINT128: n_uint128++; break;
                     case TS_BOOL: n_bool++; break;
                     case TS_FLOAT16: n_float16++; break;
+                    case TS_FLOAT64X: n_long++; n_double++; break;
+                    case TS_FLOAT128: n_float128++; break;
                     case TS_COMPLEX: n_complex++; break;
                 }
                 break;
@@ -1099,7 +1133,7 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
     }
 
     if (n_other > 1 || (n_other && (n_void + n_char + n_short + n_int + n_long + n_float
-            + n_double + n_signed + n_unsigned + n_va_list + n_int128 + n_uint128 + n_bool + n_float16 + n_complex))) {
+            + n_double + n_signed + n_unsigned + n_va_list + n_int128 + n_uint128 + n_bool + n_float16 + n_float128 + n_complex))) {
         diag_error(loc, "invalid combination of type specifiers");
         n_other = 0;
     }
@@ -1131,6 +1165,11 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
         t = type_basic(TY_VA_LIST);
     } else if (n_float16) {
         t = type_basic(TY_FLOAT16);   /* declared by the macOS SDK's math.h; values are not supported */
+    } else if (n_float128) {
+        t = type_basic(TY_FLOAT128);  /* declared by glibc's math.h and stdlib.h; values are not supported */
+        if (n_float128 > 1 || n_char || n_short || n_int || n_long || n_float || n_double || n_signed || n_unsigned) {
+            diag_error(loc, "invalid combination of type specifiers");
+        }
     } else if (n_bool) {
         t = type_basic(TY_BOOL);
         if (n_bool > 1 || n_char || n_short || n_int || n_long || n_float || n_double || n_signed || n_unsigned) {
@@ -1188,6 +1227,8 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
             t = type_basic(TY_CDOUBLE);
         } else if (t->kind == TY_LDOUBLE) {
             t = type_basic(TY_CLDOUBLE);
+        } else if (t->kind == TY_FLOAT128) {
+            t = type_basic(TY_CFLOAT128);
         } else if (t->kind == TY_INT && !n_int && !n_signed && !n_unsigned) {
             t = type_basic(TY_CDOUBLE);
         } else {
@@ -2263,6 +2304,7 @@ static Type *sema_cast(AST *e) {
 
 static Type *sema_sizeof(AST *e) {
     Type *t;
+    const char *op = e->u.cast.align ? "_Alignof" : "sizeof";
 
     e->lvalue = 0;
     e->type = type_size_t();
@@ -2271,15 +2313,15 @@ static Type *sema_sizeof(AST *e) {
     } else {
         t = sema_expr(&e->u.cast.expr);
         if (sema_is_bitfield(e->u.cast.expr)) {
-            diag_error(e->loc, "invalid application of 'sizeof' to a bit-field");
+            diag_error(e->loc, "invalid application of '%s' to a bit-field", op);
             return e->type;
         }
     }
     if (t->kind == TY_FUNC) {
         /* a GNU extension: the size is 1 */
-        diag_warning(e->loc, "invalid application of 'sizeof' to a function type");
+        diag_warning(e->loc, "invalid application of '%s' to a function type", op);
     } else if (!type_is_complete(t) && t->kind != TY_VOID) {
-        diag_error(e->loc, "invalid application of 'sizeof' to incomplete type %s", ts(t));
+        diag_error(e->loc, "invalid application of '%s' to incomplete type %s", op, ts(t));
     }
     return e->type;
 }
@@ -3010,6 +3052,7 @@ static void sema_declaration(AST *decl, int file_scope) {
             array_param_top = declarator_top(id->u.init_decl.declarator);    /* a K&R parameter's */
         }
         t = sema_declarator(id->u.init_decl.declarator, sp.type, &name);
+        t = apply_aligned(t, decl_aligned(id->u.init_decl.declarator, &sp), sp.is_typedef);
         array_param_top = saved_top;
 
         id->type = t;
