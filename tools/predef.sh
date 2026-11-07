@@ -5,7 +5,8 @@
 # SDK headers make. jcc then preprocesses without the host compiler.
 #
 #   tools/predef.sh arm64-macos            # from the host's clang and SDK
-#   tools/predef.sh x86_64-linux dM.txt    # from a saved `gcc -E -dM -std=gnu89 - </dev/null`
+#   tools/predef.sh x86_64-linux dM.txt    # from a saved `gcc -E -dM -std=gnu89 - </dev/null` (Alpine's: musl)
+#   tools/predef.sh x86_64-linux-gnu dM.txt  # the same from a glibc distribution's gcc
 #   tools/predef.sh x86_64-freebsd         # from the host's clang, aimed at FreeBSD, and
 #                                          # the sysroot tools/sysroot-freebsd.sh made
 #
@@ -16,17 +17,17 @@
 set -e
 target=$1
 case "$target" in
-    arm64-macos|x86_64-linux|x86_64-freebsd) ;;
-    *) echo "usage: tools/predef.sh arm64-macos | x86_64-linux dM.txt | x86_64-freebsd" >&2; exit 2 ;;
+    arm64-macos|x86_64-linux|x86_64-linux-gnu|x86_64-freebsd) ;;
+    *) echo "usage: tools/predef.sh arm64-macos | x86_64-linux dM.txt | x86_64-linux-gnu dM.txt | x86_64-freebsd" >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
 out=src/arch/predef_$(echo "$target" | tr - _).h
 # the tables carry the backend's prefix, so both backends can live in one translation unit (the amalgamation)
-case "$target" in arm64-macos) prefix=a64_ ;; x86_64-freebsd) prefix=x64fb_ ;; *) prefix=x64_ ;; esac
+case "$target" in arm64-macos) prefix=a64_ ;; x86_64-freebsd) prefix=x64fb_ ;; x86_64-linux-gnu) prefix=x64gnu_ ;; *) prefix=x64_ ;; esac
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
-if [ "$target" != x86_64-linux ]; then
+if [ "$target" != x86_64-linux ] && [ "$target" != x86_64-linux-gnu ]; then
     if [ "$target" = arm64-macos ]; then
         clang="cc"
         sdk=$(xcrun --show-sdk-path)
@@ -56,7 +57,7 @@ if [ "$target" != x86_64-linux ]; then
     awk 'NR == FNR {v[$1] = $2; next} FILENAME == ARGV[2] {bad[$1] = 1; next} !(FNR in bad) {print $0, v[FNR]}' \
         "$tmp/has.idx" "$tmp/bad" "$tmp/queries" > "$tmp/answers"
 else
-    [ -n "$2" ] || { echo "x86_64-linux needs the saved gcc -dM output" >&2; exit 2; }
+    [ -n "$2" ] || { echo "$target needs the saved gcc -dM output" >&2; exit 2; }
     cp "$2" "$tmp/dm"
     : > "$tmp/answers"
 fi

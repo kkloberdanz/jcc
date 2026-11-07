@@ -43,6 +43,7 @@ typedef struct Target {
 
 extern const Target target_arm64_macos;
 extern const Target target_x86_64_linux;
+extern const Target target_x86_64_linux_gnu;
 extern const Target target_x86_64_freebsd;
 
 extern const Target *const targets[];   /* NULL-terminated */

@@ -10,11 +10,12 @@
 # there by gcc. Needs tools/lua.sh to have run.
 # Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 JCC=${JCC:-./jcc}
 DATA=${JCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc}
 LUA=$DATA/lua-5.4.8
 TESTS=$DATA/lua-5.4.8-tests
-[ -d "$LUA/src" ] && [ -d "$TESTS" ] || { echo "no Lua at $DATA: run tools/lua.sh"; exit 2; }
+[ -d "$LUA/src" ] && [ -d "$TESTS" ] || skip_stage "no Lua at $DATA: run tools/lua.sh"
 mode=${1:-native}
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
@@ -36,7 +37,7 @@ if [ "$mode" = jit ] || [ "$mode" = jit-x86_64 ]; then
     cp -r "$TESTS" "$tmp/testes"
     if [ "$mode" = jit-x86_64 ]; then
         [ -f dist/jcc.c ] || { echo "no dist/jcc.c: run make amalgamation first"; exit 1; }
-        docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
+        docker info >/dev/null 2>&1 || skip_stage "docker is not running"
         cp dist/jcc.c dist/jcc.h tests/jit/lua.c "$tmp/"
         cp -r "$LUA/src" "$tmp/luasrc"
         echo "building the host in Docker"
@@ -74,8 +75,8 @@ if [ "$mode" = jit ] || [ "$mode" = jit-x86_64 ]; then
 fi
 if [ "$mode" = x86_64 ]; then
     SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
-    docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
-    command -v ld.lld >/dev/null 2>&1 || { echo "no ld.lld: brew install lld"; exit 2; }
+    docker info >/dev/null 2>&1 || skip_stage "docker is not running"
+    command -v ld.lld >/dev/null 2>&1 || skip_stage "no ld.lld: brew install lld"
     X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT -DLUA_USE_LINUX"
 else
     X="$JCC -DLUA_USE_MACOSX"

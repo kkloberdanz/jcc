@@ -6,10 +6,11 @@
 # here and runs it in Docker. Needs tools/sqlite.sh to have run. Run from
 # the repository root.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 JCC=${JCC:-./jcc}
 DATA=${JCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc}
 SQLITE=$DATA/sqlite-amalgamation-3530400
-[ -f "$SQLITE/sqlite3.c" ] && [ -f "$SQLITE/shell.c" ] || { echo "no SQLite at $DATA: run tools/sqlite.sh"; exit 2; }
+[ -f "$SQLITE/sqlite3.c" ] && [ -f "$SQLITE/shell.c" ] || skip_stage "no SQLite at $DATA: run tools/sqlite.sh"
 mode=${1:-native}
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
@@ -20,8 +21,8 @@ trap 'rm -rf "$tmp"' EXIT
 FLAGS="-std=gnu99"
 if [ "$mode" = x86_64 ]; then
     SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
-    docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
-    command -v ld.lld >/dev/null 2>&1 || { echo "no ld.lld: brew install lld"; exit 2; }
+    docker info >/dev/null 2>&1 || skip_stage "docker is not running"
+    command -v ld.lld >/dev/null 2>&1 || skip_stage "no ld.lld: brew install lld"
     X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
 else
     X=$JCC

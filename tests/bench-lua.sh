@@ -5,10 +5,11 @@
 #   JCC="cc -O0" sh tests/bench-lua.sh
 # Needs tools/lua.sh to have run. Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 JCC=${JCC:-./jcc}
 DATA=${JCC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc}
 LUA=$DATA/lua-5.4.8
-[ -d "$LUA/src" ] || { echo "no Lua at $DATA: run tools/lua.sh"; exit 2; }
+[ -d "$LUA/src" ] || skip_stage "no Lua at $DATA: run tools/lua.sh"
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 srcs=$(ls "$LUA"/src/*.c | grep -v "luac.c\|onelua.c")

@@ -14,18 +14,19 @@
 # the number of processors).
 # Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 JCC=${JCC:-./jcc}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 ROOT=${GCC_TORTURE:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/gcc-torture}
 SUITE=$ROOT/gcc/testsuite/gcc.c-torture/execute
 REF=$ROOT/ref
 XFAIL=tests/gcc-torture.xfail
-[ -d "$SUITE" ] || { echo "no suite at $SUITE: run tools/gcc-torture.sh"; exit 2; }
+[ -d "$SUITE" ] || skip_stage "no suite at $SUITE: run tools/gcc-torture.sh"
 mode=${1:-native}
 if [ "$mode" = x86_64 ]; then
     XFAIL="$XFAIL tests/gcc-torture.x86_64-linux.xfail"
     SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
-    docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
+    docker info >/dev/null 2>&1 || skip_stage "docker is not running"
     X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
 else
     X="$JCC"

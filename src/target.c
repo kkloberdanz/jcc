@@ -6,6 +6,7 @@
 const Target *const targets[] = {
     &target_arm64_macos,
     &target_x86_64_linux,
+    &target_x86_64_linux_gnu,
     &target_x86_64_freebsd,
     NULL
 };
@@ -18,6 +19,8 @@ const Backend *cg = NULL;
 const Target *target_host(void) {
 #if defined(__APPLE__) && defined(__aarch64__)
     return &target_arm64_macos;
+#elif defined(__linux__) && defined(__x86_64__) && defined(__GLIBC__)
+    return &target_x86_64_linux_gnu;    /* stdio.h, through target.h, defines __GLIBC__ */
 #elif defined(__linux__) && defined(__x86_64__)
     return &target_x86_64_linux;
 #elif defined(__FreeBSD__) && defined(__x86_64__)

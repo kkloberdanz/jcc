@@ -24,6 +24,9 @@ if [ -z "$X86_64_LINUX_GCC_DIR" ]; then
     ver=${ver:-/13.2.1/include}; ver=${ver%/include}; ver=${ver##*/}
     X86_64_LINUX_GCC_DIR="=/usr/lib/gcc/x86_64-alpine-linux-musl/$ver"
 fi
+if [ -z "$X86_64_GNU_GCC_DIR" ] && [ "$(uname -s)" = Linux ]; then
+    X86_64_GNU_GCC_DIR="=$(cc -print-file-name=)"; X86_64_GNU_GCC_DIR=${X86_64_GNU_GCC_DIR%/}
+fi
 TARGET_DEFS="-DJCC_ARM64_MACOS_SYSROOT=\"$ARM64_MACOS_SYSROOT\" -DJCC_ARM64_MACOS_RESOURCE_INC=\"$ARM64_MACOS_RESOURCE_INC\" \
     -DJCC_X86_64_LINUX_SYSROOT=\"$X86_64_LINUX_SYSROOT\" -DJCC_X86_64_LINUX_GCC_DIR=\"$X86_64_LINUX_GCC_DIR\" \
-    -DJCC_X86_64_FREEBSD_SYSROOT=\"$X86_64_FREEBSD_SYSROOT\""
+    -DJCC_X86_64_FREEBSD_SYSROOT=\"$X86_64_FREEBSD_SYSROOT\"${X86_64_GNU_GCC_DIR:+ -DJCC_X86_64_GNU_GCC_DIR=\"$X86_64_GNU_GCC_DIR\"}"

@@ -13,15 +13,16 @@
 # the number of processors).
 # Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 JCC=${JCC:-./jcc}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 XFAIL=tests/c-testsuite.xfail
 SUITE=${C_TESTSUITE:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/c-testsuite}
-[ -d "$SUITE/tests/single-exec" ] || { echo "no suite at $SUITE: run tools/c-testsuite.sh"; exit 2; }
+[ -d "$SUITE/tests/single-exec" ] || skip_stage "no suite at $SUITE: run tools/c-testsuite.sh"
 mode=${1:-native}
 if [ "$mode" = x86_64 ]; then
     SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
-    docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
+    docker info >/dev/null 2>&1 || skip_stage "docker is not running"
     X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
     XFAIL="$XFAIL tests/c-testsuite.x86_64-linux.xfail"
 else

@@ -3,8 +3,10 @@
 # (skipped with a note when Docker, the sysroot or a program is missing),
 # then both again at -O1 (the make X-O1 targets), then an AddressSanitizer
 # build of the compiler in a scratch copy running the native suites again. Each stage is a make target or a script that
-# exits 0 to pass and 2 when it cannot run (a suite that was not fetched,
-# Docker not running); anything else fails. One table at the end, one log
+# exits 0 to pass, or calls skip_stage (tests/skip.sh) when it cannot run
+# (a suite that was not fetched, Docker not running), which leaves the
+# marker file VERIFY_SKIP; anything else fails. The marker, not the exit
+# code, is what counts: make reports every failing recipe as exit 2. One table at the end, one log
 # per stage under the directory VERIFY_LOGS (default: a temporary one,
 # kept when a stage fails). The runners compile and run tests JOBS at a
 # time (default: the number of processors), so the native stages take
@@ -23,15 +25,21 @@ stage() {    # stage NAME COMMAND...: run it, record PASS, FAIL or SKIP with its
     name=$1; shift
     start=$(date +%s)
     printf '%-22s ' "$name"
+    marker="$LOGS/$name.skip"
+    rm -f "$marker"
+    export VERIFY_SKIP="$marker"
     "$@" >"$LOGS/$name.log" 2>&1
     rc=$?
     secs=$(( $(date +%s) - start ))
-    last=$(grep -v '^$' "$LOGS/$name.log" | grep -v '^make:' | tail -1 | cut -c1-70)
-    case $rc in
-        0) verdict=PASS ;;
-        2) verdict=SKIP ;;
-        *) verdict=FAIL; failed=$((failed + 1)) ;;
-    esac
+    last=$(grep -v '^$' "$LOGS/$name.log" | grep -v '^make\(\[[0-9]*\]\)\{0,1\}:' | tail -1 | cut -c1-70)
+    if [ "$rc" -eq 0 ]; then
+        verdict=PASS
+    elif [ -f "$marker" ]; then
+        verdict=SKIP
+    else
+        verdict=FAIL; failed=$((failed + 1))
+    fi
+    rm -f "$marker"
     printf '%s %4ds  %s\n' "$verdict" "$secs" "$last"
     table="$table$(printf '%-22s %s %4ds  %s' "$name" "$verdict" "$secs" "$last")
 "

@@ -42,6 +42,15 @@ elif grep -q "unknown target 'bogus'" "$tmp/err"; then ok "--target=bogus is rej
 # 3. the preprocessor follows the target
 m=$("$JCC" -E --target=$X86 -nostdinc "$tmp/m.c" | grep -v '^#')
 [ "$(echo $m)" = LINUX ] && ok "-E --target=$X86 predefines __linux__" || bad "-E --target=$X86 predefines __linux__ (got: $m)"
+m=$("$JCC" -E --target=x86_64-linux-gnu -nostdinc "$tmp/m.c" | grep -v '^#')
+[ "$(echo $m)" = LINUX ] && ok "-E --target=x86_64-linux-gnu predefines __linux__" || bad "-E --target=x86_64-linux-gnu predefines __linux__ (got: $m)"
+# glibc's gcc makes int_fast32_t long, musl's int: each Linux target carries its own
+printf '__INT_FAST32_TYPE__\n' >"$tmp/f.c"
+[ "$("$JCC" -E --target=x86_64-linux-gnu -nostdinc "$tmp/f.c" | grep -v '^#' | xargs)" = "long int" ] \
+    && [ "$("$JCC" -E --target=$X86 -nostdinc "$tmp/f.c" | grep -v '^#' | xargs)" = "int" ] \
+    && ok "the glibc and musl targets differ in int_fast32_t" || bad "the glibc and musl targets differ in int_fast32_t"
+"$JCC" --target=x86_64-linux-gnu -nostdinc -S -o "$tmp/gnu.s" "$tmp/t.c" && cmp -s "$tmp/x86.s" "$tmp/gnu.s" \
+    && ok "--target x86_64-linux-gnu generates the same x86_64 code" || bad "--target x86_64-linux-gnu generates the same x86_64 code"
 m=$("$JCC" -E --target=$ARM -nostdinc "$tmp/m.c" | grep -v '^#')
 [ "$(echo $m)" = APPLE ] && ok "-E --target=$ARM predefines __APPLE__" || bad "-E --target=$ARM predefines __APPLE__ (got: $m)"
 m=$("$JCC" -E --target=$FBSD -nostdinc "$tmp/m.c" | grep -v '^#')

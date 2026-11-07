@@ -8,12 +8,13 @@
 # are cross compiled here and gcc's objects, the links and the runs happen
 # in Docker (needs tools/sysroot.sh). Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 JCC=${JCC:-./jcc}
 mode=${1:-native}
 if [ "$mode" = x86_64 ]; then
     SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
-    [ -d "$SYSROOT/usr/include" ] || { echo "no sysroot at $SYSROOT: run tools/sysroot.sh"; exit 2; }
-    docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
+    [ -d "$SYSROOT/usr/include" ] || skip_stage "no sysroot at $SYSROOT: run tools/sysroot.sh"
+    docker info >/dev/null 2>&1 || skip_stage "docker is not running"
     X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
 else
     X="$JCC"

@@ -6,9 +6,12 @@
  * links and runs. argv[1] is a scratch directory. Built and run by
  * tests/embed.sh (make test).
  */
+/* snprintf and the wait status macros, which glibc hides under -std=c89 */
+#define _POSIX_C_SOURCE 200112L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 
 #include "jcc.h"
 
@@ -193,18 +196,24 @@ int main(int argc, char **argv) {
     }
     check(rc == 0, "twenty alternating failing and good units behave the same each time");
 
-    /* 9. another target from the same process; -nostdinc so no sysroot is needed */
-    cross = jcc_new("x86_64-linux-musl");
-    check(cross != NULL && strcmp(jcc_target(cross), "x86_64-linux-musl") == 0, "a second compiler for another target");
-    if (cross) {
-        jcc_set_option(cross, "-nostdinc", NULL);
-        rc = jcc_compile_to_asm(cross, "gen.c", "int main(void) { return 0; }\n", &out, &len);
-        check(rc == 0 && out && strstr(out, "GNU-stack") != NULL, "it produces that target's assembly");
-        free(out);
-        rc = jcc_compile_to_asm(k, "gen.c", "int main(void) { return 0; }\n", &out, &len);
-        check(rc == 0 && out && strstr(out, "GNU-stack") == NULL, "and the first still produces the host's");
-        free(out);
-        jcc_free(cross);
+    /* 9. another target from the same process; -nostdinc so no sysroot is needed. It is
+       told from the host's by a mark only its assembly has: ELF's stack note, Mach-O's _main */
+    {
+        int host_macos = strcmp(jcc_target(k), "arm64-apple-macos") == 0;
+        const char *other = host_macos ? "x86_64-linux-musl" : "arm64-apple-macos";
+        const char *mark = host_macos ? "GNU-stack" : "_main:";
+        cross = jcc_new(other);
+        check(cross != NULL && strcmp(jcc_target(cross), other) == 0, "a second compiler for another target");
+        if (cross) {
+            jcc_set_option(cross, "-nostdinc", NULL);
+            rc = jcc_compile_to_asm(cross, "gen.c", "int main(void) { return 0; }\n", &out, &len);
+            check(rc == 0 && out && strstr(out, mark) != NULL, "it produces that target's assembly");
+            free(out);
+            rc = jcc_compile_to_asm(k, "gen.c", "int main(void) { return 0; }\n", &out, &len);
+            check(rc == 0 && out && strstr(out, mark) == NULL, "and the first still produces the host's");
+            free(out);
+            jcc_free(cross);
+        }
     }
 
     jcc_free(k);

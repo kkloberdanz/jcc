@@ -2367,6 +2367,48 @@ static const TargetLink x64_link = {
 const Target target_x86_64_linux = { "x86_64-linux-musl", x64_aliases, &x64_info, &x64_cpp_target, &x64_backend, &x64_link, &as_x86_64 };
 
 /*
+ * x86_64 Linux with glibc (Debian, Fedora, ...): the same code generator
+ * and ABI, with the distribution gcc's predefined macros (glibc's
+ * int_fast16_t and int_fast32_t are long, musl's int) and its header
+ * layout: the multiarch directory holds glibc's bits/ and gnu/, and gcc's
+ * own headers come first, as gcc searches them. It is the host's target
+ * when jcc is built against glibc. A native build links with the host's
+ * cc; there is no link line for it from another host yet.
+ */
+
+#include "predef_x86_64_linux_gnu.h"
+
+/* gcc's own directory, /usr/lib/gcc/x86_64-linux-gnu/<version>: the Makefile asks the host's cc */
+#ifndef JCC_X86_64_GNU_GCC_DIR
+#define JCC_X86_64_GNU_GCC_DIR "=/usr/lib/gcc/x86_64-linux-gnu/14"
+#endif
+
+static const char *const x64gnu_system_dirs[] = {
+    JCC_X86_64_GNU_GCC_DIR "/include",
+    "=/usr/local/include",
+    "=/usr/include/x86_64-linux-gnu",
+    "=/usr/include",
+    NULL
+};
+
+static const CppTarget x64gnu_cpp_target = {
+    "/",
+    x64gnu_system_dirs,
+    x64gnu_predefined_macros,
+    x64gnu_nonstrict_macros,
+    x64gnu_has_answers,
+    x64_has_builtins
+};
+
+static const char *const x64gnu_aliases[] = {
+    "x86_64-linux-gnu", "x86_64-pc-linux-gnu", "x86_64-unknown-linux-gnu", NULL
+};
+
+const Target target_x86_64_linux_gnu = {
+    "x86_64-linux-gnu", x64gnu_aliases, &x64_info, &x64gnu_cpp_target, &x64_backend, NULL, &as_x86_64
+};
+
+/*
  * x86_64 FreeBSD: the same code generator and System V ABI, with FreeBSD's
  * headers, C runtime and libraries. Its system compiler is clang, whose
  * predefined macros and feature answers the tables give; its own headers

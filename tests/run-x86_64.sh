@@ -10,9 +10,10 @@
 # end-to-end test as root in the container.
 # Needs tools/sysroot.sh to have run. Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
-[ -d "$SYSROOT/usr/include" ] || { echo "no sysroot at $SYSROOT: run tools/sysroot.sh"; exit 2; }
-docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
+[ -d "$SYSROOT/usr/include" ] || skip_stage "no sysroot at $SYSROOT: run tools/sysroot.sh"
+docker info >/dev/null 2>&1 || skip_stage "docker is not running"
 JCC=${JCC:-./jcc}
 [ -x "$JCC" ] || { echo "no $JCC: run make first"; exit 1; }
 # the compiler under test, aimed at Linux; -isysroot also moves gcc's own headers

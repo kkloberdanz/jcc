@@ -10,16 +10,17 @@
 # and run JOBS at a time (default: the number of processors).
 # Run from the repository root.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 JCC=${JCC:-./jcc}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 CSMITH=${CSMITH:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/csmith}
-[ -x "$CSMITH/bin/csmith" ] || { echo "no csmith at $CSMITH: run tools/csmith.sh"; exit 2; }
+[ -x "$CSMITH/bin/csmith" ] || skip_stage "no csmith at $CSMITH: run tools/csmith.sh"
 N=${N:-100}
 SEED=${SEED:-$(date +%s)}
 mode=${1:-native}
 if [ "$mode" = x86_64 ]; then
     SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-musl}
-    docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
+    docker info >/dev/null 2>&1 || skip_stage "docker is not running"
     X="$JCC --target=x86_64-linux-musl -isysroot $SYSROOT"
 else
     X="$JCC"
@@ -54,7 +55,7 @@ EOF
 export tmp CSMITH X T
 i=0
 while [ $i -lt "$N" ]; do i=$((i + 1)); echo $((SEED + i)); done | xargs -P "$JOBS" -n 1 sh "$tmp/compile1.sh"
-if ls "$tmp"/res/*.abort >/dev/null 2>&1; then cat "$tmp"/res/*.abort; exit 2; fi
+if ls "$tmp"/res/*.abort >/dev/null 2>&1; then cat "$tmp"/res/*.abort; skip_stage "csmith or the host cc could not produce a test"; fi
 skip=$(ls "$tmp/res" | grep -c '\.skip$')
 built=$(ls "$tmp/res" | sed -n 's/\.built$//p' | tr '\n' ' ')
 cat "$tmp"/res/*.fail >"$tmp/run.out" 2>/dev/null

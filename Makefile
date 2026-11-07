@@ -35,11 +35,17 @@ ifeq ($(X86_64_GCC_VER),)
 X86_64_GCC_VER=13.2.1
 endif
 X86_64_LINUX_GCC_DIR?==/usr/lib/gcc/x86_64-alpine-linux-musl/$(X86_64_GCC_VER)
+# the glibc target's gcc directory (x86_64-linux-gnu, the host's on Debian,
+# Fedora, ...): the host gcc's own, as "=/dir"; elsewhere the source's default
+ifeq ($(HOST_OS),Linux)
+X86_64_GNU_GCC_DIR?==$(patsubst %/,%,$(shell cc -print-file-name=))
+endif
 TARGET_DEFS=-DJCC_ARM64_MACOS_SYSROOT='"$(ARM64_MACOS_SYSROOT)"' \
     -DJCC_ARM64_MACOS_RESOURCE_INC='"$(ARM64_MACOS_RESOURCE_INC)"' \
     -DJCC_X86_64_LINUX_SYSROOT='"$(X86_64_LINUX_SYSROOT)"' \
     -DJCC_X86_64_LINUX_GCC_DIR='"$(X86_64_LINUX_GCC_DIR)"' \
-    -DJCC_X86_64_FREEBSD_SYSROOT='"$(X86_64_FREEBSD_SYSROOT)"'
+    -DJCC_X86_64_FREEBSD_SYSROOT='"$(X86_64_FREEBSD_SYSROOT)"' \
+    $(if $(X86_64_GNU_GCC_DIR),-DJCC_X86_64_GNU_GCC_DIR='"$(X86_64_GNU_GCC_DIR)"')
 
 SRC=$(wildcard src/*.c)
 ARCH_SRC=$(wildcard src/arch/arch.*.c)
@@ -183,7 +189,7 @@ verify: jcc
 
 TARGET_VARS=ARM64_MACOS_SYSROOT='$(ARM64_MACOS_SYSROOT)' ARM64_MACOS_RESOURCE_INC='$(ARM64_MACOS_RESOURCE_INC)' \
     X86_64_LINUX_SYSROOT='$(X86_64_LINUX_SYSROOT)' X86_64_LINUX_GCC_DIR='$(X86_64_LINUX_GCC_DIR)' \
-    X86_64_FREEBSD_SYSROOT='$(X86_64_FREEBSD_SYSROOT)'
+    X86_64_FREEBSD_SYSROOT='$(X86_64_FREEBSD_SYSROOT)' X86_64_GNU_GCC_DIR='$(X86_64_GNU_GCC_DIR)'
 
 # jcc built by jcc, then by that build; the checks passed, the last stage is kept as ./jcc-selfhost
 .PHONY: selfhost

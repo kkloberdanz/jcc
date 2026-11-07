@@ -8,11 +8,12 @@
 # (make test does the native run). A libjcc.a built with
 # -fsanitize=address gets the host linked the same way.
 cd "$(dirname "$0")/.." || exit 1
+. tests/skip.sh
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 if [ "$1" = x86_64 ]; then
     [ -f dist/jcc.c ] || { echo "no dist/jcc.c: run make amalgamation first"; exit 1; }
-    docker info >/dev/null 2>&1 || { echo "docker is not running"; exit 2; }
+    docker info >/dev/null 2>&1 || skip_stage "docker is not running"
     cp dist/jcc.c dist/jcc.h tests/jit/jit.c "$tmp/"
     docker run --rm --platform linux/amd64 -v "$tmp:/w" jcc-x86_64-linux sh -c '
         cd /w &&
