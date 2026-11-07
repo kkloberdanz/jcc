@@ -39,6 +39,7 @@
     X(TOK_SIGNED) \
     X(TOK_SIZEOF) \
     X(TOK_ALIGNOF) \
+    X(TOK_ALIGNAS) \
     X(TOK_STATIC) \
     X(TOK_STRUCT) \
     X(TOK_SWITCH) \
@@ -54,6 +55,7 @@
     X(TOK_INLINE) \
     X(TOK_RESTRICT) \
     X(TOK_ATTRIBUTE) \
+    X(TOK_ALIGNED_ATTR) /* stands for `aligned` before the tokens of an aligned attribute's argument expression */ \
     X(TOK_ASM) \
     X(TOK_NULLABILITY) \
     X(TOK_INT128) \

@@ -99,6 +99,7 @@ Type *type_qualify(Type *t, unsigned quals) {
     q->has_proto = t->has_proto;
     q->vla = t->vla;
     q->align = t->align;
+    q->bits = t->bits;
     return q;
 }
 
@@ -118,6 +119,13 @@ Type *type_with_align(Type *t, size_t align) {
     q->has_proto = t->has_proto;
     q->vla = t->vla;
     q->align = align;
+    q->bits = t->bits;
+    return q;
+}
+
+Type *type_bitfield(Type *t, int bits) {
+    Type *q = type_alloc(t->kind);
+    q->bits = bits;
     return q;
 }
 
@@ -126,7 +134,7 @@ Type *type_unqualified(Type *t) {
     if (!t->quals) {
         return t;
     }
-    if (t->kind <= TY_VA_LIST && !t->align) {
+    if (t->kind <= TY_VA_LIST && !t->align && !t->bits) {
         return type_basic(t->kind);
     }
     q = type_alloc(t->kind);
@@ -139,6 +147,7 @@ Type *type_unqualified(Type *t) {
     q->has_proto = t->has_proto;
     q->vla = t->vla;
     q->align = t->align;
+    q->bits = t->bits;
     return q;
 }
 
@@ -683,6 +692,15 @@ Type *type_arith_common(Type *a, Type *b) {
     }
     a = type_promote(a);
     b = type_promote(b);
+    if (a->bits || b->bits) {
+        /* gcc: a bit-field type takes part by its width, and the wider operand's type is the common one */
+        size_t pa = a->bits ? (size_t)a->bits : type_size(a) * 8;
+        size_t pb = b->bits ? (size_t)b->bits : type_size(b) * 8;
+        if (pa != pb) {
+            return pa > pb ? a : b;
+        }
+        return type_is_unsigned(b) && !type_is_unsigned(a) ? b : a;
+    }
     ra = type_rank(a);
     rb = type_rank(b);
     if (ra == rb) {

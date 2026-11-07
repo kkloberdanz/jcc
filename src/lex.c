@@ -379,13 +379,65 @@ static TokenKind scan_number(void) {
 }
 
 /*
+ * Where the argument of an `aligned(...)` in the group scan_paren_group
+ * last read is, when it is more than a number (`aligned(2 * sizeof(int))`):
+ * the lexer then also returns the argument's tokens, after the attribute,
+ * so that the parser reads it as an expression.
+ */
+static int aligned_arg_found;
+static size_t aligned_arg_line, aligned_arg_col;    /* its '(' */
+static size_t aligned_arg_end_line, aligned_arg_end_col;    /* just past its ')' */
+
+/* does buf end with the word `aligned` (or `__aligned__`), past any spaces? */
+static int buf_ends_with_aligned(void) {
+    size_t n = buf_len;
+    size_t k;
+    while (n && buf[n - 1] == ' ') {
+        n--;
+    }
+    if (n >= 2 && buf[n - 1] == '_' && buf[n - 2] == '_') {
+        n -= 2;
+    }
+    k = strlen("aligned");
+    if (n < k || memcmp(buf + n - k, "aligned", k) != 0) {
+        return 0;
+    }
+    n -= k;
+    if (n >= 2 && buf[n - 1] == '_' && buf[n - 2] == '_') {
+        n -= 2;
+    }
+    return n == 0 || !(isalnum((unsigned char)buf[n - 1]) || buf[n - 1] == '_');
+}
+
+/* is text[from, to) an integer constant and nothing more, which scan_attribute reads itself? */
+static int is_plain_number(const char *text, size_t from, size_t to) {
+    size_t i = from;
+    while (i < to && (text[i] == ' ' || text[i] == '(')) {
+        i++;
+    }
+    if (i == to || !isdigit((unsigned char)text[i])) {
+        return 0;
+    }
+    while (i < to && (isalnum((unsigned char)text[i]))) {
+        i++;
+    }
+    while (i < to && (text[i] == ' ' || text[i] == ')')) {
+        i++;
+    }
+    return i == to;
+}
+
+/*
  * Append a parenthesised group to buf, including the outer parentheses,
  * honouring nested parentheses and string or character literals. Used to
  * swallow the arguments of __attribute__ and __asm as a single token.
  */
 static void scan_paren_group(void) {
     int depth = 0;
+    int arg_depth = 0;      /* the depth inside an aligned attribute's argument, 0 outside one */
+    size_t arg_start = 0;
 
+    aligned_arg_found = 0;
     skip_space();
     if (peekc() != '(') {
         lex_error("expected '('");
@@ -407,11 +459,23 @@ static void scan_paren_group(void) {
             scan_quoted(c);
             continue;
         }
+        if (c == '(' && !aligned_arg_found && !arg_depth && buf_ends_with_aligned()) {
+            arg_depth = depth + 1;
+            arg_start = buf_len;
+            aligned_arg_line = cur_line;
+            aligned_arg_col = cur_col;
+        }
         text_push((char)c);
         next_char();
         if (c == '(') {
             depth++;
         } else if (c == ')') {
+            if (depth == arg_depth) {
+                arg_depth = 0;
+                aligned_arg_end_line = cur_line;
+                aligned_arg_end_col = cur_col;
+                aligned_arg_found = !is_plain_number(buf, arg_start, buf_len);
+            }
             depth--;
             if (depth == 0) {
                 break;
@@ -517,6 +581,20 @@ void lex_cleanup(void) {
     lexing = NULL;
 }
 
+static void append_token(TokList **head, TokList **tail, Token tok) {
+    TokList *node = toklist_new(tok);
+    if (!node) {
+        fatal("out of memory");
+    }
+    if (*tail) {
+        (*tail)->next = node;
+    } else {
+        *head = node;
+        lexing = node;
+    }
+    *tail = node;
+}
+
 TokList *lex(void) {
     Token tok;
     TokList *head = NULL;
@@ -531,17 +609,24 @@ TokList *lex(void) {
     cur_col = 0;
 
     while (next_token(&tok)) {
-        TokList *node = toklist_new(tok);
-        if (!node) {
-            fatal("out of memory");
+        append_token(&head, &tail, tok);
+        if (tok.kind == TOK_ATTRIBUTE && aligned_arg_found) {
+            /* `aligned(expr)`: after the attribute, TOK_ALIGNED_ATTR and the argument's own tokens */
+            size_t resume_line = cur_line, resume_col = cur_col;
+            size_t end_line = aligned_arg_end_line, end_col = aligned_arg_end_col;
+            Token arg;
+            tok_init(&arg, tok.lineno, tok.col, "aligned", TOK_ALIGNED_ATTR);
+            arg.file = tok.file;
+            arg.line = tok.line;
+            append_token(&head, &tail, arg);
+            cur_line = aligned_arg_line;
+            cur_col = aligned_arg_col;
+            while ((cur_line < end_line || (cur_line == end_line && cur_col < end_col)) && next_token(&arg)) {
+                append_token(&head, &tail, arg);
+            }
+            cur_line = resume_line;
+            cur_col = resume_col;
         }
-        if (tail) {
-            tail->next = node;
-        } else {
-            head = node;
-            lexing = head;
-        }
-        tail = node;
     }
     lexing = NULL;
 

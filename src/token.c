@@ -141,6 +141,7 @@ static const struct Keyword keywords[] = {
     {"_Alignof", TOK_ALIGNOF},
     {"__alignof__", TOK_ALIGNOF},
     {"__alignof", TOK_ALIGNOF},
+    {"_Alignas", TOK_ALIGNAS},
     {"static", TOK_STATIC},
     {"struct", TOK_STRUCT},
     {"switch", TOK_SWITCH},

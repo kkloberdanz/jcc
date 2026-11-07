@@ -195,6 +195,17 @@ static void x64_cg_data_begin(const char *name, int is_global, size_t align, int
     fprintf(x64_cg_out, "%s:\n", name);
 }
 
+static int x64_cg_alias(const char *name, const char *to, int is_global, int weak, int is_func) {
+    if (weak) {
+        x64_emit(".weak %s", name);
+    } else if (is_global) {
+        x64_emit(".globl %s", name);
+    }
+    x64_emit(".type %s, @%s", name, is_func ? "function" : "object");
+    x64_emit(".set %s, %s", name, to);
+    return 0;
+}
+
 static void x64_cg_data_int(size_t size, long value) {
     switch (size) {
         case 1: x64_emit(".byte %ld", value & 0xff); break;
@@ -2361,7 +2372,8 @@ static const Backend x64_backend = {
     x64_cg_args_next,
     x64_cg_args_end,
     x64_cg_record_ret_regs,
-    x64_cg_select
+    x64_cg_select,
+    x64_cg_alias
 };
 
 /* the static link line of Alpine's gcc, less the stack protector library */
@@ -2385,7 +2397,7 @@ static const TargetLink x64_link = {
     dyn_startfiles, dyn_endfiles, "/lib/ld-musl-x86_64.so.1"
 };
 
-const Target target_x86_64_linux = { "x86_64-linux-musl", x64_aliases, &x64_info, &x64_cpp_target, &x64_backend, &x64_link, &as_x86_64 };
+const Target target_x86_64_linux = { "x86_64-linux-musl", x64_aliases, &x64_info, &x64_cpp_target, &x64_backend, &x64_link, &as_x86_64, 1 };
 
 /*
  * x86_64 Linux with glibc (Debian, Fedora, ...): the same code generator
@@ -2427,7 +2439,7 @@ static const char *const x64gnu_aliases[] = {
 };
 
 const Target target_x86_64_linux_gnu = {
-    "x86_64-linux-gnu", x64gnu_aliases, &x64_info, &x64gnu_cpp_target, &x64_backend, NULL, &as_x86_64
+    "x86_64-linux-gnu", x64gnu_aliases, &x64_info, &x64gnu_cpp_target, &x64_backend, NULL, &as_x86_64, 1
 };
 
 /*
@@ -2484,5 +2496,5 @@ static const TargetLink x64fb_link = {
 };
 
 const Target target_x86_64_freebsd = {
-    "x86_64-unknown-freebsd", x64fb_aliases, &x64_info, &x64fb_cpp_target, &x64_backend, &x64fb_link, &as_x86_64
+    "x86_64-unknown-freebsd", x64fb_aliases, &x64_info, &x64fb_cpp_target, &x64_backend, &x64fb_link, &as_x86_64, 0
 };

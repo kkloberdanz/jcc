@@ -262,7 +262,8 @@ char *strdup(const char *s);
     primary_expression relational_expression selection_statement shift_expression specifier_qualifier_list statement storage_class_specifier string_literal
     struct_declaration struct_declaration_list struct_declarator struct_declarator_list struct_or_union struct_or_union_keyword struct_or_union_specifier translation_unit
     type_name type_qualifier type_qualifier_list type_specifier unary_expression unary_operator
-%token ATTRIBUTE ASM PRAGMA
+    aligned_attribute alignment_specifier
+%token ATTRIBUTE ASM PRAGMA ALIGNED_ATTR ALIGNAS
 
 /*
  * After a declarator, prefer shifting a trailing __attribute__ or __asm
@@ -270,7 +271,7 @@ char *strdup(const char *s);
  * style parameter declaration list starting with __attribute__).
  */
 %nonassoc DECLARATOR_END
-%nonassoc ATTRIBUTE ASM
+%nonassoc ATTRIBUTE ASM ALIGNED_ATTR
 
 /*
  * The dangling else: `if (a) if (b) x; else y;` gives the else to the
@@ -1205,6 +1206,40 @@ attribute_list
             ast_list_push($1->u.list, $2);
             $$ = $1;
         }
+    | attribute_list aligned_attribute
+        {
+            ast_list_push($1->u.list, $2);
+            $$ = $1;
+        }
+    ;
+
+/*
+ * The argument of `__attribute__((aligned(expr)))` when it is more than a
+ * number: the lexer returns its tokens after the attribute's own, behind
+ * ALIGNED_ATTR. An Alignas node with `align` set (gcc's rules: a typedef
+ * may lower the alignment).
+ */
+aligned_attribute
+    : ALIGNED_ATTR '(' constant_expression ')'
+        {
+            $$ = ast_new(N_ALIGNAS, @$);
+            $$->u.cast.expr = $3;
+            $$->u.cast.align = 1;
+        }
+    ;
+
+/* C11 `_Alignas(type)` and `_Alignas(constant)` */
+alignment_specifier
+    : ALIGNAS '(' type_name ')'
+        {
+            $$ = ast_new(N_ALIGNAS, @$);
+            $$->u.cast.type = $3;
+        }
+    | ALIGNAS '(' constant_expression ')'
+        {
+            $$ = ast_new(N_ALIGNAS, @$);
+            $$->u.cast.expr = $3;
+        }
     ;
 
 /* may be empty: a GNU struct with no members has size 0 */
@@ -1545,11 +1580,23 @@ type_qualifier
         {
             $$ = $1;
         }
+    | aligned_attribute
+        {
+            $$ = $1;
+        }
+    | alignment_specifier
+        {
+            $$ = $1;
+        }
     ;
 
 /* GNU extensions that may trail a declarator: __attribute__ and __asm */
 gnu_attribute
     : ATTRIBUTE
+        {
+            $$ = $1;
+        }
+    | aligned_attribute
         {
             $$ = $1;
         }
@@ -2384,10 +2431,26 @@ static int is_func_name(const char *name) {
         || strcmp(name, "__PRETTY_FUNCTION__") == 0;
 }
 
+/* the token after the attribute `t`, past the argument of an `aligned(expr)` in it (see aligned_attribute) */
+static TokList *skip_attribute(TokList *t) {
+    t = t->next;
+    if (t && t->tok.kind == TOK_ALIGNED_ATTR) {
+        int depth = 0;
+        for (t = t->next; t; t = t->next) {
+            if (t->tok.kind == TOK_LPAREN) {
+                depth++;
+            } else if (t->tok.kind == TOK_RPAREN && --depth == 0) {
+                return t->next;
+            }
+        }
+    }
+    return t;
+}
+
 /* is `t` an attribute followed, past any more of them, by `*` or `^`? */
-static int attrs_then_pointer(const TokList *t) {
+static int attrs_then_pointer(TokList *t) {
     while (t && t->tok.kind == TOK_ATTRIBUTE) {
-        t = t->next;
+        t = skip_attribute(t);
     }
     return t && (t->tok.kind == TOK_STAR || t->tok.kind == TOK_HAT);
 }
@@ -2505,6 +2568,10 @@ static int translate_tok(const Token *tok) {
             return SIZEOF;
         case TOK_ALIGNOF:
             return ALIGNOF;
+        case TOK_ALIGNAS:
+            return ALIGNAS;
+        case TOK_ALIGNED_ATTR:
+            return ALIGNED_ATTR;
         case TOK_REAL:
             return REAL_OP;
         case TOK_IMAG:
@@ -2732,7 +2799,7 @@ static int yylex(void) {
      * and it says nothing jcc acts on, so it is dropped here.
      */
     while (tok == ATTRIBUTE && prev_tok == '(' && attrs_then_pointer(current_token)) {
-        current_token = current_token->next;
+        current_token = skip_attribute(current_token);
         tok = translate_tok(&current_token->tok);
     }
     if (tok == ':' && (prev_tok == ENUM || prev_tok == IDENTIFIER || prev_tok == TYPE_NAME || prev_tok == ATTRIBUTE)

@@ -211,9 +211,19 @@ int codegen_sym_is_static_local(const Symbol *s) {
     return s->kind == SYM_VARIABLE && s->scope->kind != SCOPE_FILE && s->storage == STORAGE_STATIC;
 }
 
-/* the undecorated assembler name; static locals get a unique suffix */
+/* what an alias (__attribute__((alias))) stands for, through any aliases of aliases; `s` itself otherwise */
+static const Symbol *alias_target(const Symbol *s) {
+    int hops = 0;
+    while (s->alias_to && hops++ < 64) {
+        s = s->alias_to;
+    }
+    return s;
+}
+
+/* the undecorated assembler name; static locals get a unique suffix; a use of an alias names its target, which is the same object */
 const char *codegen_sym_name(const Symbol *s) {
     static char buf[1024];
+    s = alias_target(s);
     if (codegen_sym_is_static_local(s)) {
         snprintf(buf, sizeof(buf), "%s.%d", s->name, s->label);
         return buf;
@@ -223,6 +233,7 @@ const char *codegen_sym_name(const Symbol *s) {
 
 /* defined in this translation unit, so its address need not go through the GOT */
 int codegen_sym_defined_here(const Symbol *s) {
+    s = alias_target(s);
     if (s->kind == SYM_FUNCTION) {
         return s->def != NULL;
     }
@@ -1106,9 +1117,36 @@ int codegen(AST *tu, SymTab *symtab, FILE *output) {
         }
     }
 
+    /* __attribute__((alias)): the target is emitted, and kept, whether or not this unit uses it */
+    for (s = symtab->file->first; s; s = s->next) {
+        Symbol *to;
+        if (s->ns != NS_ORDINARY || !s->alias) {
+            continue;
+        }
+        to = scope_lookup(symtab->file, NS_ORDINARY, s->alias);
+        if (!to || to == s || (!to->alias
+                && (to->kind == SYM_FUNCTION ? !to->def : to->kind != SYM_VARIABLE || to->storage == STORAGE_EXTERN))) {
+            diag_error(s->loc, "'%s' is an alias of '%s', which this translation unit does not define", s->name, s->alias);
+            continue;
+        }
+        s->alias_to = to;
+    }
+    for (s = symtab->file->first; s; s = s->next) {
+        Symbol *to;
+        if (s->ns != NS_ORDINARY || !s->alias_to) {
+            continue;
+        }
+        to = (Symbol *)alias_target(s);
+        if (to->kind == SYM_FUNCTION && to->def && !to->used) {
+            to->used = 1;
+            mark_function(to->def);
+        }
+        to->addr_taken = 1;
+    }
+
     /* objects with static storage at file scope, each once */
     for (s = symtab->file->first; s; s = s->next) {
-        if (s->ns != NS_ORDINARY || s->kind != SYM_VARIABLE || s->storage == STORAGE_EXTERN) {
+        if (s->ns != NS_ORDINARY || s->kind != SYM_VARIABLE || s->storage == STORAGE_EXTERN || s->alias) {
             continue;
         }
         gen_global(s);
@@ -1156,6 +1194,12 @@ int codegen(AST *tu, SymTab *symtab, FILE *output) {
     for (i = 0; i < nstrings; i++) {
         cg->string(strings[i].label, strings[i].bytes, strings[i].len);
         free(strings[i].bytes);
+    }
+    for (s = symtab->file->first; s; s = s->next) {
+        if (s->ns == NS_ORDINARY && s->alias_to
+                && cg->alias(s->name, codegen_sym_name(s), s->storage != STORAGE_STATIC, s->weak, s->kind == SYM_FUNCTION) < 0) {
+            diag_error(s->loc, "aliases (__attribute__((alias))) are not supported on this target");
+        }
     }
     free(strings);
     strings = NULL;

@@ -29,7 +29,6 @@
 20071220-1 extended asm
 20071220-2 extended asm
 20080122-1 extended asm
-20080502-1 __builtin_signbit
 920302-1 computed goto
 920501-3 computed goto
 920501-4 computed goto
@@ -83,7 +82,6 @@ pr17377 __builtin_return_address
 pr19449 non-constant static initializer GCC folds
 pr23135 vector types
 pr34154 variadic macros
-pr35456 __builtin_signbit
 pr38151 _Complex on an integer type (GNU)
 pr38533 extended asm
 pr40022 extended asm

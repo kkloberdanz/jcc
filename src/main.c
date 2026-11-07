@@ -25,6 +25,7 @@ struct Options {
     const char *sysroot; /* -isysroot, or NULL for the target's default */
     const char *target; /* --target, or NULL for the host's */
     int dynamic;        /* -dynamic: a cross link uses the target's shared libc rather than the static one */
+    int no_warnings;    /* -w */
     const char *include_dirs[64];   /* -I, in order */
     size_t n_include_dirs;
     const char *macros[256];        /* -D and -U, in order, as given */
@@ -76,6 +77,8 @@ static const char *const help_text[] = {
     "        -fexternal-as",
     "              Assemble with the host's cc instead of jcc's own assembler",
     "",
+    "        -w    Suppress all warnings",
+    "",
     "        -fsyntax-only",
     "              Stop after parsing and semantic analysis",
     "",
@@ -103,7 +106,7 @@ static const char *const help_text[] = {
 static void print_help(void) {
     size_t i;
     printf("\njcc -- an embeddable C compiler\n");
-    printf("\n%s: [-c] [-E] [-h] [-S] [-ast-dump] [-symtab-dump] [-fdump-ir] [-fexternal-as] [-fsyntax-only] [-Olevel] [--target=triple] [-o outfile] [-lNAME] file...\n\n", prg_name);
+    printf("\n%s: [-c] [-E] [-h] [-S] [-ast-dump] [-symtab-dump] [-fdump-ir] [-fexternal-as] [-fsyntax-only] [-w] [-Olevel] [--target=triple] [-o outfile] [-lNAME] file...\n\n", prg_name);
     for (i = 0; i < sizeof(help_text) / sizeof(help_text[0]); i++) {
         printf("%s\n", help_text[i]);
     }
@@ -140,6 +143,8 @@ static void parse_long_options(int *argc, char **argv, struct Options *options) 
         } else if (strcmp(argv[i], "--print-targets") == 0) {
             target_list(stdout);
             exit(EXIT_SUCCESS);
+        } else if (strcmp(argv[i], "-w") == 0) {
+            options->no_warnings = 1;
         } else if (strcmp(argv[i], "-dynamic") == 0) {
             options->dynamic = 1;
         } else if (strcmp(argv[i], "-static") == 0) {
@@ -201,6 +206,7 @@ static void parse_options(int argc, char **argv, struct Options *options) {
     options->n_macros = 0;
     options->nostdinc = 0;
     options->dynamic = 0;
+    options->no_warnings = 0;
     options->opt_level = '0';
 
     parse_long_options(&argc, argv, options);
@@ -462,6 +468,9 @@ static Jcc *make_compiler(const struct Options *options) {
     }
     if (options->external_as) {
         jcc_set_option(k, "-fexternal-as", NULL);
+    }
+    if (options->no_warnings) {
+        jcc_set_option(k, "-w", NULL);
     }
     if (options->ir_dump) {
         jcc_set_option(k, "-fdump-ir", NULL);

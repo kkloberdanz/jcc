@@ -47,6 +47,7 @@ struct Jcc {
     int symtab_dump;
     int ir_dump;
     int external_as;        /* -fexternal-as: objects from the host's cc, not jcc's assembler */
+    int no_warnings;        /* -w */
     int opt_level;          /* -O: 0, or 1 for the optimizing pipeline (src/opt.h) */
     /* the unit being compiled, when its text was given rather than a path */
     const char *main_name;
@@ -167,6 +168,8 @@ int jcc_set_option(Jcc *k, const char *name, const char *value) {
         k->ir_dump = 1;
     } else if (strcmp(name, "-fexternal-as") == 0) {
         k->external_as = 1;
+    } else if (strcmp(name, "-w") == 0) {
+        k->no_warnings = 1;
     } else if (strcmp(name, "-O") == 0) {
         /* 0 is the straight translation; any other level (1, 2, 3, s, z, or none for -O) is -O1 */
         k->opt_level = value && strcmp(value, "0") == 0 ? 0 : 1;
@@ -351,6 +354,7 @@ static int run(Jcc *k, const char *name, const char *text, Stage stage, char **o
     target_select(k->target->name);
     diag_set_handler(k->diag, k->diag_user);
     diag_reset();
+    diag_suppress_warnings(k->no_warnings);
     k->main_name = name;
     k->main_text = text;
     k->main_len = text ? strlen(text) : 0;
@@ -464,6 +468,7 @@ cleanup:
     }
     type_free_all();
     diag_set_handler(NULL, NULL);
+    diag_suppress_warnings(0);
     return status;
 }
 
@@ -491,6 +496,7 @@ JccJit *jcc_jit_load(Jcc *k, const char *obj, size_t len) {
 
     diag_set_handler(k->diag, k->diag_user);
     diag_reset();
+    diag_suppress_warnings(k->no_warnings);
     previous = diag_set_recovery(&recover);
     if (setjmp(recover) == 0) {
         j = jit_load(obj, len, k->resolve, k->resolve_user);
@@ -499,6 +505,7 @@ JccJit *jcc_jit_load(Jcc *k, const char *obj, size_t len) {
     k->nerrors = diag_error_count();
     k->nwarnings = diag_warning_count();
     diag_set_handler(NULL, NULL);
+    diag_suppress_warnings(0);
     return j;
 }
 

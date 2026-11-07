@@ -151,6 +151,7 @@ typedef enum QualKind {
     X(N_TYPE_QUAL, "TypeQual")           /* qual */ \
     X(N_TYPEDEF_NAME, "TypedefName")     /* name */ \
     X(N_ATTRIBUTE, "Attribute")          /* text: the whole __attribute__ or __asm */ \
+    X(N_ALIGNAS, "Alignas")              /* cast: type = the TypeName or expr = the alignment; align: from `__attribute__((aligned(expr)))` rather than _Alignas */ \
     X(N_STRUCT_SPEC, "StructSpec")       /* record: is_union, tag, has_body, members, scope */ \
     X(N_STRUCT_DECLARATION, "StructDeclaration") /* decl: specs, declarators (struct declarators) */ \
     X(N_STRUCT_DECLARATOR, "StructDeclarator") /* init_decl: declarator (may be NULL), init = bit width */ \
@@ -198,6 +199,7 @@ struct AST {
     struct Symbol *sym;
     int lvalue;
     long temp;      /* set by code generation: frame offset of a temporary the node needs (a call returning a record) */
+    int temp_by_ref; /* the temporary is over-aligned: `temp` is the slot holding its address (src/lower.c, alloc_temp) */
     union {
         char *name;
         char *text;

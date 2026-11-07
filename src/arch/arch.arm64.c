@@ -555,12 +555,23 @@ static size_t a64_cg_args_end(ArgAlloc *a, ArgLoc *locs, size_t n) {
     size_t i;
     for (i = 0; i < n; i++) {
         if (locs[i].by_ref) {
-            a->nstack = a64_round_up(a->nstack, 8);
+            /* the copy at the record's alignment, up to the 16 the area itself has */
+            a->nstack = a64_round_up(a->nstack, locs[i].type.align > 16 ? 16 : locs[i].type.align > 8 ? locs[i].type.align : 8);
             locs[i].copy = a->nstack;
             a->nstack += locs[i].copy_size;
         }
     }
     return a->nstack;
+}
+
+/* Mach-O has no symbol aliases (neither has clang there) */
+static int a64_cg_alias(const char *name, const char *to, int is_global, int weak, int is_func) {
+    (void)name;
+    (void)to;
+    (void)is_global;
+    (void)weak;
+    (void)is_func;
+    return -1;
 }
 
 static int a64_cg_record_ret_regs(const ArgType *t) {
@@ -2466,8 +2477,9 @@ static const Backend a64_backend = {
     a64_cg_args_next,
     a64_cg_args_end,
     a64_cg_record_ret_regs,
-    a64_cg_select
+    a64_cg_select,
+    a64_cg_alias
 };
 
 /* no TargetLink: a Mach-O link needs ld64, so from another host use -c */
-const Target target_arm64_macos = { "arm64-apple-macos", a64_aliases, &a64_info, &a64_cpp_target, &a64_backend, NULL, &as_arm64 };
+const Target target_arm64_macos = { "arm64-apple-macos", a64_aliases, &a64_info, &a64_cpp_target, &a64_backend, NULL, &as_arm64, 0 };

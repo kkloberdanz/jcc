@@ -76,6 +76,9 @@ struct Symbol {
     int used;               /* functions: referenced from code that is emitted */
     int addr_taken;         /* functions: referenced other than as the callee of a direct call (by emitted code or an initializer) */
     int tls;                /* variables: _Thread_local (or __thread), one object per thread */
+    char *alias;            /* __attribute__((alias("target"))): the name it is another name for, else NULL */
+    int weak;               /* with alias: __attribute__((weak)) */
+    struct Symbol *alias_to;    /* with alias: the symbol named, once code generation found it */
 };
 
 struct Scope {

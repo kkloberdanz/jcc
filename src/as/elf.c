@@ -31,6 +31,7 @@
 #define SHF_INFO_LINK 0x40
 #define SHF_TLS 0x400
 #define STB_GLOBAL 1
+#define STB_WEAK 2
 #define STT_OBJECT 1
 #define STT_FUNC 2
 #define STT_SECTION 3
@@ -338,7 +339,7 @@ int elf_write(As *a, char **out, size_t *out_len) {
                 elf_put(&strtab, s->name, strlen(s->name) + 1);
                 type = s->is_tls ? STT_TLS : s->is_func ? STT_FUNC : s->is_obj ? STT_OBJECT : 0;
             }
-            put_int(&b, (unsigned long)((k ? STB_GLOBAL : 0) << 4 | type), 1);
+            put_int(&b, (unsigned long)((k ? (s->weak ? STB_WEAK : STB_GLOBAL) : 0) << 4 | type), 1);
             put_int(&b, 0, 1);              /* st_other */
             if (s->section >= 0) {
                 for (n = 0; n < nsecs && secs[n].kind != s->section; n++) {

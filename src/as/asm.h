@@ -194,6 +194,9 @@ typedef struct AsmSym {
     int is_obj;             /* .type @object */
     int is_tls;             /* .type @tls_object: ELF STT_TLS */
     int is_section;         /* ELF: the section symbol made when its section was first entered */
+    int weak;               /* .weak: global, with weak binding (ELF) */
+    int alias_of;           /* `.set sym, target`: the symbol it is another name for, else -1 (ELF) */
+    unsigned alias_line;
     size_t off;             /* in its section, once laid out */
     size_t size;            /* .size sym, .-sym: the distance, once laid out */
     int atom;               /* Mach-O: the nearest non-local symbol defined at or before it in its section */

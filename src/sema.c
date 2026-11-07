@@ -8,6 +8,7 @@
 #include "diag.h"
 #include "type.h"
 #include "arch.h"
+#include "target.h"
 #include "util.h"
 
 /*
@@ -50,7 +51,8 @@ typedef struct Specs {
     int is_inline;
     int is_typedef;
     int packed;         /* __attribute__((packed)) seen */
-    size_t aligned;     /* __attribute__((aligned(n))) seen */
+    size_t aligned;     /* __attribute__((aligned(n))) or _Alignas seen */
+    int has_alignas;    /* _Alignas, which a typedef may not have */
     int only_tag;       /* the list is just `struct S` or `enum E` (with or without body) */
     int is_thread;      /* _Thread_local or __thread */
 } Specs;
@@ -780,7 +782,7 @@ static int is_constant_initializer(AST *e) {
 
 /* specifiers */
 
-/* look for aligned(n) and packed in an attribute's text */
+/* look for aligned(n) and packed in an attribute's text; aligned(expr) is an Alignas node of its own (alignas_value) */
 static void scan_attribute(const char *text, int *packed, size_t *aligned) {
     const char *p;
     if (strstr(text, "packed")) {
@@ -793,13 +795,53 @@ static void scan_attribute(const char *text, int *packed, size_t *aligned) {
             p++;
         }
         if (*p == '(') {
-            long n = strtol(p + 1, NULL, 0);
-            if (n > 0 && (size_t)n > *aligned) {
+            char *end;
+            long n;
+            p++;
+            while (*p == ' ' || *p == '(') {
+                p++;
+            }
+            n = strtol(p, &end, 0);
+            while (*end == 'u' || *end == 'U' || *end == 'l' || *end == 'L') {
+                end++;
+            }
+            while (*end == ' ') {
+                end++;
+            }
+            if (*end == ')' && n > 0 && (size_t)n > *aligned) {
                 *aligned = (size_t)n;
             }
         } else if (*aligned < 16) {
             *aligned = 16;  /* bare aligned: the largest alignment on either target */
         }
+    }
+}
+
+/* the alignment an Alignas node asks for (_Alignas, or an aligned attribute's expression); 0 for none or an error */
+static size_t alignas_value(AST *a) {
+    long v;
+    if (a->u.cast.type) {
+        return type_align(sema_type_name(a->u.cast.type));
+    }
+    if (!a->u.cast.expr->type) {    /* analysed once, though a declaration's specifiers may be read again */
+        sema_rvalue(&a->u.cast.expr);
+    }
+    if (!type_is_integer(a->u.cast.expr->type) || !sema_const_eval(a->u.cast.expr, &v)) {
+        diag_error(a->loc, "requested alignment is not an integer constant");
+        return 0;
+    }
+    if (v < 0 || (v & (v - 1)) != 0 || (v == 0 && a->u.cast.align)) {
+        diag_error(a->loc, "requested alignment %ld is not a positive power of 2", v);
+        return 0;
+    }
+    return (size_t)v;
+}
+
+/* raise *aligned to what the Alignas node `a` asks for */
+static void scan_alignas(AST *a, size_t *aligned) {
+    size_t n = alignas_value(a);
+    if (n > *aligned) {
+        *aligned = n;
     }
 }
 
@@ -817,6 +859,8 @@ static size_t decl_aligned(AST *d, const Specs *sp) {
             AST *a = d->u.declarator.attrs->items[i];
             if (a->kind == N_ATTRIBUTE) {
                 scan_attribute(a->u.text, &packed, &aligned);
+            } else if (a->kind == N_ALIGNAS) {
+                scan_alignas(a, &aligned);
             }
         }
     }
@@ -1007,7 +1051,12 @@ static void sema_struct_spec(AST *spec, Type *type, const Specs *attrs) {
     r->pack = (size_t)spec->u.record.pack;
     if (spec->u.record.attrs) {
         for (i = 0; i < spec->u.record.attrs->len; i++) {
-            scan_attribute(spec->u.record.attrs->items[i]->u.text, &r->packed, &r->aligned);
+            AST *a = spec->u.record.attrs->items[i];
+            if (a->kind == N_ALIGNAS) {
+                scan_alignas(a, &r->aligned);
+            } else {
+                scan_attribute(a->u.text, &r->packed, &r->aligned);
+            }
         }
     }
     record_layout(r);
@@ -1096,6 +1145,13 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
 
             case N_ATTRIBUTE:
                 scan_attribute(s->u.text, &out->packed, &out->aligned);
+                break;
+
+            case N_ALIGNAS:
+                scan_alignas(s, &out->aligned);
+                if (!s->u.cast.align) {
+                    out->has_alignas = 1;
+                }
                 break;
 
             case N_TYPE_SPEC:
@@ -1234,6 +1290,9 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
         } else {
             diag_error(loc, "'_Complex' requires a floating type, not %s", ts(t));
         }
+    }
+    if (out->has_alignas && out->is_typedef) {
+        diag_error(loc, "a typedef cannot have '_Alignas'");
     }
     out->type = type_qualify(t, quals);
 }
@@ -1553,9 +1612,12 @@ static void convert_assign(AST **slot, Type *to, const char *what) {
 
 /*
  * A bit-field promotes by its width (3.2.1.1): to int when an int holds
- * every value it can take, else to unsigned int; a field wider than an int
- * (an extension) keeps its declared type. The member keeps its declared
- * type for assignment; this is for operands.
+ * every value it can take, else to unsigned int. A field wider than an int
+ * (an extension) keeps its declared type, as clang has it; gcc instead
+ * gives it a type of its own width (`unsigned long long:40`), so that
+ * arithmetic on it wraps at that width (Type.bits), and jcc does too where
+ * gcc is the platform's compiler. The member keeps its declared type for
+ * assignment; this is for operands.
  */
 static Type *promote_bitfield(AST **slot) {
     AST *e = *slot;
@@ -1572,6 +1634,8 @@ static Type *promote_bitfield(AST **slot) {
         p = int_type();
     } else if (bits == int_bits) {
         p = type_basic(TY_UINT);
+    } else if (target->gcc && bits < type_size(e->type) * 8) {
+        p = type_bitfield(type_unqualified(e->type), (int)bits);
     } else {
         p = type_promote(e->type);
     }
@@ -2123,6 +2187,8 @@ static Type *sema_call(AST *e) {
     Type *ft;
     Type *fn;
     size_t i;
+    int type_generic;
+    AST *callee;
 
     e->lvalue = 0;
     if ((*f)->kind == N_IDENT && !(*f)->sym) {
@@ -2152,6 +2218,13 @@ static Type *sema_call(AST *e) {
         return error_type(e);
     }
     fn = ft->base;
+    /* a type generic builtin (the "i(.)" ones): its operands keep their own types, a float too */
+    callee = *f;
+    while (callee->kind == N_IMPLICIT_CAST) {
+        callee = callee->u.cast.expr;
+    }
+    type_generic = callee->kind == N_IDENT && callee->sym && !callee->sym->decl && strncmp(callee->u.name, "__builtin_", 10) == 0
+        && fn->has_proto && fn->nparams == 0 && fn->variadic;
     for (i = 0; i < args->len; i++) {
         Type *at = sema_rvalue(&args->items[i]);
         if (at->kind == TY_VOID) {
@@ -2171,7 +2244,7 @@ static Type *sema_call(AST *e) {
                 char what[64];
                 snprintf(what, sizeof(what), "passing argument %lu of type", (unsigned long)i + 1);
                 convert_assign(&args->items[i], fn->params[i].type, what);
-            } else {
+            } else if (!type_generic) {
                 default_promote(&args->items[i]);
             }
         }
@@ -2983,7 +3056,7 @@ static void report_conflict(Symbol *sym, Loc loc, const char *name) {
 static int only_attributes(const ASTList *specs) {
     size_t i;
     for (i = 0; i < specs->len; i++) {
-        if (specs->items[i]->kind != N_ATTRIBUTE) {
+        if (specs->items[i]->kind != N_ATTRIBUTE && specs->items[i]->kind != N_ALIGNAS) {
             return 0;
         }
     }
@@ -3013,6 +3086,73 @@ static int static_assertion(AST *decl) {
         }
     }
     return 1;
+}
+
+/* the attribute `word` (or `__word__`) in an __attribute__'s text, as a whole word: a pointer just past it, else NULL */
+static const char *find_attr(const char *text, const char *word) {
+    size_t n = strlen(word);
+    const char *p = text;
+    while ((p = strstr(p, word)) != NULL) {
+        const char *b = p;
+        const char *e = p + n;
+        if (b - text >= 2 && b[-1] == '_' && b[-2] == '_') {
+            b -= 2;
+        }
+        if (e[0] == '_' && e[1] == '_') {
+            e += 2;
+        }
+        if ((b == text || !(isalnum((unsigned char)b[-1]) || b[-1] == '_')) && !(isalnum((unsigned char)*e) || *e == '_')) {
+            return e;
+        }
+        p += n;
+    }
+    return NULL;
+}
+
+/* alias("target") and weak in a list of attributes: Symbol.alias and Symbol.weak */
+static void scan_alias_list(Symbol *sym, const ASTList *attrs, Loc loc) {
+    size_t i;
+    for (i = 0; attrs && i < attrs->len; i++) {
+        const char *text = attrs->items[i]->u.text;
+        const char *p;
+        const char *end;
+        if (attrs->items[i]->kind != N_ATTRIBUTE || strncmp(text, "__attribute", 11) != 0) {
+            continue;   /* not an attribute: a specifier, an Alignas node, or __asm("name") */
+        }
+        if (find_attr(text, "weak")) {
+            sym->weak = 1;
+        }
+        p = find_attr(text, "alias");
+        if (!p) {
+            continue;
+        }
+        while (*p == ' ') {
+            p++;
+        }
+        if (*p == '(') {
+            p++;
+        }
+        while (*p == ' ') {
+            p++;
+        }
+        end = *p == '"' ? strchr(p + 1, '"') : NULL;
+        if (!end) {
+            diag_error(loc, "the alias attribute takes a string, the name of its target");
+            continue;
+        }
+        free(sym->alias);
+        sym->alias = xmalloc((size_t)(end - p));
+        memcpy(sym->alias, p + 1, (size_t)(end - p - 1));
+        sym->alias[end - p - 1] = '\0';
+    }
+}
+
+/* __attribute__((alias("target"))) and weak on a file scope declaration, in its specifiers or its declarator */
+static void scan_alias_attrs(Symbol *sym, const ASTList *specs, AST *d, Loc loc) {
+    scan_alias_list(sym, specs, loc);
+    for (; d; d = d->kind == N_DECL_NAME ? NULL : d->u.declarator.inner) {
+        scan_alias_list(sym, d->u.declarator.attrs, loc);
+    }
 }
 
 static void sema_declaration(AST *decl, int file_scope) {
@@ -3062,6 +3202,9 @@ static void sema_declaration(AST *decl, int file_scope) {
         }
         prev = sym->storage;
         sym->storage = sp.storage;
+        if (file_scope && !sp.is_typedef) {
+            scan_alias_attrs(sym, decl->u.decl.specs, id->u.init_decl.declarator, id->loc);
+        }
         if (type_is_vm(t) && t->kind != TY_FUNC) {
             /* C99 6.7.5.2: variably modified types only for names with no linkage at block scope, VLAs only for automatic objects */
             if (file_scope) {
@@ -3633,6 +3776,32 @@ static const struct BuiltinFn {
     { "__builtin_add_overflow", "i(.)" },
     { "__builtin_sub_overflow", "i(.)" },
     { "__builtin_mul_overflow", "i(.)" },
+    { "__builtin_add_overflow_p", "i(.)" },
+    { "__builtin_sub_overflow_p", "i(.)" },
+    { "__builtin_mul_overflow_p", "i(.)" },
+    /* type generic too: the floating point classification of <math.h> */
+    { "__builtin_isnan", "i(.)" },
+    { "__builtin_isnanf", "i(.)" },
+    { "__builtin_isnanl", "i(.)" },
+    { "__builtin_isinf", "i(.)" },
+    { "__builtin_isinff", "i(.)" },
+    { "__builtin_isinfl", "i(.)" },
+    { "__builtin_isinf_sign", "i(.)" },
+    { "__builtin_isfinite", "i(.)" },
+    { "__builtin_finite", "i(.)" },
+    { "__builtin_finitef", "i(.)" },
+    { "__builtin_finitel", "i(.)" },
+    { "__builtin_isnormal", "i(.)" },
+    { "__builtin_signbit", "i(.)" },
+    { "__builtin_signbitf", "i(.)" },
+    { "__builtin_signbitl", "i(.)" },
+    { "__builtin_fpclassify", "i(.)" },
+    { "__builtin_isgreater", "i(.)" },
+    { "__builtin_isgreaterequal", "i(.)" },
+    { "__builtin_isless", "i(.)" },
+    { "__builtin_islessequal", "i(.)" },
+    { "__builtin_islessgreater", "i(.)" },
+    { "__builtin_isunordered", "i(.)" },
     { "__builtin_clz", "i(u)" },
     { "__builtin_clzl", "i(U)" },
     { "__builtin_clzll", "i(q)" },

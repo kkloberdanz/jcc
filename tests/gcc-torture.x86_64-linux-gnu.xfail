@@ -41,15 +41,10 @@ pr82210 a variably modified struct member (GNU)
 20061220-1 extended asm
 990413-2 extended asm (x87)
 bitfld-5 basic asm in a function
-alias-2 __attribute__((alias)) (ELF only)
-alias-3 __attribute__((alias)) (ELF only)
-alias-4 __attribute__((alias)) (ELF only)
 built-in-setjmp __builtin_setjmp/__builtin_longjmp
 pr60003 __builtin_setjmp/__builtin_longjmp
 pr64242 __builtin_setjmp/__builtin_longjmp
 pr84521 __builtin_setjmp/__builtin_longjmp
-pr105984 __builtin_mul_overflow_p
-pr39228 __builtin_isinff
 pr47237 __builtin_apply
 va-arg-pack-1 __builtin_va_arg_pack
 pr80692 _Decimal64
@@ -59,6 +54,3 @@ nest-align-1 nested functions
 20230630-2 scalar_storage_order (clang fails it too)
 20230630-4 scalar_storage_order (clang fails it too)
 991014-1 a struct near the size of the address space (clang fails it too)
-bitfld-3 arithmetic in a bit-field's width (gcc only; clang fails it too)
-pr32244-1 arithmetic in a bit-field's width (gcc only; clang fails it too)
-pr34971 arithmetic in a bit-field's width (gcc only; clang fails it too)

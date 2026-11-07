@@ -235,6 +235,7 @@ static int scale_by(int n, Type *t) {
 
 static void assign_temps(AST *e);
 static long alloc_slot(size_t size, size_t align);
+static int temp_addr(const AST *e);
 static int convert(int v, Type *from, Type *to);
 
 /* a frame slot for the size of each VLA a declarator chain makes (the parameters of a function declarator in it are not its own) */
@@ -390,7 +391,9 @@ static int int_fits(const Type *from, const Type *to) {
 }
 
 /* `v`, a value of scalar type `from`, converted to `to` */
-static int convert(int v, Type *from, Type *to) {
+static int canon(int v, const Type *t);
+
+static int convert_basic(int v, Type *from, Type *to) {
     int ff = type_is_floating(from);
     int tf = type_is_floating(to);
     IRType ft = ty(from);
@@ -445,11 +448,26 @@ static int convert(int v, Type *from, Type *to) {
     return trunc_to(IR_I32, v);
 }
 
-/* a narrow integer result re-extended to its type's canonical form */
+static int convert(int v, Type *from, Type *to) {
+    v = convert_basic(v, from, to);
+    if (to->bits && (from->bits != to->bits || type_is_unsigned(from) != type_is_unsigned(to) || type_is_floating(from))) {
+        v = canon(v, to);   /* into a gcc bit-field type: reduced to its width */
+    }
+    return v;
+}
+
+/* a narrow integer result re-extended to its type's canonical form; one of a gcc bit-field type (Type.bits) reduced to its width */
 static int canon(int v, const Type *t) {
     size_t n;
     if (!type_is_integer(t) || t->kind == TY_BOOL) {
         return v;
+    }
+    if (t->bits && ty(t) == IR_I64 && t->bits < 64) {
+        if (type_is_unsigned(t)) {
+            return ir_binop(F, IR_AND, IR_I64, v, iconst(IR_I64, (long)((1ul << t->bits) - 1)));
+        }
+        v = ir_binop_imm(F, IR_SHL, IR_I64, v, 64 - t->bits);
+        return ir_binop_imm(F, IR_ASHR, IR_I64, v, 64 - t->bits);
     }
     n = type_size(t);
     if (n < 4) {
@@ -584,6 +602,15 @@ static int index_addr(AST *e) {
 }
 
 /*
+ * Where a local's initializer writes. Initializers address the object by
+ * frame offset; an over-aligned local (see overaligned_local) or temporary is instead at
+ * an address computed at run time, so while its initializer is lowered
+ * init_base holds that address and init_base_off the offset it stands for.
+ */
+static int init_base = -1;
+static long init_base_off;
+
+/*
  * A compound literal's object. A static one is data (src/codegen.c); an
  * automatic one owns a frame slot (assign_temps) that is initialized
  * each time the literal is evaluated, as C99 says.
@@ -592,9 +619,19 @@ static int compound_lit_addr(AST *e) {
     if (e->sym) {
         return addr_global(e->sym);
     }
-    zero_bytes(addr_local(e->temp), type_size(e->type));
-    codegen_local_initializer(e->type, e->u.cast.expr->u.init_decl.init, e->temp);
-    return addr_local(e->temp);
+    {
+        /* the initializer writes relative to this object, even inside an over-aligned local's initializer */
+        int saved_base = init_base;
+        long saved_off = init_base_off;
+        int a = temp_addr(e);
+        zero_bytes(a, type_size(e->type));
+        init_base = e->temp_by_ref ? a : -1;
+        init_base_off = e->temp;
+        codegen_local_initializer(e->type, e->u.cast.expr->u.init_decl.init, e->temp);
+        init_base = saved_base;
+        init_base_off = saved_off;
+        return a;
+    }
 }
 
 static int addr(AST *e) {
@@ -1268,7 +1305,8 @@ static int emit_call(const char *name, int target, int nargs, const int *args, T
 
 static int is_overflow_builtin(const char *name) {
     return strcmp(name, "__builtin_add_overflow") == 0 || strcmp(name, "__builtin_sub_overflow") == 0
-        || strcmp(name, "__builtin_mul_overflow") == 0;
+        || strcmp(name, "__builtin_mul_overflow") == 0 || strcmp(name, "__builtin_add_overflow_p") == 0
+        || strcmp(name, "__builtin_sub_overflow_p") == 0 || strcmp(name, "__builtin_mul_overflow_p") == 0;
 }
 
 /*
@@ -1276,7 +1314,9 @@ static int is_overflow_builtin(const char *name) {
  * in 128 bits and stored in r's type; the flag says whether the stored
  * value, widened again, is still the exact result. Two unsigned 64 bit
  * factors can exceed a signed 128 bit product, so they multiply unsigned;
- * every other case is exact in a signed one.
+ * every other case is exact in a signed one. The _p forms take, in place
+ * of &r, an expression whose type is the result's; it is not evaluated,
+ * and nothing is stored.
  */
 static int overflow_builtin(AST *e, const char *name) {
     ASTList *args = e->u.call.args;
@@ -1290,9 +1330,12 @@ static int overflow_builtin(AST *e, const char *name) {
     IROp op = name[10] == 'a' ? IR_ADD : name[10] == 's' ? IR_SUB : IR_MUL;
     int wa, wb, exact, narrow, back, pv;
 
-    if (args->len != 3 || !type_is_pointer(args->items[2]->type) || !type_is_integer(args->items[0]->type)
-            || !type_is_integer(args->items[1]->type) || !type_is_integer(args->items[2]->type->base)) {
-        diag_error(e->loc, "'%s' takes two integers and a pointer to an integer", name);
+    int pred = name[strlen(name) - 1] == 'p';
+
+    if (args->len != 3 || !type_is_integer(args->items[0]->type) || !type_is_integer(args->items[1]->type)
+            || (pred ? !type_is_integer(args->items[2]->type)
+                : !type_is_pointer(args->items[2]->type) || !type_is_integer(args->items[2]->type->base))) {
+        diag_error(e->loc, "'%s' takes two integers and %s", name, pred ? "a third" : "a pointer to an integer");
         return iconst(IR_I32, 0);
     }
     a = args->items[0];
@@ -1300,17 +1343,172 @@ static int overflow_builtin(AST *e, const char *name) {
     p = args->items[2];
     ta = a->type;
     tb = b->type;
-    tr = type_unqualified(p->type->base);
+    tr = type_unqualified(pred ? p->type : p->type->base);
     w = type_basic(op == IR_MUL && type_is_unsigned(ta) && type_size(ta) >= 8 && type_is_unsigned(tb) && type_size(tb) >= 8
                    ? TY_UINT128 : TY_INT128);
     wa = convert(expr(a), ta, w);
     wb = convert(expr(b), tb, w);
     exact = ir_binop(F, op, IR_I128, wa, wb);
-    pv = expr(p);
     narrow = convert(exact, w, tr);
-    store_value(tr, pv, narrow);
+    if (!pred) {
+        pv = expr(p);
+        store_value(tr, pv, narrow);
+    }
     back = convert(narrow, tr, w);
     return ir_icmp(F, IR_NE, IR_I128, back, exact);
+}
+
+/* ------------------------------------------------------------------ */
+/* floating point classification: __builtin_isnan and the rest          */
+/* ------------------------------------------------------------------ */
+
+/* (c ? x : y) for i32 values, c being 0 or 1 */
+static int select_i32(int c, int x, int y) {
+    int m = ir_unop(F, IR_NEG, IR_I32, c);
+    return ir_binop(F, IR_XOR, IR_I32, y, ir_binop(F, IR_AND, IR_I32, ir_binop(F, IR_XOR, IR_I32, x, y), m));
+}
+
+static int fcmp(OpKind op, Type *t, int a, int b) {
+    return arith(op, t, a, b);
+}
+
+static int is_inf(Type *t, int v) {
+    return ir_binop(F, IR_OR, IR_I32, fcmp(OP_EQ, t, v, float_const(HUGE_VAL, t)), fcmp(OP_EQ, t, v, float_const(-HUGE_VAL, t)));
+}
+
+/*
+ * The sign bit, and whether the exponent is all zeros or all ones, from the
+ * value's bytes: a float or double is one word, the x87 long double keeps
+ * its sign and exponent in the 16 bits after the 8 of its mantissa.
+ */
+static void fp_fields(Type *t, int v, int *sign, int *exp_zero, int *exp_ones) {
+    long slot = alloc_slot(16, 16);
+    size_t n = type_size(t);
+    int w, e;
+    long mask;
+    store_value(t, addr_local(slot), v);
+    if (ty(t) == IR_F80) {
+        w = ir_load(F, IR_I32, addr_local(slot + 8), 2, 0);
+        *sign = ir_binop_imm(F, IR_LSHR, IR_I32, w, 15);
+        e = ir_binop_imm(F, IR_AND, IR_I32, w, 0x7fff);
+        mask = 0x7fff;
+    } else if (n == 4) {
+        w = ir_load(F, IR_I32, addr_local(slot), 4, 0);
+        *sign = ir_binop_imm(F, IR_LSHR, IR_I32, w, 31);
+        e = ir_binop_imm(F, IR_AND, IR_I32, ir_binop_imm(F, IR_LSHR, IR_I32, w, 23), 0xff);
+        mask = 0xff;
+    } else {
+        w = ir_load(F, IR_I64, addr_local(slot), 8, 0);
+        *sign = trunc_to(IR_I32, ir_binop_imm(F, IR_LSHR, IR_I64, w, 63));
+        e = trunc_to(IR_I32, ir_binop_imm(F, IR_AND, IR_I64, ir_binop_imm(F, IR_LSHR, IR_I64, w, 52), 0x7ff));
+        mask = 0x7ff;
+    }
+    *exp_zero = ir_icmp_imm(F, IR_EQ, IR_I32, e, 0);
+    *exp_ones = ir_icmp_imm(F, IR_EQ, IR_I32, e, mask);
+}
+
+/* the GNU spellings of the C99 classification macros (and isinff, isnanl, ...); returns 1 when `b` (past __builtin_) is one */
+static int fp_builtin(AST *e, const char *b, int *result) {
+    static const char *const names[] = {
+        "isnan", "isinf", "isinf_sign", "isfinite", "finite", "isnormal", "signbit", "fpclassify",
+        "isgreater", "isgreaterequal", "isless", "islessequal", "islessgreater", "isunordered", NULL
+    };
+    ASTList *args = e->u.call.args;
+    char name[32];
+    size_t i, n = strlen(b);
+    size_t nargs;
+    AST *x;
+    Type *t;
+    int v;
+
+    if (n >= sizeof(name)) {
+        return 0;
+    }
+    strcpy(name, b);
+    for (i = 0; names[i] && strcmp(names[i], name) != 0; i++) {
+    }
+    if (!names[i] && n > 1 && (name[n - 1] == 'f' || name[n - 1] == 'l')) {
+        name[n - 1] = '\0';     /* isinff, isnanl, signbitf, finitel: the same, by the argument's type */
+        for (i = 0; names[i] && strcmp(names[i], name) != 0; i++) {
+        }
+        if (names[i] && (strcmp(name, "isnan") != 0 && strcmp(name, "isinf") != 0 && strcmp(name, "signbit") != 0
+                && strcmp(name, "finite") != 0)) {
+            return 0;
+        }
+    }
+    if (!names[i]) {
+        return 0;
+    }
+    nargs = strcmp(name, "fpclassify") == 0 ? 6 : strncmp(name, "isgreater", 9) == 0 || strncmp(name, "isless", 6) == 0
+            || strcmp(name, "isunordered") == 0 ? 2 : 1;
+    if (args->len != nargs || !type_is_floating(args->items[nargs - 1]->type) || type_is_complex(args->items[nargs - 1]->type)) {
+        diag_error(e->loc, "'__builtin_%s' takes %s", b, nargs == 6 ? "five integers and a real floating value"
+                   : nargs == 2 ? "two real floating values" : "a real floating value");
+        *result = iconst(IR_I32, 0);
+        return 1;
+    }
+    if (nargs == 2) {
+        AST *y = args->items[1];
+        int a, c;
+        x = args->items[0];
+        if (!type_is_floating(x->type) && !type_is_integer(x->type)) {
+            diag_error(e->loc, "'__builtin_%s' takes two real floating values", b);
+            *result = iconst(IR_I32, 0);
+            return 1;
+        }
+        t = type_arith_common(x->type, y->type);
+        a = convert(expr(x), x->type, t);
+        c = convert(expr(y), y->type, t);
+        if (strcmp(name, "isunordered") == 0) {
+            *result = ir_binop(F, IR_OR, IR_I32, fcmp(OP_NE, t, a, a), fcmp(OP_NE, t, c, c));
+        } else if (strcmp(name, "islessgreater") == 0) {
+            *result = ir_binop(F, IR_OR, IR_I32, fcmp(OP_LT, t, a, c), fcmp(OP_GT, t, a, c));
+        } else {
+            OpKind op = strcmp(name, "isgreater") == 0 ? OP_GT : strcmp(name, "isgreaterequal") == 0 ? OP_GE
+                        : strcmp(name, "isless") == 0 ? OP_LT : OP_LE;
+            *result = fcmp(op, t, a, c);
+        }
+        return 1;
+    }
+    x = args->items[nargs - 1];
+    t = x->type;
+    if (nargs == 6) {
+        int k[5];
+        int nan, inf, zero, sign, exp_zero, exp_ones;
+        for (i = 0; i < 5; i++) {
+            k[i] = convert(expr(args->items[i]), args->items[i]->type, type_basic(TY_INT));
+        }
+        v = expr(x);
+        nan = fcmp(OP_NE, t, v, v);
+        inf = is_inf(t, v);
+        zero = fcmp(OP_EQ, t, v, float_const(0, t));
+        fp_fields(t, v, &sign, &exp_zero, &exp_ones);
+        /* FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, in the order of the arguments */
+        *result = select_i32(nan, k[0], select_i32(inf, k[1], select_i32(zero, k[4], select_i32(exp_zero, k[3], k[2]))));
+        return 1;
+    }
+    v = expr(x);
+    if (strcmp(name, "isnan") == 0) {
+        *result = fcmp(OP_NE, t, v, v);
+    } else if (strcmp(name, "isinf") == 0) {
+        *result = is_inf(t, v);
+    } else if (strcmp(name, "isinf_sign") == 0) {
+        *result = ir_binop(F, IR_SUB, IR_I32, fcmp(OP_EQ, t, v, float_const(HUGE_VAL, t)), fcmp(OP_EQ, t, v, float_const(-HUGE_VAL, t)));
+    } else if (strcmp(name, "isfinite") == 0 || strcmp(name, "finite") == 0) {
+        /* x - x is 0 for every finite x, NaN for an infinity or a NaN */
+        int d = ir_binop(F, IR_FSUB, ty(t), v, v);
+        *result = fcmp(OP_EQ, t, d, float_const(0, t));
+    } else {
+        int sign, exp_zero, exp_ones;
+        fp_fields(t, v, &sign, &exp_zero, &exp_ones);
+        if (strcmp(name, "signbit") == 0) {
+            *result = sign;
+        } else {
+            /* isnormal: neither zero nor subnormal (exponent all zeros), nor infinite nor NaN (all ones) */
+            *result = ir_icmp_imm(F, IR_EQ, IR_I32, ir_binop(F, IR_OR, IR_I32, exp_zero, exp_ones), 0);
+        }
+    }
+    return 1;
 }
 
 /*
@@ -1466,6 +1664,9 @@ static int builtin(AST *e, const char *name, const char **target, int *result) {
         *result = float_const(b[0] == 'n' ? inf - inf : inf, e->type);
         return 1;
     }
+    if (fp_builtin(e, b, result)) {
+        return 1;
+    }
     if (strcmp(b, "prefetch") == 0) {
         if (args->len >= 1) {
             expr(args->items[0]);   /* a hint only; the address expression still happens */
@@ -1597,9 +1798,9 @@ static int call(AST *e) {
     if (by_address(e->type)) {
         /* the result lives in this call's temporary; a record evaluates to its address */
         if (sret) {
-            sret_addr = addr_local(e->temp);
+            sret_addr = temp_addr(e);
         } else {
-            result_addr = addr_local(e->temp);
+            result_addr = temp_addr(e);
         }
     }
     result = emit_call(name, target, (int)args->len, vals, types, by_addr, nfixed, fn->variadic, e->type, sret_addr, result_addr);
@@ -1979,15 +2180,6 @@ static int complex_compound(AST *e) {
 /* ------------------------------------------------------------------ */
 /* local initializers (the walker is in codegen.c)                    */
 /* ------------------------------------------------------------------ */
-
-/*
- * Where a local's initializer writes. Initializers address the object by
- * frame offset; an over-aligned local (see overaligned_local) is instead at
- * an address computed at run time, so while its initializer is lowered
- * init_base holds that address and init_base_off the offset it stands for.
- */
-static int init_base = -1;
-static long init_base_off;
 
 static int init_addr(long off) {
     if (init_base < 0) {
@@ -2508,15 +2700,38 @@ static void alloc_local(Symbol *s) {
  * rounded up at function entry, in a slot of its own; it is reached
  * through that address, as a VLA is (Symbol.by_ref).
  */
-static void overaligned_local(Symbol *s) {
-    size_t align = type_align(s->type);
-    long raw = alloc_slot(type_size(s->type) + align - 16, 16);
-    int a;
-    s->by_ref = 1;
-    s->offset = alloc_slot(8, 8);
-    a = ir_binop_imm(F, IR_ADD, IR_I64, addr_local(raw), (long)align - 1);
+/* room for `size` bytes at `align` (past 16), placed at function entry: the slot holding their address; *aligned_out, the address */
+static long overaligned_slot(size_t size, size_t align, int *aligned_out) {
+    long raw = alloc_slot(size + align - 16, 16);
+    long ptr = alloc_slot(8, 8);
+    int a = ir_binop_imm(F, IR_ADD, IR_I64, addr_local(raw), (long)align - 1);
     a = ir_binop_imm(F, IR_AND, IR_I64, a, -(long)align);
-    ir_store(F, IR_I64, addr_local(s->offset), a, 8);
+    ir_store(F, IR_I64, addr_local(ptr), a, 8);
+    if (aligned_out) {
+        *aligned_out = a;
+    }
+    return ptr;
+}
+
+static void overaligned_local(Symbol *s) {
+    s->by_ref = 1;
+    s->offset = overaligned_slot(type_size(s->type), type_align(s->type), NULL);
+}
+
+/* a temporary of `size` bytes for the node `e`, at `align`; one aligned past 16 is reached through its address, as an over-aligned local is */
+static void alloc_temp(AST *e, size_t size, size_t align) {
+    if (align > 16) {
+        e->temp = overaligned_slot(size, align, NULL);
+        e->temp_by_ref = 1;
+    } else {
+        e->temp = alloc_slot(size, align);
+        e->temp_by_ref = 0;
+    }
+}
+
+/* the address of e's temporary */
+static int temp_addr(const AST *e) {
+    return e->temp_by_ref ? ir_load(F, IR_I64, addr_local(e->temp), 8, 0) : addr_local(e->temp);
 }
 
 /* can this local live in a register: a scalar whose address is never taken, in a function without setjmp */
@@ -2699,7 +2914,7 @@ static void assign_temps(AST *e) {
                 assign_temps(e->u.call.args->items[i]);
             }
             if (e->type && by_address(e->type)) {
-                e->temp = alloc_slot((type_size(e->type) + 7) & ~(size_t)7, 8);
+                alloc_temp(e, (type_size(e->type) + 7) & ~(size_t)7, type_align(e->type) > 8 ? type_align(e->type) : 8);
             }
             break;
         case N_UNARY:
@@ -2754,7 +2969,7 @@ static void assign_temps(AST *e) {
             break;
         case N_COMPOUND_LIT:
             if (!e->sym) {
-                e->temp = alloc_slot(type_size(e->type), type_is_complex(e->type) ? 16 : type_align(e->type));
+                alloc_temp(e, type_size(e->type), type_is_complex(e->type) ? 16 : type_align(e->type));
             }
             assign_temps(e->u.cast.expr->u.init_decl.init);
             break;
@@ -3008,6 +3223,16 @@ IRFunc *lower_function(AST *fdef) {
         } else if (!ip->loc.in_regs && local_vreg(p) >= 0) {
             /* a stack parameter kept in a register: loaded from the caller's area */
             ir_mov(F, local_vreg(p), load_value(fdef->loc, p->type, addr_local(ip->offset)));
+        } else if (ip->loc.in_regs && !ip->loc.by_ref && local_vreg(p) < 0 && type_align(p->type) > 16) {
+            /*
+             * Aligned past the frame's 16 bytes: the prologue stored the registers in a slot
+             * the frame cannot align, so the parameter moves to an over-aligned one (see
+             * overaligned_local) and is reached through its address from here on.
+             */
+            int a;
+            p->offset = overaligned_slot(type_size(p->type), type_align(p->type), &a);
+            p->by_ref = 1;
+            copy_bytes(a, addr_local(ip->offset), type_size(p->type));
         }
     }
 

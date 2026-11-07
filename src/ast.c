@@ -279,6 +279,7 @@ void ast_free(AST *ast) {
         case N_CAST:
         case N_SIZEOF_EXPR:
         case N_SIZEOF_TYPE:
+        case N_ALIGNAS:
         case N_VA_ARG:
         case N_IMPLICIT_CAST:
         case N_COMPOUND_LIT:
@@ -666,6 +667,7 @@ static void dump_node(FILE *out, int depth, const char *label, const AST *ast) {
         case N_VA_ARG:
         case N_COMPOUND_LIT:
         case N_GENERIC_ASSOC:
+        case N_ALIGNAS:
             dump_node(out, d, "type", ast->u.cast.type);
             dump_node(out, d, NULL, ast->u.cast.expr);
             break;

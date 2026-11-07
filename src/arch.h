@@ -134,6 +134,9 @@ typedef struct Backend {
 
     /* a whole function: allocate its registers, select instructions, print it */
     void (*select)(struct IRFunc *f);
+
+    /* `name` as another name for `target`, which the unit defines (__attribute__((alias))); -1 when the object format has no aliases */
+    int (*alias)(const char *name, const char *target, int is_global, int weak, int is_func);
 } Backend;
 
 /* the selected target's type sizes and primitives; target_select sets them */

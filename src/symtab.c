@@ -52,6 +52,7 @@ static void scope_free(Scope *scope) {
     while (sym) {
         Symbol *next = sym->next;
         free(sym->name);
+        free(sym->alias);
         free(sym);
         sym = next;
     }

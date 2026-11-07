@@ -39,6 +39,8 @@ typedef struct Target {
     const Backend *cg;
     const TargetLink *link;         /* NULL: cannot be linked for on another host */
     const struct AsmArch *as;       /* the assembler's syntax and instruction table for it (src/as) */
+    int gcc;                        /* the platform's compiler is gcc, not clang: where the two differ
+                                       (the type of a bit-field wider than an int), jcc does as gcc */
 } Target;
 
 extern const Target target_arm64_macos;

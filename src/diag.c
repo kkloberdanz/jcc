@@ -9,6 +9,7 @@ static int nwarnings = 0;
 static DiagHandler handler = NULL;
 static void *handler_user = NULL;
 static jmp_buf *recovery = NULL;
+static int warnings_off = 0;    /* -w */
 
 static const char *const level_names[] = { "note", "warning", "error", "fatal error" };
 
@@ -53,6 +54,9 @@ void diag_error(Loc loc, const char *fmt, ...) {
 
 void diag_warning(Loc loc, const char *fmt, ...) {
     va_list ap;
+    if (warnings_off) {
+        return;
+    }
     va_start(ap, fmt);
     report(loc, DIAG_WARNING, fmt, ap);
     va_end(ap);
@@ -92,6 +96,10 @@ void fatal(const char *fmt, ...) {
     report(none, DIAG_FATAL, fmt, ap);
     va_end(ap);
     bail();
+}
+
+void diag_suppress_warnings(int off) {
+    warnings_off = off;
 }
 
 int diag_error_count(void) {

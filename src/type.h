@@ -147,6 +147,9 @@ struct Type {
     Vla *vla;           /* array: a variable length one, else NULL */
     size_t align;       /* __attribute__((aligned(n))) on a typedef, member or object: the
                            alignment in place of the natural one; 0 for the natural one */
+    int bits;           /* an integer of fewer bits than its kind: the type gcc gives a bit-field
+                           wider than an int (`unsigned long long:40`), whose arithmetic is done
+                           at that width; 0 for every other type (type_bitfield) */
     Type *next_alloc;
 };
 
@@ -160,6 +163,8 @@ Type *type_func(Type *ret, Param *params, size_t nparams, int variadic, int has_
 Type *type_record(Record *record);
 /* a copy of `t` aligned to `align` bytes (a typedef's, member's or object's aligned attribute) */
 Type *type_with_align(Type *t, size_t align);
+/* the unqualified integer type `t` narrowed to `bits` bits (Type.bits) */
+Type *type_bitfield(Type *t, int bits);
 /* a copy of `t` with `quals` added; `t` itself when nothing changes */
 Type *type_qualify(Type *t, unsigned quals);
 Type *type_unqualified(Type *t);

@@ -41,6 +41,7 @@ void fatal(const char *fmt, ...);               /* the same, without a location 
 /* install the jmp_buf a fatal error returns to (NULL: none); returns the previous one, to restore */
 jmp_buf *diag_set_recovery(jmp_buf *where);
 
+void diag_suppress_warnings(int off);  /* -w: drop every warning */
 int diag_error_count(void);
 int diag_warning_count(void);
 void diag_reset(void);

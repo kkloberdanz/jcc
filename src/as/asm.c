@@ -102,6 +102,9 @@ int as_symbol(As *a, const char *s, size_t len) {
     sym->is_obj = 0;
     sym->is_tls = 0;
     sym->is_section = 0;
+    sym->weak = 0;
+    sym->alias_of = -1;
+    sym->alias_line = 0;
     sym->off = 0;
     sym->size = 0;
     sym->atom = -1;
@@ -417,6 +420,28 @@ static int directive(As *a, const AsmTok *t, size_t n) {
         a->syms[sym].global = 1;
         return 0;
     }
+    if (as_tok_is(d, ".weak") && a->arch->secsym == SECSYM_SECTION) {     /* ELF only, as is .set */
+        int sym;
+        if (n != 2 || t[1].kind != ATOK_IDENT) goto junk;
+        sym = as_symbol(a, t[1].s, t[1].len);
+        a->syms[sym].global = 1;
+        a->syms[sym].weak = 1;
+        return 0;
+    }
+    if (as_tok_is(d, ".set") && a->arch->secsym == SECSYM_SECTION) {
+        /* .set alias, target: another name for a symbol this unit defines (__attribute__((alias))) */
+        int sym, to;
+        if (n != 4 || t[1].kind != ATOK_IDENT || t[2].punct != ',' || t[3].kind != ATOK_IDENT) goto junk;
+        sym = as_symbol(a, t[1].s, t[1].len);
+        to = as_symbol(a, t[3].s, t[3].len);
+        if (a->syms[sym].section >= 0 || a->syms[sym].alias_of >= 0) {
+            as_error(a, "symbol %s is already defined", a->syms[sym].name);
+            return -1;
+        }
+        a->syms[sym].alias_of = to;
+        a->syms[sym].alias_line = a->line;
+        return 0;
+    }
     if (as_tok_is(d, ".p2align")) {
         AsmItem *it;
         if (n != 2 || t[1].kind != ATOK_NUM || t[1].num > 12) goto junk;
@@ -705,10 +730,39 @@ static void apply_symvers(As *a) {
     }
 }
 
+/* give each `.set` alias its target's section and kind; its place follows the target's in as_layout */
+static void resolve_aliases(As *a) {
+    size_t i;
+    for (i = 0; i < a->nsyms; i++) {
+        AsmSym *s = &a->syms[i];
+        const AsmSym *to;
+        int k = s->alias_of;
+        int hops = 0;
+        if (k < 0) {
+            continue;
+        }
+        while (a->syms[k].alias_of >= 0 && hops++ < 64) {    /* an alias of an alias */
+            k = a->syms[k].alias_of;
+        }
+        s->alias_of = k;
+        to = &a->syms[k];
+        if (to->section < 0) {
+            a->line = s->alias_line;
+            as_error(a, "%s is an alias of %s, which this unit does not define", s->name, to->name);
+            continue;
+        }
+        s->section = to->section;
+        s->is_func = to->is_func;
+        s->is_obj = to->is_obj;
+        s->is_tls = to->is_tls;
+        s->sized = to->sized;
+    }
+}
+
 static int define_symbol(As *a, const char *s, size_t len) {
     int sym = as_symbol(a, s, len);
     AsmItem *it;
-    if (a->syms[sym].section >= 0) {
+    if (a->syms[sym].section >= 0 || a->syms[sym].alias_of >= 0) {
         as_error(a, "label %.*s defined twice", (int)len, s);
         return -1;
     }
@@ -776,6 +830,7 @@ int as_check(const char *name, const char *text, size_t len) {
     as_init(&a, name);
     parse_unit(&a, text, len);
     apply_symvers(&a);
+    resolve_aliases(&a);
     rc = a.errors ? -1 : 0;
     as_free(&a);
     return rc;
@@ -808,6 +863,7 @@ void as_reloc(As *a, int sec, size_t off, int sym, long addend, int kind) {
 static void as_layout(As *a) {
     int changed = 1;
     int sec;
+    size_t i;
     while (changed) {
         changed = 0;
         for (sec = 0; sec < SEC_COUNT; sec++) {
@@ -870,6 +926,14 @@ static void as_layout(As *a) {
                 }
             }
             s->size = off;
+        }
+        for (i = 0; i < a->nsyms; i++) {
+            AsmSym *sym = &a->syms[i];
+            if (sym->alias_of >= 0 && sym->section >= 0) {
+                sym->off = a->syms[sym->alias_of].off;
+                sym->size = a->syms[sym->alias_of].size;
+                sym->atom = a->syms[sym->alias_of].atom;
+            }
         }
     }
 }
@@ -950,6 +1014,7 @@ int as_assemble(const char *name, const char *text, size_t len, char **out, size
     as_init(&a, name);
     parse_unit(&a, text, len);
     apply_symvers(&a);
+    resolve_aliases(&a);
     if (a.errors == 0 && !a.arch->write) {
         as_error(&a, "no object writer for %s yet", a.arch->name);
     }

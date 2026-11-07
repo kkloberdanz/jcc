@@ -62,11 +62,12 @@ void jcc_set_reader(Jcc *k, JccReadFn fn, void *user);
  * NAME=BODY, "-U" NAME, "-std" c90 or gnu89, "-isysroot" dir, and the
  * flags "-nostdinc", "-ast-dump", "-symtab-dump" (the dumps go to
  * stdout during jcc_check), "-fdump-ir" (each function's IR to stdout
- * as it is compiled) and "-fexternal-as" (objects come from the host's
- * cc rather than jcc's assembler), whose value is ignored; and "-O"
- * with a level: "0" (the default) translates the IR as it is, anything
- * else ("1", "2", "3", "s", "z", or NULL for plain -O) is -O1, which
- * optimizes it. Returns 0, or -1 for an option it does not know.
+ * as it is compiled), "-fexternal-as" (objects come from the host's
+ * cc rather than jcc's assembler) and "-w" (no warnings), whose value
+ * is ignored; and "-O" with a level: "0" (the default) translates the
+ * IR as it is, anything else ("1", "2", "3", "s", "z", or NULL for
+ * plain -O) is -O1, which optimizes it. Returns 0, or -1 for an option
+ * it does not know.
  */
 int jcc_set_option(Jcc *k, const char *name, const char *value);
 
