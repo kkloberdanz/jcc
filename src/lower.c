@@ -145,7 +145,7 @@ static int addr_local(long off) {
 
 static int addr_global(const Symbol *s) {
     int dst = ir_vreg(F, IR_I64);
-    IRInst *i = ir_inst(F, ir_emit(F, IR_ADDR_GLOBAL, IR_I64, dst, -1, -1));
+    IRInst *i = ir_inst(F, ir_emit(F, s->tls ? IR_TLS_ADDR : IR_ADDR_GLOBAL, IR_I64, dst, -1, -1));
     i->sym = ir_name(F, codegen_sym_name(s));
     if (!codegen_sym_defined_here(s)) {
         i->flags |= IRF_EXTERN;
@@ -191,6 +191,94 @@ static void copy_bytes(int dst_addr, int src_addr, size_t size) {
 static void zero_bytes(int addr_v, size_t size) {
     IRInst *i = ir_inst(F, ir_emit(F, IR_ZERO, IR_VOID, -1, addr_v, -1));
     i->imm = (long)size;
+}
+
+/* ------------------------------------------------------------------ */
+/* variable length arrays                                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A VLA type's byte size is computed when its declarator is reached and
+ * kept in a frame slot of its own (Vla.slot, src/type.h); every size the
+ * code needs for it, sizeof and the scaling of pointer arithmetic, is
+ * loaded from there. An object of VLA type is a 16 byte slot: its
+ * address (so it is reached like a record passed by reference, through
+ * Symbol.by_ref), then the stack pointer from before its first
+ * allocation, zero until then. Reaching the declaration again (a loop,
+ * a backward goto) returns the stack to that point before allocating:
+ * everything allocated since is out of its lifetime, so a loop does not
+ * grow the stack. As in GCC, memory alloca returned after it goes too.
+ */
+
+/* sizeof(t), an i64 */
+static int size_of(Type *t) {
+    if (type_is_vla(t)) {
+        return ir_load(F, IR_I64, addr_local(t->vla->slot), 8, 0);
+    }
+    return iconst(IR_I64, (long)type_size(t));
+}
+
+/* `n` elements of type t in bytes; n is an i64 */
+static int scale_by(int n, Type *t) {
+    if (type_is_vla(t)) {
+        return ir_binop(F, IR_MUL, IR_I64, n, size_of(t));
+    }
+    if (type_size(t) == 1) {
+        return n;
+    }
+    return ir_binop_imm(F, IR_MUL, IR_I64, n, (long)type_size(t));
+}
+
+static void assign_temps(AST *e);
+static long alloc_slot(size_t size, size_t align);
+static int convert(int v, Type *from, Type *to);
+
+/* a frame slot for the size of each VLA a declarator chain makes (the parameters of a function declarator in it are not its own) */
+static void vla_slots(AST *d) {
+    for (; d; d = d->u.declarator.inner) {
+        if (d->kind == N_DECL_ARRAY && d->type && type_is_vla(d->type)) {
+            d->type->vla->slot = alloc_slot(8, 8);
+            assign_temps(d->type->vla->size);
+        }
+        if (d->kind == N_DECL_NAME) {
+            break;
+        }
+    }
+}
+
+/* compute the sizes of the VLAs a declarator chain makes, element types first */
+static void vla_eval(AST *d) {
+    for (; d; d = d->u.declarator.inner) {
+        if (d->kind == N_DECL_ARRAY && d->type && type_is_vla(d->type)) {
+            Type *t = d->type;
+            AST *n = t->vla->size;
+            int v = convert(expr(n), n->type, type_basic(TY_ULONG));
+            ir_store(F, IR_I64, addr_local(t->vla->slot), scale_by(v, t->base), 8);
+        }
+        if (d->kind == N_DECL_NAME) {
+            break;
+        }
+    }
+}
+
+/* allocate the VLA object `s` on the stack, returning the stack to where its last allocation started */
+static void vla_alloc(Symbol *s) {
+    int old = ir_load(F, IR_I64, addr_local(s->offset + 8), 8, 0);
+    int restore = ir_block(F);
+    int save = ir_block(F);
+    int join = ir_block(F);
+    int sp;
+    ir_condbr(F, ir_icmp_imm(F, IR_NE, IR_I64, old, 0), restore, save);
+    ir_place(F, restore);
+    ir_emit(F, IR_SPRESTORE, IR_VOID, -1, old, -1);
+    ir_br(F, join);
+    ir_place(F, save);
+    sp = ir_vreg(F, IR_I64);
+    ir_emit(F, IR_SPSAVE, IR_I64, sp, -1, -1);
+    ir_store(F, IR_I64, addr_local(s->offset + 8), sp, 8);
+    ir_br(F, join);
+    ir_place(F, join);
+    ir_store(F, IR_I64, addr_local(s->offset), ir_unop(F, IR_ALLOCA, IR_I64, size_of(s->type)), 8);
 }
 
 /*
@@ -476,6 +564,9 @@ static int index_addr(AST *e) {
     }
     size = type_size(a->type->base);
     p = expr(a);
+    if (type_is_vla(a->type->base)) {
+        return ir_binop(F, IR_ADD, IR_I64, p, scale_by(scaled_index(expr(i), i->type, 1), a->type->base));
+    }
     if (sema_const_eval(i, &v)) {
         if (v == 0) {
             return p;
@@ -485,8 +576,25 @@ static int index_addr(AST *e) {
     return ir_binop(F, IR_ADD, IR_I64, p, scaled_index(expr(i), i->type, size));
 }
 
+/*
+ * A compound literal's object. A static one is data (src/codegen.c); an
+ * automatic one owns a frame slot (assign_temps) that is initialized
+ * each time the literal is evaluated, as C99 says.
+ */
+static int compound_lit_addr(AST *e) {
+    if (e->sym) {
+        return addr_global(e->sym);
+    }
+    zero_bytes(addr_local(e->temp), type_size(e->type));
+    codegen_local_initializer(e->type, e->u.cast.expr->u.init_decl.init, e->temp);
+    return addr_local(e->temp);
+}
+
 static int addr(AST *e) {
     switch (e->kind) {
+        case N_COMPOUND_LIT:
+            return compound_lit_addr(e);
+
         case N_IDENT: {
             Symbol *s = e->sym;
             if (!s) {
@@ -745,6 +853,10 @@ static int cast(AST *e) {
     AST *x = e->u.cast.expr;
     Type *from = x->type;
 
+    if (e->kind == N_CAST && e->u.cast.type && type_is_vm(e->u.cast.type->type)) {
+        vla_eval(e->u.cast.type->u.typed.declarator);    /* `(int (*)[n])p` */
+    }
+
     if (to->kind == TY_VOID) {
         expr(x);
         return -1;
@@ -778,7 +890,9 @@ static int incdec(AST *e, int sign, int post) {
     }
     a = lvalue_addr(o);
     old = lvalue_load(o, a);
-    if (type_is_floating(t)) {
+    if (t->kind == TY_POINTER && type_is_vla(t->base)) {
+        nw = ir_binop(F, sign > 0 ? IR_ADD : IR_SUB, IR_I64, old, size_of(t->base));
+    } else if (type_is_floating(t)) {
         nw = ir_binop(F, IR_FADD, ty(t), old, float_const((long double)sign, t));
     } else if (t->kind == TY_BOOL) {
         /* a _Bool: ++ sets it, -- flips it (old + step, then != 0) */
@@ -911,6 +1025,10 @@ static int binary(AST *e) {
     if ((op == OP_ADD || op == OP_SUB) && type_is_pointer(l->type) && !type_is_pointer(r->type)) {
         size_t size = type_size(l->type->base);
         lv = expr(l);
+        if (type_is_vla(l->type->base)) {
+            rv = scale_by(scaled_index(expr(r), r->type, 1), l->type->base);
+            return ir_binop(F, op == OP_ADD ? IR_ADD : IR_SUB, IR_I64, lv, rv);
+        }
         if (sema_const_eval(r, &cv)) {
             long off = (long)((unsigned long)cv * size);
             if (off == 0) {
@@ -928,6 +1046,9 @@ static int binary(AST *e) {
         lv = expr(l);
         rv = expr(r);
         d = ir_binop(F, IR_SUB, IR_I64, lv, rv);
+        if (type_is_vla(l->type->base)) {
+            return ir_binop(F, IR_SDIV, IR_I64, d, size_of(l->type->base));
+        }
         if (size != 1) {
             d = ir_binop_imm(F, IR_SDIV, IR_I64, d, (long)size);
         }
@@ -1001,7 +1122,10 @@ static int assign(AST *e) {
     if (t->kind == TY_POINTER) {
         size_t size = type_size(t->base);
         lv = lvalue_load(l, a);
-        if (sema_const_eval(r, &cv)) {
+        if (type_is_vla(t->base)) {
+            rv = scale_by(scaled_index(expr(r), r->type, 1), t->base);
+            rv = ir_binop(F, op == OP_ADD_ASSIGN ? IR_ADD : IR_SUB, IR_I64, lv, rv);
+        } else if (sema_const_eval(r, &cv)) {
             rv = ir_binop_imm(F, op == OP_ADD_ASSIGN ? IR_ADD : IR_SUB, IR_I64, lv, (long)((unsigned long)cv * size));
         } else {
             rv = scaled_index(expr(r), r->type, size);
@@ -1509,10 +1633,19 @@ static int expr(AST *e) {
             return result;
         }
 
+        case N_SIZEOF_TYPE:
+            if (e->u.cast.type->type && type_is_vla(e->u.cast.type->type)) {
+                vla_eval(e->u.cast.type->u.typed.declarator);
+                return size_of(e->u.cast.type->type);
+            }
+            /* fall through */
+        case N_SIZEOF_EXPR:
+            if (e->kind == N_SIZEOF_EXPR && e->u.cast.expr->type && type_is_vla(e->u.cast.expr->type)) {
+                return size_of(e->u.cast.expr->type);
+            }
+            /* fall through */
         case N_INT:
         case N_CHAR:
-        case N_SIZEOF_EXPR:
-        case N_SIZEOF_TYPE:
             if (!sema_const_eval(e, &v)) {
                 diag_error(e->loc, "internal error: constant has no value");
                 v = 0;
@@ -1584,6 +1717,9 @@ static int expr(AST *e) {
 
         case N_VA_ARG:
             return va_arg_expr(e);
+
+        case N_COMPOUND_LIT:
+            return load_value(e->loc, e->type, compound_lit_addr(e));
 
         default:
             diag_error(e->loc, "internal error: %s is not an expression", node_kind_name(e->kind));
@@ -1861,6 +1997,11 @@ static void local_decl(AST *decl) {
         AST *id = decl->u.decl.declarators->items[i];
         Symbol *s = id->sym;
         AST *init = id->u.init_decl.init;
+        vla_eval(id->u.init_decl.declarator);
+        if (s && s->kind == SYM_VARIABLE && s->type && type_is_vla(s->type) && codegen_sym_is_local(s)) {
+            vla_alloc(s);
+            continue;
+        }
         if (!s || s->kind != SYM_VARIABLE || !codegen_sym_is_local(s) || !init || !s->type) {
             continue;
         }
@@ -1875,6 +2016,9 @@ static void local_decl(AST *decl) {
             }
             if (item->kind != N_INIT_LIST && lower_check_value_type(item->loc, s->type)) {
                 ir_mov(F, local_vreg(s), expr(item));
+            } else if (item->kind == N_INIT_LIST && lower_check_value_type(item->loc, s->type)) {
+                /* `= {}` */
+                ir_mov(F, local_vreg(s), type_is_floating(s->type) ? float_const(0, s->type) : iconst(ty(s->type), 0));
             }
             continue;
         }
@@ -2446,6 +2590,9 @@ static void mark_memory(AST *n) {
         case N_DESIGNATED:
             mark_memory(n->u.desig.init);
             break;
+        case N_COMPOUND_LIT:
+            mark_memory(n->u.cast.expr->u.init_decl.init);
+            break;
         case N_STMT_EXPR:
             mark_memory(n->u.stmt.body);
             break;
@@ -2487,7 +2634,7 @@ static void assign_temps(AST *e) {
     if (!e) {
         return;
     }
-    if (e->type && type_is_complex(e->type) && e->kind != N_CALL && e->kind != N_VA_ARG) {
+    if (e->type && type_is_complex(e->type) && e->kind != N_CALL && e->kind != N_VA_ARG && e->kind != N_COMPOUND_LIT) {
         /* every complex valued node: its result, or its consumer's working copy */
         e->temp = alloc_slot(type_size(e->type), 16);
     }
@@ -2535,7 +2682,13 @@ static void assign_temps(AST *e) {
             break;
         case N_CAST:
         case N_IMPLICIT_CAST:
+            if (e->kind == N_CAST && e->u.cast.type) {
+                vla_slots(e->u.cast.type->u.typed.declarator);
+            }
             assign_temps(e->u.cast.expr);
+            break;
+        case N_SIZEOF_TYPE:
+            vla_slots(e->u.cast.type->u.typed.declarator);
             break;
         case N_INIT_LIST:
             for (i = 0; i < e->u.list->len; i++) {
@@ -2544,6 +2697,12 @@ static void assign_temps(AST *e) {
             break;
         case N_DESIGNATED:
             assign_temps(e->u.desig.init);
+            break;
+        case N_COMPOUND_LIT:
+            if (!e->sym) {
+                e->temp = alloc_slot(type_size(e->type), type_is_complex(e->type) ? 16 : type_align(e->type));
+            }
+            assign_temps(e->u.cast.expr->u.init_decl.init);
             break;
         case N_STMT_EXPR:
             assign_locals(e->u.stmt.body);
@@ -2564,13 +2723,20 @@ static void assign_locals(AST *s) {
             for (i = 0; i < s->u.decl.declarators->len; i++) {
                 AST *id = s->u.decl.declarators->items[i];
                 Symbol *sym = id->sym;
+                vla_slots(id->u.init_decl.declarator);
                 if (!sym || sym->kind != SYM_VARIABLE || sym->decl != id || !sym->type) {
                     continue;
                 }
                 if (codegen_sym_is_static_local(sym)) {
                     codegen_static_local(sym);
                 } else if (codegen_sym_is_local(sym)) {
-                    if (promotable(sym)) {
+                    if (type_is_vla(sym->type)) {
+                        /* its address, then the stack pointer to return to (zero: not allocated yet) */
+                        sym->vreg = 0;
+                        sym->by_ref = 1;
+                        sym->offset = alloc_slot(16, 8);
+                        ir_store(F, IR_I64, addr_local(sym->offset + 8), iconst(IR_I64, 0), 8);
+                    } else if (promotable(sym)) {
                         sym->vreg = ir_vreg_local(F, ty(sym->type), sym->name) + 1;
                         if (!id->u.init_decl.init && type_is_integer(sym->type) && type_size(sym->type) < 4) {
                             /*
@@ -2783,6 +2949,13 @@ IRFunc *lower_function(AST *fdef) {
             /* a stack parameter kept in a register: loaded from the caller's area */
             ir_mov(F, local_vreg(p), load_value(fdef->loc, p->type, addr_local(ip->offset)));
         }
+    }
+
+    /* the sizes of variable length array parameters (`int a[n][m]`, adjusted to a pointer to a VLA) */
+    for (i = 0; params && !fn->u.declarator.kr && i < params->len; i++) {
+        AST *pd = params->items[i]->u.typed.declarator;
+        vla_slots(pd);
+        vla_eval(pd);
     }
 
     stmt(fdef->u.func.body);

@@ -98,6 +98,8 @@ static int parse_sym(As *a, const AsmTok *t, size_t *i, AsmOp *op) {
         else if (as_tok_is(k, "PAGEOFF")) op->mode = SYM_PAGEOFF;
         else if (as_tok_is(k, "GOTPAGE")) op->mode = SYM_GOTPAGE;
         else if (as_tok_is(k, "GOTPAGEOFF")) op->mode = SYM_GOTPAGEOFF;
+        else if (as_tok_is(k, "TLVPPAGE")) op->mode = SYM_TLVPPAGE;
+        else if (as_tok_is(k, "TLVPPAGEOFF")) op->mode = SYM_TLVPPAGEOFF;
         else return -1;
         *i += 2;
     }
@@ -181,11 +183,12 @@ static int arm64_parse_operand(As *a, const AsmTok *t, size_t *i, AsmOp *op) {
                 (*i)++;
             } else if (t[*i].kind == ATOK_IDENT) {
                 AsmOp s;
-                if (parse_sym(a, t, i, &s) != 0 || s.mode != SYM_GOTPAGEOFF) {
+                if (parse_sym(a, t, i, &s) != 0 || (s.mode != SYM_GOTPAGEOFF && s.mode != SYM_TLVPPAGEOFF)) {
                     return -1;
                 }
                 op->mode = MEM_SYM;
                 op->sym = s.sym;
+                op->cls = s.mode;
             } else {
                 return -1;
             }
@@ -302,7 +305,7 @@ static void arm64_shape(const AsmInst *in, char *buf) {
                     case SYM_PLAIN: c = 'L'; break;
                     case SYM_PAGE: c = 'G'; break;
                     case SYM_PAGEOFF: c = 'O'; break;
-                    case SYM_GOTPAGE: c = 'g'; break;
+                    case SYM_GOTPAGE: case SYM_TLVPPAGE: c = 'g'; break;
                 }
                 break;
             case OP_MEM:
@@ -646,7 +649,8 @@ static int arm64_encode(As *a, int sec, const AsmItem *it, unsigned char *out) {
             break;
         case F_ADRP:
             w |= rd(in, 0);
-            as_reloc(a, sec, it->off, in->ops[1].sym, in->ops[1].imm, in->ops[1].mode == SYM_PAGE ? R_PAGE21 : R_GOT_PAGE21);
+            as_reloc(a, sec, it->off, in->ops[1].sym, in->ops[1].imm,
+                     in->ops[1].mode == SYM_PAGE ? R_PAGE21 : in->ops[1].mode == SYM_TLVPPAGE ? R_TLVP_PAGE21 : R_GOT_PAGE21);
             break;
         case F_PAGEOFF:
             w |= rd(in, 1) << 5 | rd(in, 0);
@@ -657,7 +661,7 @@ static int arm64_encode(As *a, int sec, const AsmItem *it, unsigned char *out) {
             unsigned long scale = 1ul << (w >> 30);
             w |= (unsigned long)m->base << 5 | rd(in, 0);
             if (m->mode == MEM_SYM) {
-                as_reloc(a, sec, it->off, m->sym, 0, R_GOT_PAGEOFF12);
+                as_reloc(a, sec, it->off, m->sym, 0, m->cls == SYM_TLVPPAGEOFF ? R_TLVP_PAGEOFF12 : R_GOT_PAGEOFF12);
             } else if (m->imm >= 0 && (unsigned long)m->imm % scale == 0 && (unsigned long)m->imm / scale < 4096) {
                 w |= ((unsigned long)m->imm / scale) << 10;
             } else if (m->imm >= -256 && m->imm <= 255) {

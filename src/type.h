@@ -117,6 +117,19 @@ struct Param {
     Type *type;
 };
 
+/*
+ * A variable length array's run time size. The type's `length` is 0;
+ * `size` is the expression in its declarator (owned by the AST), which
+ * the code that reaches the declarator evaluates (src/lower.c): the
+ * whole array's byte size goes to the frame slot `slot`. Copies of the
+ * type made by qualifying it share this record.
+ */
+typedef struct Vla {
+    struct AST *size;
+    long slot;
+    struct Vla *next_alloc;
+} Vla;
+
 struct Type {
     TypeKind kind;
     unsigned quals;     /* TQ_* bits */
@@ -127,6 +140,7 @@ struct Type {
     size_t nparams;
     int variadic;
     int has_proto;      /* function: declared with a parameter type list */
+    Vla *vla;           /* array: a variable length one, else NULL */
     Type *next_alloc;
 };
 
@@ -135,6 +149,7 @@ struct Type {
 Type *type_basic(TypeKind kind);          /* shared, unqualified singleton */
 Type *type_pointer(Type *base);
 Type *type_array(Type *elem, long length);
+Type *type_vla(Type *elem, struct AST *size);
 Type *type_func(Type *ret, Param *params, size_t nparams, int variadic, int has_proto);
 Type *type_record(Record *record);
 /* a copy of `t` with `quals` added; `t` itself when nothing changes */
@@ -165,6 +180,8 @@ int type_is_scalar(const Type *t);      /* arithmetic or pointer */
 int type_is_pointer(const Type *t);
 int type_is_record(const Type *t);      /* struct or union */
 int type_is_complete(const Type *t);
+int type_is_vla(const Type *t);         /* an array whose length is only known at run time */
+int type_is_vm(const Type *t);          /* variably modified: a VLA, or a pointer to or array of one */
 int type_is_void(const Type *t);
 int type_is_void_pointer(const Type *t);
 int type_is_func_pointer(const Type *t);

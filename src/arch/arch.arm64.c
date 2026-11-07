@@ -343,7 +343,34 @@ static void a64_cg_end(void) {
 /* data                                                               */
 /* ------------------------------------------------------------------ */
 
-static void a64_cg_data_begin(const char *name, int is_global, size_t align, int zero) {
+/*
+ * A thread-local variable is two things in Mach-O: its descriptor in
+ * __thread_vars, which the symbol names and code reaches it through
+ * (three words: the runtime's thunk, a key it fills in, the initial
+ * value's address), and that initial value, in __thread_data under the
+ * name plus `.tlv.init` (clang writes `$tlv$init`; the name is local).
+ * Zero ones go in __thread_data too, as zeros.
+ */
+static void a64_cg_data_begin(const char *name, int is_global, size_t align, int zero, int tls) {
+    if (tls) {
+        a64_emit(".section __DATA,__thread_vars,thread_local_variables");
+        if (is_global) {
+            a64_emit(".globl _%s", name);
+        }
+        a64_emit(".p2align 3");
+        peep_flush();
+        fprintf(a64_cg_out, "_%s:\n", name);
+        a64_emit(".quad __tlv_bootstrap");
+        a64_emit(".quad 0");
+        a64_emit(".quad _%s.tlv.init", name);
+        a64_emit(".section __DATA,__thread_data,thread_local_regular");
+        if (align > 1) {
+            a64_emit(".p2align %d", a64_log2_of(align));
+        }
+        peep_flush();
+        fprintf(a64_cg_out, "_%s.tlv.init:\n", name);
+        return;
+    }
     a64_emit(zero ? ".bss" : ".data");
     if (is_global) {
         a64_emit(".globl _%s", name);
@@ -1106,7 +1133,8 @@ static int a64_is_leaf(void) {
     }
     for (i = 0; i < a64_F->ninsts; i++) {
         const IRInst *ins = &a64_F->insts[i];
-        if (ir_clobbers_registers(a64_F, ins) || ins->op == IR_ADDR_LOCAL || ins->op == IR_ALLOCA || ins->op == IR_VASTART
+        if (ir_clobbers_registers(a64_F, ins) || ins->op == IR_ADDR_LOCAL || ins->op == IR_ALLOCA || ins->op == IR_SPRESTORE
+                || ins->op == IR_VASTART
                 || ins->op == IR_VAARG) {
             return 0;
         }
@@ -1428,7 +1456,8 @@ static int a64_tail_call(int index, const IRCall *c, size_t nstack) {
         return 0;
     }
     for (i = 0; i < a64_F->ninsts; i++) {
-        if (a64_F->insts[i].op == IR_ADDR_LOCAL || a64_F->insts[i].op == IR_ALLOCA || a64_F->insts[i].op == IR_VASTART) {
+        if (a64_F->insts[i].op == IR_ADDR_LOCAL || a64_F->insts[i].op == IR_ALLOCA || a64_F->insts[i].op == IR_SPRESTORE
+                || a64_F->insts[i].op == IR_VASTART) {
             return 0;
         }
     }
@@ -1853,6 +1882,19 @@ static int a64_select_inst(int index, int next_block) {
             a64_def_done_x(i->dst, d);
             return 0;
 
+        case IR_TLS_ADDR:
+            /* the descriptor's address, then a call to its thunk with it in x0, which returns the variable's */
+            d = a64_def_reg(i->dst, 11);
+            a64_emit("adrp x0, _%s@TLVPPAGE", i->sym);
+            a64_emit("ldr x0, [x0, _%s@TLVPPAGEOFF]", i->sym);
+            a64_emit("ldr x16, [x0]");
+            a64_emit("blr x16");
+            if (d != 0) {
+                a64_emit("mov x%d, x0", d);
+            }
+            a64_def_done_x(i->dst, d);
+            return 0;
+
         case IR_ADDR_STRING:
             d = a64_def_reg(i->dst, 11);
             a64_emit("adrp x%d, L.str.%ld@PAGE", d, i->imm);
@@ -2131,6 +2173,17 @@ static int a64_select_inst(int index, int next_block) {
             a64_def_done_x(i->dst, d);
             return 0;
 
+        case IR_SPSAVE:
+            d = a64_def_reg(i->dst, 11);
+            a64_emit("mov x%d, sp", d);
+            a64_def_done_x(i->dst, d);
+            return 0;
+
+        case IR_SPRESTORE:
+            a = a64_use_x(i->a, 9);
+            a64_emit("mov sp, x%d", a);
+            return 0;
+
         case IR_BR:
             a64_branch_to((int)i->imm, next_block);
             return 0;
@@ -2304,7 +2357,7 @@ static void a64_cg_select(IRFunc *f) {
     sp_disp = 0;
     sp_known = 1;
     for (i = 0; i < f->ninsts; i++) {
-        if (f->insts[i].op == IR_ALLOCA) {
+        if (f->insts[i].op == IR_ALLOCA || f->insts[i].op == IR_SPRESTORE) {
             sp_known = 0;
         }
     }

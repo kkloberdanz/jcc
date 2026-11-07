@@ -196,6 +196,7 @@ static int x86_64_parse_operand(As *a, const AsmTok *t, size_t *i, AsmOp *op) {
         if (x86_64_is_punct(&t[*i], '@')) {
             if (as_tok_is(&t[*i + 1], "PLT")) mode = SYM_PLT;
             else if (as_tok_is(&t[*i + 1], "GOTPCREL")) mode = SYM_GOTPCREL;
+            else if (as_tok_is(&t[*i + 1], "tlsgd")) mode = SYM_TLSGD;
             else return -1;
             *i += 2;
         }
@@ -203,7 +204,7 @@ static int x86_64_parse_operand(As *a, const AsmTok *t, size_t *i, AsmOp *op) {
             op->kind = OP_MEM;
             op->mode = MEM_SYM;
             op->sym = sym;
-            op->cls = (unsigned char)mode;    /* SYM_PLAIN or SYM_GOTPCREL */
+            op->cls = (unsigned char)mode;    /* SYM_PLAIN, SYM_GOTPCREL or SYM_TLSGD */
             return parse_mem(t, i, op);
         }
         op->kind = OP_SYM;
@@ -399,7 +400,7 @@ static int modrm(As *a, int sec, const AsmItem *it, Enc *e, unsigned regfield, c
             return -1;
         } else {
             if (!dry) {
-                int kind = rm->cls == SYM_GOTPCREL ? (rex ? R_REX_GOTPCRELX : R_GOTPCRELX) : R_PC32;
+                int kind = rm->cls == SYM_GOTPCREL ? (rex ? R_REX_GOTPCRELX : R_GOTPCRELX) : rm->cls == SYM_TLSGD ? R_TLSGD : R_PC32;
                 as_reloc(a, sec, it->off + field, rm->sym, rm->imm - 4 - (long)trailing, kind);
             }
             disp = 0;

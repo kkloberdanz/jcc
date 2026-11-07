@@ -75,6 +75,7 @@ struct Symbol {
     int by_ref;             /* a record parameter passed by reference: the slot holds its address */
     int used;               /* functions: referenced from code that is emitted */
     int addr_taken;         /* functions: referenced other than as the callee of a direct call (by emitted code or an initializer) */
+    int tls;                /* variables: _Thread_local (or __thread), one object per thread */
 };
 
 struct Scope {

@@ -178,15 +178,19 @@ static void x64_cg_end(void) {
 /* data                                                               */
 /* ------------------------------------------------------------------ */
 
-static void x64_cg_data_begin(const char *name, int is_global, size_t align, int zero) {
-    x64_emit(zero ? ".bss" : ".data");
+static void x64_cg_data_begin(const char *name, int is_global, size_t align, int zero, int tls) {
+    if (tls) {
+        x64_emit(zero ? ".section .tbss,\"awT\",@nobits" : ".section .tdata,\"awT\",@progbits");
+    } else {
+        x64_emit(zero ? ".bss" : ".data");
+    }
     if (is_global) {
         x64_emit(".globl %s", name);
     }
     if (align > 1) {
         x64_emit(".p2align %d", x64_log2_of(align));
     }
-    x64_emit(".type %s, @object", name);
+    x64_emit(".type %s, @%s", name, tls ? "tls_object" : "object");
     peep_flush();
     fprintf(x64_cg_out, "%s:\n", name);
 }
@@ -1517,6 +1521,26 @@ static int x64_select_inst(int index, int next_block) {
             def_done_r(i->dst, d);
             return 0;
 
+        case IR_TLS_ADDR:
+            /*
+             * The general dynamic model, in the exact bytes linkers
+             * recognize (data16 leaq; data16 data16 rex64 call), so that
+             * one linking an executable can relax it to a %fs offset; the
+             * JIT loader (src/jit.c) supplies __tls_get_addr itself.
+             */
+            x64_emit(".byte 0x66");
+            x64_emit("leaq %s@tlsgd(%%rip), %%rdi", i->sym);
+            x64_emit(".byte 0x66");
+            x64_emit(".byte 0x66");
+            x64_emit(".byte 0x48");
+            x64_emit("call __tls_get_addr@PLT");
+            d = x64_def_reg(i->dst, RAX);
+            if (d != RAX) {
+                x64_emit("movq %%rax, %s", reg64[d]);
+            }
+            def_done_r(i->dst, d);
+            return 0;
+
         case IR_ADDR_STRING:
             d = x64_def_reg(i->dst, RAX);
             x64_emit("leaq .L.str.%ld(%%rip), %s", i->imm, reg64[d]);
@@ -2027,6 +2051,16 @@ static int x64_select_inst(int index, int next_block) {
             d = x64_def_reg(i->dst, RAX);
             x64_emit("movq %%rsp, %s", reg64[d]);
             def_done_r(i->dst, d);
+            return 0;
+
+        case IR_SPSAVE:
+            d = x64_def_reg(i->dst, RAX);
+            x64_emit("movq %%rsp, %s", reg64[d]);
+            def_done_r(i->dst, d);
+            return 0;
+
+        case IR_SPRESTORE:
+            x64_emit("movq %s, %%rsp", reg64[use_r(i->a, RAX)]);
             return 0;
 
         case IR_BR:

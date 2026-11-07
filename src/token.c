@@ -183,7 +183,12 @@ static const struct Keyword keywords[] = {
     {"__int128", TOK_INT128},
     {"__int128_t", TOK_INT128},
     {"__uint128_t", TOK_UINT128},
-    {"__extension__", TOK_EXTENSION}
+    {"__extension__", TOK_EXTENSION},
+    {"_Generic", TOK_GENERIC},
+    {"_Thread_local", TOK_THREAD_LOCAL},
+    {"__thread", TOK_THREAD_LOCAL},
+    {"_Static_assert", TOK_STATIC_ASSERT},
+    {"_Noreturn", TOK_NORETURN}
 };
 
 TokenKind keyword_kind(const char *word) {

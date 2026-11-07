@@ -147,7 +147,8 @@ static void spec_reset(void);
 static int prev_tok = 0;
 static int bad_token_reported = 0;  /* yylex reported the invalid token itself; yyerror stays quiet */
 static int abort_requested = 0;     /* a helper hit an error it cannot recover from: yylex ends the input */
-static int after_kr_list = 0;   /* the `)` just closed a K&R identifier list: a declaration list may follow */
+static int after_kr_list = 0;
+static int generic_depth = 0;   /* inside _Generic( ... ): `T:` is an association, not a label */   /* the `)` just closed a K&R identifier list: a declaration list may follow */
 
 /*
  * Nodes built by mid-rule actions. Bison runs no %destructor on a
@@ -232,6 +233,7 @@ char *strdup(const char *s);
 
 %token CASE DEFAULT IF ELSE SWITCH WHILE DO FOR GOTO CONTINUE BREAK RETURN
 
+%token GENERIC THREAD_LOCAL STATIC_ASSERT
 %token BUILTIN_VA_LIST BUILTIN_VA_ARG INLINE RESTRICT NULLABILITY INT128 UINT128 BOOL FLOAT16 BUILTIN_OFFSETOF COMPLEX
 %token REAL_OP IMAG_OP
 %token BAD_TOKEN
@@ -255,7 +257,7 @@ char *strdup(const char *s);
     direct_abstract_declarator direct_declarator enum_keyword enum_specifier enum_underlying enum_underlying_list enumerator enumerator_list
     enumerators equality_expression exclusive_or_expression expression expression_statement external_declaration function_body
     function_definition gnu_attribute gnu_attribute_list identifier_list inclusive_or_expression init_declarator init_declarator_list initializer
-    initializer_list iteration_statement jump_statement labeled_statement logical_and_expression logical_or_expression multiplicative_expression
+    braced_initializer generic_assoc generic_assoc_list static_assertion initializer_list iteration_statement jump_statement labeled_statement logical_and_expression logical_or_expression multiplicative_expression
     offsetof_member parameter_declaration parameter_list parameter_type_list pointer postfix_expression 
     primary_expression relational_expression selection_statement shift_expression specifier_qualifier_list statement storage_class_specifier string_literal
     struct_declaration struct_declaration_list struct_declarator struct_declarator_list struct_or_union struct_or_union_keyword struct_or_union_specifier translation_unit
@@ -294,6 +296,46 @@ primary_expression
         {
             /* GNU statement expression: the value is the last expression statement's */
             $$ = ast_stmt(N_STMT_EXPR, @$, NULL, $2);
+        }
+    | GENERIC '('
+        {
+            generic_depth++;
+        }
+      assignment_expression ',' generic_assoc_list ')'
+        {
+            /* C11: sema replaces the node with the association the controlling expression's type selects */
+            generic_depth--;
+            $$ = ast_new(N_GENERIC, @$);
+            $$->u.call.func = $4;
+            $$->u.call.args = $6->u.list;
+            $6->u.list = NULL;
+            ast_free($6);
+        }
+    ;
+
+generic_assoc_list
+    : generic_assoc
+        {
+            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_push(NULL, $1));
+        }
+    | generic_assoc_list ',' generic_assoc
+        {
+            ast_list_push($1->u.list, $3);
+            $$ = $1;
+        }
+    ;
+
+generic_assoc
+    : type_name ':' assignment_expression
+        {
+            $$ = ast_new(N_GENERIC_ASSOC, @$);
+            $$->u.cast.type = $1;
+            $$->u.cast.expr = $3;
+        }
+    | DEFAULT ':' assignment_expression
+        {
+            $$ = ast_new(N_GENERIC_ASSOC, @$);
+            $$->u.cast.expr = $3;
         }
     ;
 
@@ -355,6 +397,14 @@ postfix_expression
     | postfix_expression DEC_OP
         {
             $$ = ast_unary(@$, OP_POSTDEC, $1);
+        }
+    | '(' type_name ')' braced_initializer
+        {
+            /* C99 compound literal: an unnamed object; sema gives it its storage */
+            $$ = ast_new(N_COMPOUND_LIT, @$);
+            $$->u.cast.type = $2;
+            $$->u.cast.expr = ast_new(N_INIT_DECLARATOR, @4);
+            $$->u.cast.expr->u.init_decl.init = $4;
         }
     ;
 
@@ -748,6 +798,24 @@ declaration
             ast_free($1);
             ast_free($2);
         }
+    | static_assertion
+        {
+            $$ = ast_new(N_DECLARATION, @$);
+            $$->u.decl.specs = ast_list_push(NULL, $1);
+            $$->u.decl.declarators = ast_list_new();
+        }
+    ;
+
+/* C11 `_Static_assert(e, "message");`, and C23's form without the message */
+static_assertion
+    : STATIC_ASSERT '(' constant_expression ',' string_literal ')' ';'
+        {
+            $$ = ast_binary(N_STATIC_ASSERT, @$, OP_NOP, $3, $5);
+        }
+    | STATIC_ASSERT '(' constant_expression ')' ';'
+        {
+            $$ = ast_binary(N_STATIC_ASSERT, @$, OP_NOP, $3, NULL);
+        }
     ;
 
 /*
@@ -838,6 +906,11 @@ storage_class_specifier
         {
             $$ = ast_new(N_STORAGE_CLASS, @$);
             $$->u.storage = STORAGE_INLINE;
+        }
+    | THREAD_LOCAL
+        {
+            $$ = ast_new(N_STORAGE_CLASS, @$);
+            $$->u.storage = STORAGE_THREAD;
         }
     | EXTERN
         {
@@ -1084,14 +1157,11 @@ attribute_list
         }
     ;
 
+/* may be empty: a GNU struct with no members has size 0 */
 struct_declaration_list
-    : struct_declaration
+    : /* empty */
         {
-            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_push(NULL, $1));
-        }
-    | pragma struct_declaration
-        {
-            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_push(NULL, $2));
+            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_new());
         }
     | struct_declaration_list struct_declaration
         {
@@ -1135,6 +1205,12 @@ struct_declaration
             $$->u.decl.declarators = ast_list_new();
             $1->u.list = NULL;
             ast_free($1);
+        }
+    | static_assertion
+        {
+            $$ = ast_new(N_STRUCT_DECLARATION, @$);
+            $$->u.decl.specs = ast_list_push(NULL, $1);
+            $$->u.decl.declarators = ast_list_new();
         }
     ;
 
@@ -1830,6 +1906,18 @@ initializer
         {
             $$ = $1;
         }
+    | braced_initializer
+        {
+            $$ = $1;
+        }
+    ;
+
+/* `{ ... }`; C23 and GNU allow it empty, which zeroes the object */
+braced_initializer
+    : '{' '}'
+        {
+            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_new());
+        }
     | '{' initializer_list '}'
         {
             $$ = $2;
@@ -2264,7 +2352,7 @@ static int translate_tok(const Token *tok) {
              * unnamed bit-field of type T.
              */
             if (current_token->next && current_token->next->tok.kind == TOK_COLON
-                    && symtab->current->kind != SCOPE_STRUCT) {
+                    && symtab->current->kind != SCOPE_STRUCT && !generic_depth) {
                 return IDENTIFIER;
             }
             return TYPE_NAME;
@@ -2375,6 +2463,14 @@ static int translate_tok(const Token *tok) {
             return COMPLEX;
         case TOK_BUILTIN_OFFSETOF:
             return BUILTIN_OFFSETOF;
+        case TOK_GENERIC:
+            return GENERIC;
+        case TOK_THREAD_LOCAL:
+            return THREAD_LOCAL;
+        case TOK_STATIC_ASSERT:
+            return STATIC_ASSERT;
+        case TOK_NORETURN:
+            return ATTRIBUTE;   /* C11 `_Noreturn`: a function specifier with no effect on the code, kept as an attribute */
         case TOK_EXTENSION:
             /* dropped by the lexer */
             return -1;
@@ -2494,6 +2590,7 @@ static AST *token_value(const Token *tok, Loc loc) {
         case TOK_ATTRIBUTE:
         case TOK_ASM:
         case TOK_PRAGMA:
+        case TOK_NORETURN:
             return ast_text(N_ATTRIBUTE, loc, strdup(tok->repr));
         default:
             return NULL;
@@ -2535,6 +2632,10 @@ static int yylex(void) {
     yylloc.line = current_token->tok.lineno;
     yylloc.col = current_token->tok.col;
     yylval = token_value(&current_token->tok, yylloc);
+    if (tok == ATTRIBUTE && strstr(current_token->tok.repr, "vector_size")) {
+        /* ignoring it would turn vector arithmetic into scalar arithmetic */
+        diag_error(token_loc(), "vector types (__attribute__((vector_size))) are not supported");
+    }
     if (yylval && current_token->tok.kind == TOK_ID) {
         /* an identifier refers to whatever is in scope where it appears */
         yylval->sym = ident_sym;
@@ -2848,6 +2949,7 @@ AST *parse(const char *text, SymTab *st) {
     spec_stack[0] = 0;
     prev_tok = 0;
     after_kr_list = 0;
+    generic_depth = 0;
     bad_token_reported = 0;
     abort_requested = 0;
     function_body_pending = 0;

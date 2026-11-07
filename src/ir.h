@@ -102,6 +102,9 @@ typedef enum IRType {
     X(IR_CTZ, "ctz") \
     X(IR_FENCE, "fence") \
     X(IR_ALLOCA, "alloca")          /* dst:i64 = sp after taking a bytes (rounded up to 16) */ \
+    X(IR_SPSAVE, "spsave")          /* dst:i64 = sp (a variable length array's allocation point) */ \
+    X(IR_SPRESTORE, "sprestore")    /* sp = a, a value spsave gave: frees what was allocated since */ \
+    X(IR_TLS_ADDR, "tlsaddr")       /* dst:i64 = this thread's address of the thread-local `sym` (IRF_EXTERN as for addr_global); the backends call the runtime, so it clobbers registers like a call */ \
     /* control; every block ends in one of these five */ \
     X(IR_BR, "br")                  /* to block imm */ \
     X(IR_CONDBR, "condbr")          /* a != 0: block imm, else block aux */ \

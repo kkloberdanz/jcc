@@ -389,6 +389,7 @@ int ir_clobbers_registers(const IRFunc *f, const IRInst *i) {
     UNUSED_F(f);
     switch (i->op) {
         case IR_CALL:
+        case IR_TLS_ADDR:
             return 1;
         case IR_SDIV:
         case IR_UDIV:
@@ -517,7 +518,7 @@ static void dump_inst(const IRFunc *f, const IRInst *i, FILE *out) {
         }
         return;
     }
-    if (i->op == IR_ADDR_GLOBAL) {
+    if (i->op == IR_ADDR_GLOBAL || i->op == IR_TLS_ADDR) {
         fprintf(out, " %s%s", i->sym, i->flags & IRF_EXTERN ? " (extern)" : "");
         return;
     }

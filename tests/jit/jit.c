@@ -7,12 +7,15 @@
  * a host function and a host variable through the resolver; two modules
  * at once, the second calling the first; the errors (an undefined
  * symbol, a non-object, a compile error) and that the compiler works
- * after them; an object from the host's assembler (-fexternal-as); and
- * that loading and unloading a hundred times does not grow the process
+ * after them; an object from the host's assembler (-fexternal-as);
+ * thread-local variables, which each thread sees its own copy of, and
+ * one the module does not define, which is refused; and that loading
+ * and unloading a hundred times does not grow the process
  * (not measured under ASan). Each case runs at -O0 and -O1. Built and run by
  * tests/jit.sh (make test), natively on each host; the units include no
  * headers, so that the Linux run needs no header paths.
  */
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,6 +137,33 @@ static const char unit_rich[] =
     "}\n"
     "int via_host(int a) { host_counter++; return host_add(a, seeded); }\n";
 
+static const char unit_tls[] =
+    "_Thread_local int tcount = 10;\n"
+    "static __thread int hidden;\n"
+    "__thread long zeros[4];\n"
+    "int tls_bump(int by) { tcount += by; hidden++; zeros[3] += by; return tcount * 100 + hidden; }\n"
+    "long tls_zeros(void) { return zeros[3]; }\n"
+    "int *tls_where(void) { return &tcount; }\n";
+
+/* what a second thread sees of the module's thread-local variables */
+typedef struct TlsRun {
+    int (*bump)(int);
+    long (*zeros)(void);
+    int *(*where)(void);
+    int first, second;
+    long z;
+    int *addr;
+} TlsRun;
+
+static void *tls_thread(void *arg) {
+    TlsRun *t = arg;
+    t->first = t->bump(5);
+    t->second = t->bump(5);
+    t->z = t->zeros();
+    t->addr = t->where();
+    return NULL;
+}
+
 static const char unit_first[] = "int base_value(void) { return 1000; }\n";
 static const char unit_second[] =
     "int base_value(void);\n"
@@ -198,6 +228,32 @@ static void run_cases(void) {
         jcc_jit_unload(j);
     }
 
+    /* thread-local variables: a copy per thread, starting from the initial values */
+    j = jcc_compile_to_jit(k, "tls.c", unit_tls);
+    check(j != NULL && seen.n == 0, "a unit with thread-local variables loads");
+    if (!j && seen.n) {
+        printf("    %s\n", seen.message);
+    }
+    if (j) {
+        TlsRun t;
+        pthread_t th;
+        memset(&t, 0, sizeof(t));
+        t.bump = (int (*)(int))jcc_jit_symbol(j, "tls_bump");
+        t.zeros = (long (*)(void))jcc_jit_symbol(j, "tls_zeros");
+        t.where = (int *(*)(void))jcc_jit_symbol(j, "tls_where");
+        check(t.bump && t.zeros && t.where && jcc_jit_symbol(j, "tcount") == NULL,
+              "its functions are found, its thread-local variables are not exported");
+        if (t.bump && t.zeros && t.where) {
+            int mine = t.bump(1);
+            check(mine == 1101, "the first thread starts from the initial values");
+            ok = pthread_create(&th, NULL, tls_thread, &t) == 0 && pthread_join(th, NULL) == 0;
+            check(ok && t.first == 1501 && t.second == 2002 && t.z == 10, "a second thread has its own copy");
+            check(t.bump(1) == 1202 && t.zeros() == 2, "the first thread's copy is untouched by it");
+            check(ok && t.addr != t.where(), "the two copies are at different addresses");
+        }
+        jcc_jit_unload(j);
+    }
+
     /* two modules, the second resolved against the first */
     first = jcc_compile_to_jit(k, "first.c", unit_first);
     host.other = first;
@@ -216,6 +272,10 @@ static void run_cases(void) {
     j = jcc_compile_to_jit(k, "undef.c", "int nosuch_function(void);\nint f(void) { return nosuch_function(); }\n");
     check(j == NULL && seen.n == 1 && strstr(seen.message, "nosuch_function") != NULL && jcc_errors(k) == 1,
           "an undefined symbol is reported by name");
+    seen.n = 0;
+    j = jcc_compile_to_jit(k, "tlsext.c", "extern _Thread_local int host_tls;\nint f(void) { return host_tls; }\n");
+    check(j == NULL && seen.n == 1 && strstr(seen.message, "host_tls") != NULL,
+          "a thread-local variable the module does not define is refused by name");
     seen.n = 0;
     j = jcc_jit_load(k, "not an object at all", 20);
     check(j == NULL && seen.n == 1 && jcc_errors(k) == 1, "a buffer that is no object is refused");

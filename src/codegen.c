@@ -290,6 +290,13 @@ static int static_lvalue(AST *e, Addr *a) {
             a->name = xstrdup(codegen_sym_name(e->sym));
             return 1;
 
+        case N_COMPOUND_LIT:
+            if (!e->sym) {
+                return 0;
+            }
+            a->name = xstrdup(codegen_sym_name(e->sym));
+            return 1;
+
         case N_STRING:
             a->label = codegen_add_string(e);
             return 1;
@@ -405,9 +412,17 @@ static void add_float_piece(long off, Type *t, long double f) {
     pieces[npieces - 1].value = type_float_bits(f, t);
 }
 
+static void gen_initializer(Type *t, AST *init, long off);
+
 static void static_scalar(long off, Type *t, AST *e) {
     long v;
     Addr a;
+
+    if (type_is_record(t) && e->kind == N_COMPOUND_LIT && e->sym) {
+        /* GNU: a static record initialized from a compound literal takes the literal's initializer */
+        gen_initializer(e->sym->type, e->u.cast.expr->u.init_decl.init, off);
+        return;
+    }
 
     if (type_is_complex(t)) {
         long double re, im;
@@ -860,11 +875,11 @@ static void gen_global(Symbol *s) {
     }
     size = type_size(t);
     if (!init) {
-        cg->data_begin(codegen_sym_name(s), s->storage != STORAGE_STATIC, type_align(t), 1);
+        cg->data_begin(codegen_sym_name(s), s->storage != STORAGE_STATIC, type_align(t), 1, s->tls);
         cg->data_zero(size ? size : 1);
         return;
     }
-    cg->data_begin(codegen_sym_name(s), s->storage != STORAGE_STATIC, type_align(t), 0);
+    cg->data_begin(codegen_sym_name(s), s->storage != STORAGE_STATIC, type_align(t), 0, s->tls);
     init_static = 1;
     npieces = 0;
     gen_initializer(t, init, 0);
@@ -887,6 +902,29 @@ void codegen_static_local(Symbol *s) {
  * compiling them all would only bloat the output. Every function with
  * external linkage is a root, as is every file scope initializer.
  */
+static void mark_refs(AST *n);
+
+/* the size expressions of the variable length arrays a declarator chain makes */
+static void mark_vla_refs(AST *d) {
+    for (; d && d->kind != N_DECL_NAME; d = d->u.declarator.inner) {
+        if (d->kind == N_DECL_ARRAY && d->type && type_is_vla(d->type)) {
+            mark_refs(d->type->vla->size);
+        }
+    }
+}
+
+/* a function definition's body, and its parameters' VLA sizes */
+static void mark_function(AST *fdef) {
+    AST *fn = ast_declarator_innermost(fdef->u.func.declarator);
+    size_t i;
+    if (fn && fn->kind == N_DECL_FUNC && !fn->u.declarator.kr) {
+        for (i = 0; i < fn->u.declarator.params->len; i++) {
+            mark_vla_refs(fn->u.declarator.params->items[i]->u.typed.declarator);
+        }
+    }
+    mark_refs(fdef->u.func.body);
+}
+
 static void mark_refs(AST *n) {
     size_t i;
     if (!n) {
@@ -900,7 +938,7 @@ static void mark_refs(AST *n) {
             if (n->sym && n->sym->kind == SYM_FUNCTION && !n->sym->used) {
                 n->sym->used = 1;
                 if (n->sym->def) {
-                    mark_refs(n->sym->def->u.func.body);
+                    mark_function(n->sym->def);
                 }
             }
             break;
@@ -928,7 +966,7 @@ static void mark_refs(AST *n) {
                 if (!f->used) {
                     f->used = 1;
                     if (f->def) {
-                        mark_refs(f->def->u.func.body);
+                        mark_function(f->def);
                     }
                 }
             } else {
@@ -949,7 +987,13 @@ static void mark_refs(AST *n) {
         case N_CAST:
         case N_IMPLICIT_CAST:
         case N_VA_ARG:
+            if (n->kind == N_CAST && n->u.cast.type) {
+                mark_vla_refs(n->u.cast.type->u.typed.declarator);
+            }
             mark_refs(n->u.cast.expr);
+            break;
+        case N_SIZEOF_TYPE:
+            mark_vla_refs(n->u.cast.type->u.typed.declarator);
             break;
         case N_INIT_LIST:
             for (i = 0; i < n->u.list->len; i++) {
@@ -958,6 +1002,9 @@ static void mark_refs(AST *n) {
             break;
         case N_DESIGNATED:
             mark_refs(n->u.desig.init);
+            break;
+        case N_COMPOUND_LIT:
+            mark_refs(n->u.cast.expr->u.init_decl.init);
             break;
         case N_STMT_EXPR:
             mark_refs(n->u.stmt.body);
@@ -969,6 +1016,7 @@ static void mark_refs(AST *n) {
             break;
         case N_DECLARATION:
             for (i = 0; i < n->u.decl.declarators->len; i++) {
+                mark_vla_refs(n->u.decl.declarators->items[i]->u.init_decl.declarator);
                 mark_refs(n->u.decl.declarators->items[i]->u.init_decl.init);
             }
             break;
@@ -1024,7 +1072,7 @@ int codegen(AST *tu, SymTab *symtab, FILE *output) {
         AST *item = tu->u.list->items[i];
         if (item->kind == N_FUNCTION_DEF && item->sym && item->sym->storage != STORAGE_STATIC) {
             item->sym->used = 1;
-            mark_refs(item->u.func.body);
+            mark_function(item);
         }
     }
 

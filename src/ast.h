@@ -78,6 +78,7 @@ typedef enum StorageKind {
     STORAGE_AUTO,
     STORAGE_REGISTER,
     STORAGE_INLINE,
+    STORAGE_THREAD, /* _Thread_local or __thread: combines with static and extern, so sema keeps it apart */
     STORAGE_NONE    /* no storage class specifier; only used on symbols */
 } StorageKind;
 
@@ -113,6 +114,10 @@ typedef enum QualKind {
     X(N_VA_ARG, "VaArg")                /* cast: expr = the va_list, type = the TypeName */ \
     X(N_STMT_EXPR, "StmtExpr")           /* stmt: body = a Compound; GNU `({ ... })` */ \
     X(N_OFFSETOF, "Offsetof")            /* desig: init = the TypeName, path = the member designator */ \
+    X(N_STATIC_ASSERT, "StaticAssert")   /* binary: left = the condition, right = the message (may be NULL); the one specifier of a Declaration with no declarators */ \
+    X(N_GENERIC, "Generic")              /* call: func = the controlling expression, args = GenericAssoc nodes; C11 _Generic */ \
+    X(N_GENERIC_ASSOC, "GenericAssoc")   /* cast: type = the TypeName (NULL for default), expr */ \
+    X(N_COMPOUND_LIT, "CompoundLiteral") /* cast: type = the TypeName, expr = an InitDeclarator holding the braced list; sym = the object when it is static */ \
     /* statements */ \
     X(N_LABEL, "Label")                  /* stmt: name, body */ \
     X(N_CASE, "Case")                    /* stmt: expr, body */ \

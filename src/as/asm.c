@@ -100,6 +100,7 @@ int as_symbol(As *a, const char *s, size_t len) {
     sym->is_func = 0;
     sym->sized = 0;
     sym->is_obj = 0;
+    sym->is_tls = 0;
     sym->is_section = 0;
     sym->off = 0;
     sym->size = 0;
@@ -131,11 +132,11 @@ static AsmItem *add_item(As *a, int kind) {
 static void add_bytes(As *a, const unsigned char *p, size_t n) {
     AsmSection *s = &a->sec[a->cur];
     AsmItem *it;
-    if (a->cur == SEC_BSS) {
+    if (AS_SEC_IS_BSS(a->cur)) {
         size_t i;
         for (i = 0; i < n; i++) {
             if (p[i]) {
-                as_error(a, "non-zero data in .bss");
+                as_error(a, "non-zero data in %s", a->cur == SEC_BSS ? ".bss" : ".tbss");
                 return;
             }
         }
@@ -339,7 +340,7 @@ static int define_symbol(As *a, const char *s, size_t len);
 
 /* enter a section; the first entry gives it its place in the object and its symbol (asm.h, SECSYM_...) */
 static int set_section(As *a, int sec) {
-    static const char *const names[SEC_COUNT] = { ".text", ".data", ".bss", ".rodata", ".note.GNU-stack" };
+    static const char *const names[SEC_COUNT] = { ".text", ".data", ".bss", ".rodata", ".note.GNU-stack", ".tdata", ".tbss", "__thread_vars" };
     a->cur = sec;
     if (!a->sec[sec].used) {
         a->sec[sec].used = 1;
@@ -382,6 +383,25 @@ static int directive(As *a, const AsmTok *t, size_t n) {
         }
         if (n == 2 && as_tok_is(&t[1], ".rodata")) {
             return set_section(a, SEC_RODATA);
+        }
+        /* the thread-local ones: .section __DATA,__thread_data,thread_local_regular (and __thread_vars,thread_local_variables) */
+        if (n == 6 && as_tok_is(&t[1], "__DATA") && t[2].punct == ',' && t[4].punct == ',') {
+            if (as_tok_is(&t[3], "__thread_data") && as_tok_is(&t[5], "thread_local_regular")) {
+                return set_section(a, SEC_TDATA);
+            }
+            if (as_tok_is(&t[3], "__thread_vars") && as_tok_is(&t[5], "thread_local_variables")) {
+                return set_section(a, SEC_TVARS);
+            }
+        }
+        /* .section .tdata,"awT",@progbits and .section .tbss,"awT",@nobits */
+        if (n == 7 && t[2].punct == ',' && t[3].kind == ATOK_STRING && t[3].len == 3 && memcmp(t[3].s, "awT", 3) == 0
+                && t[4].punct == ',' && t[5].punct == '@') {
+            if (as_tok_is(&t[1], ".tdata") && as_tok_is(&t[6], "progbits")) {
+                return set_section(a, SEC_TDATA);
+            }
+            if (as_tok_is(&t[1], ".tbss") && as_tok_is(&t[6], "nobits")) {
+                return set_section(a, SEC_TBSS);
+            }
         }
         if (n == 9 && as_tok_is(&t[1], ".note.GNU") && t[2].punct == '-' && as_tok_is(&t[3], "stack") && t[4].punct == ','
                 && t[5].kind == ATOK_STRING && t[5].len == 0 && t[6].punct == ',' && t[7].punct == '@' && as_tok_is(&t[8], "progbits")) {
@@ -426,8 +446,8 @@ static int directive(As *a, const AsmTok *t, size_t n) {
                 i += 2;
             }
             if (i != n) goto junk;
-            if (a->cur == SEC_BSS) {
-                as_error(a, "an address in .bss");
+            if (AS_SEC_IS_BSS(a->cur)) {
+                as_error(a, "an address in %s", a->cur == SEC_BSS ? ".bss" : ".tbss");
                 return -1;
             }
             it = add_item(a, ITEM_ADDR);
@@ -472,6 +492,9 @@ static int directive(As *a, const AsmTok *t, size_t n) {
         } else if (as_tok_is(&t[4], "object")) {
             int sym = as_symbol(a, t[1].s, t[1].len);
             a->syms[sym].is_obj = 1;
+        } else if (as_tok_is(&t[4], "tls_object")) {
+            int sym = as_symbol(a, t[1].s, t[1].len);
+            a->syms[sym].is_tls = 1;
         } else {
             goto junk;
         }
@@ -857,7 +880,7 @@ static void as_emit(As *a) {
     for (sec = 0; sec < SEC_COUNT; sec++) {
         AsmSection *s = &a->sec[sec];
         size_t i;
-        if (!s->used || sec == SEC_BSS || s->size == 0) {
+        if (!s->used || AS_SEC_IS_BSS(sec) || s->size == 0) {
             continue;
         }
         s->out = xrealloc(NULL, s->size);

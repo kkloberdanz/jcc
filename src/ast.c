@@ -248,6 +248,7 @@ void ast_free(AST *ast) {
 
         case N_BINARY:
         case N_ASSIGN:
+        case N_STATIC_ASSERT:
             ast_free(ast->u.binary.left);
             ast_free(ast->u.binary.right);
             break;
@@ -260,6 +261,7 @@ void ast_free(AST *ast) {
             break;
 
         case N_CALL:
+        case N_GENERIC:
             ast_free(ast->u.call.func);
             ast_list_free(ast->u.call.args);
             break;
@@ -279,6 +281,8 @@ void ast_free(AST *ast) {
         case N_SIZEOF_TYPE:
         case N_VA_ARG:
         case N_IMPLICIT_CAST:
+        case N_COMPOUND_LIT:
+        case N_GENERIC_ASSOC:
             ast_free(ast->u.cast.type);
             ast_free(ast->u.cast.expr);
             break;
@@ -428,6 +432,7 @@ const char *storage_name(StorageKind storage) {
         case STORAGE_AUTO: return "auto";
         case STORAGE_REGISTER: return "register";
         case STORAGE_INLINE: return "inline";
+        case STORAGE_THREAD: return "_Thread_local";
         case STORAGE_NONE: return "none";
     }
     return "?";
@@ -625,6 +630,7 @@ static void dump_node(FILE *out, int depth, const char *label, const AST *ast) {
 
         case N_BINARY:
         case N_ASSIGN:
+        case N_STATIC_ASSERT:
             dump_node(out, d, NULL, ast->u.binary.left);
             dump_node(out, d, NULL, ast->u.binary.right);
             break;
@@ -639,6 +645,7 @@ static void dump_node(FILE *out, int depth, const char *label, const AST *ast) {
             break;
 
         case N_CALL:
+        case N_GENERIC:
             dump_node(out, d, "func", ast->u.call.func);
             dump_list(out, d, "args", ast->u.call.args);
             break;
@@ -654,6 +661,8 @@ static void dump_node(FILE *out, int depth, const char *label, const AST *ast) {
 
         case N_CAST:
         case N_VA_ARG:
+        case N_COMPOUND_LIT:
+        case N_GENERIC_ASSOC:
             dump_node(out, d, "type", ast->u.cast.type);
             dump_node(out, d, NULL, ast->u.cast.expr);
             break;

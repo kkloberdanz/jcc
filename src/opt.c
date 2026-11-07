@@ -2451,7 +2451,7 @@ static int opt_thread(void) {
 static int opt_removable(const IRInst *i) {
     switch (i->op) {
         case IR_STORE: case IR_STOREBITS: case IR_COPY: case IR_ZERO: case IR_CALL: case IR_VASTART: case IR_VAARG:
-        case IR_FENCE: case IR_ALLOCA: case IR_BR: case IR_CONDBR: case IR_RET: case IR_UNREACHABLE: case IR_SWITCH:
+        case IR_FENCE: case IR_ALLOCA: case IR_SPRESTORE: case IR_BR: case IR_CONDBR: case IR_RET: case IR_UNREACHABLE: case IR_SWITCH:
             return 0;
         case IR_LOAD:
         case IR_LOADBITS:
@@ -3866,7 +3866,8 @@ static IRFunc *opt_inlinable(const IRInst *call, int caller_size) {
     }
     for (k = 0; k < ce->ninsts; k++) {
         const IRInst *i = &ce->insts[k];
-        if (i->op == IR_VASTART || i->op == IR_ALLOCA || (i->op == IR_RET && (i->flags & IRF_RECORD))) {
+        if (i->op == IR_VASTART || i->op == IR_ALLOCA || i->op == IR_SPSAVE || i->op == IR_SPRESTORE
+                || (i->op == IR_RET && (i->flags & IRF_RECORD))) {
             return NULL;
         }
         if (i->op == IR_RET && call->dst >= 0 && i->a >= 0 && ce->vregs[i->a].type != opt_vtype(call->dst)) {
@@ -3969,6 +3970,7 @@ static void opt_inline_call(int b, int j, IRFunc *ce) {
                     ins.imm -= fbase;
                     break;
                 case IR_ADDR_GLOBAL:
+                case IR_TLS_ADDR:
                     ins.sym = ir_name(opt_F, ins.sym);
                     break;
                 case IR_VAARG:

@@ -110,8 +110,8 @@ typedef struct Backend {
     void (*begin)(FILE *out);
     void (*end)(void);
 
-    /* initialized and zero data; `name` is the C name, the backend decorates it */
-    void (*data_begin)(const char *name, int is_global, size_t align, int zero);
+    /* initialized and zero data; `name` is the C name, the backend decorates it; `tls`: one copy per thread */
+    void (*data_begin)(const char *name, int is_global, size_t align, int zero, int tls);
     void (*data_int)(size_t size, long value);
     void (*data_addr)(const char *name, long addend);
     void (*data_string_addr)(int label, long addend);

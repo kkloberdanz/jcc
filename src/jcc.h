@@ -100,10 +100,15 @@ int jcc_warnings(const Jcc *k);
  * jcc_jit_unload, independently of the Jcc that loaded it (jcc_free
  * does not unload it), and any number can be loaded at once.
  *
- * Not supported in a module: thread-local storage, common symbols, and
- * unwinding through its frames (no unwind tables are registered). A
- * macOS host with the hardened runtime needs the
- * com.apple.security.cs.allow-jit entitlement.
+ * A module's thread-local variables (_Thread_local, __thread) work: each
+ * thread gets its own copy on first use, freed when the thread exits.
+ * They are not returned by jcc_jit_symbol (their address differs per
+ * thread), and a module cannot reach one the host defines.
+ *
+ * Not supported in a module: common symbols, and unwinding through its
+ * frames (no unwind tables are registered). A macOS host with the
+ * hardened runtime needs the com.apple.security.cs.allow-jit
+ * entitlement.
  */
 typedef struct JccJit JccJit;
 

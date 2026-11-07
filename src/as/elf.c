@@ -29,15 +29,18 @@
 #define SHF_ALLOC 2
 #define SHF_EXECINSTR 4
 #define SHF_INFO_LINK 0x40
+#define SHF_TLS 0x400
 #define STB_GLOBAL 1
 #define STT_OBJECT 1
 #define STT_FUNC 2
 #define STT_SECTION 3
+#define STT_TLS 6
 
 enum {
     R_X86_64_64 = 1,
     R_X86_64_PC32 = 2,
     R_X86_64_PLT32 = 4,
+    R_X86_64_TLSGD = 19,
     R_X86_64_GOTPCRELX = 41,
     R_X86_64_REX_GOTPCRELX = 42
 };
@@ -145,6 +148,7 @@ static int elf_relocs(As *a, AsmSection *s, const int *secsym, ESec *m, char *us
             case R_PLT32: out->type = R_X86_64_PLT32; break;
             case R_GOTPCRELX: out->type = R_X86_64_GOTPCRELX; break;
             case R_REX_GOTPCRELX: out->type = R_X86_64_REX_GOTPCRELX; break;
+            case R_TLSGD: out->type = R_X86_64_TLSGD; break;
             default:
                 as_error(a, "relocation kind %d is not for ELF", r->kind);
                 return -1;
@@ -233,10 +237,15 @@ int elf_write(As *a, char **out, size_t *out_len) {
             case SEC_BSS: name = ".bss"; h->flags = SHF_ALLOC | SHF_WRITE; break;
             case SEC_RODATA: name = ".rodata"; h->flags = SHF_ALLOC; break;
             case SEC_NOTE: name = ".note.GNU-stack"; h->flags = 0; break;
+            case SEC_TDATA: name = ".tdata"; h->flags = SHF_ALLOC | SHF_WRITE | SHF_TLS; break;
+            case SEC_TBSS: name = ".tbss"; h->flags = SHF_ALLOC | SHF_WRITE | SHF_TLS; break;
+            default:
+                as_error(a, "a section ELF has no name for");
+                goto done;
         }
         h->name = strtab.len;
         elf_put(&strtab, name, strlen(name) + 1);
-        h->type = m->kind == SEC_BSS ? SHT_NOBITS : SHT_PROGBITS;
+        h->type = AS_SEC_IS_BSS(m->kind) ? SHT_NOBITS : SHT_PROGBITS;
         h->size = s->size;
         h->addralign = 1ul << s->p2align;
         if (m->kind == SEC_TEXT && h->addralign < 4) {
@@ -305,7 +314,7 @@ int elf_write(As *a, char **out, size_t *out_len) {
         Shdr *h = &hdrs[m->index];
         align(&b, h->addralign);
         h->off = b.len;
-        if (m->kind != SEC_BSS && s->size) {
+        if (!AS_SEC_IS_BSS(m->kind) && s->size) {
             elf_put(&b, s->out, s->size);
         }
     }
@@ -327,7 +336,7 @@ int elf_write(As *a, char **out, size_t *out_len) {
             } else {
                 put_int(&b, strtab.len, 4);
                 elf_put(&strtab, s->name, strlen(s->name) + 1);
-                type = s->is_func ? STT_FUNC : s->is_obj ? STT_OBJECT : 0;
+                type = s->is_tls ? STT_TLS : s->is_func ? STT_FUNC : s->is_obj ? STT_OBJECT : 0;
             }
             put_int(&b, (unsigned long)((k ? STB_GLOBAL : 0) << 4 | type), 1);
             put_int(&b, 0, 1);              /* st_other */

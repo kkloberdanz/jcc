@@ -30,11 +30,35 @@
  * entitlement for MAP_JIT.
  *
  * What an object may contain is what the backends emit plus a little
- * slack for clang's objects: no thread-local storage, no common
- * symbols, and unwind sections (__eh_frame, __compact_unwind) are not
- * loaded, so a debugger cannot unwind through the module's frames.
+ * slack for clang's objects: no common symbols, and unwind sections
+ * (__eh_frame, __compact_unwind) are not loaded, so a debugger cannot
+ * unwind through the module's frames.
+ *
+ * Thread-local storage. The module's thread-local sections (ELF .tdata
+ * and .tbss, Mach-O __thread_data and __thread_bss) are laid out at the
+ * end of the data part as one image, which is never written once
+ * relocated: each thread that touches a variable gets its own copy of
+ * it, made on first use and kept under a pthread key of the module's
+ * (freed when the thread exits). The code reaches it the way the
+ * backends emit, with the loader standing in for the runtime: on ELF
+ * the general dynamic model, `leaq x@tlsgd(%rip), %rdi; call
+ * __tls_get_addr`, where the GOT pair holds the module's record and the
+ * variable's offset in the image and __tls_get_addr resolves to
+ * jit_tls_get_addr; on Mach-O the variable's descriptor in
+ * __thread_vars, reached through the GOT (the TLVP relocations), whose
+ * thunk is jit_tlv_thunk and whose key word holds the record. Both are
+ * ordinary C functions, so the code calling them must treat the call
+ * as clobbering what a call does (jcc's does; clang's Mach-O code
+ * assumes the thunk saves more). Only variables the module defines can
+ * be reached this way; one defined by the host is refused, and so are
+ * the other ELF models (initial and local exec, local dynamic).
+ * Thread-local variables are not among the module's exports, since
+ * their addresses differ per thread. Unloading frees the calling
+ * thread's copy; copies other threads still hold are freed when those
+ * threads exit.
  */
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -57,7 +81,7 @@ void sys_icache_invalidate(void *start, size_t len);
 /* the object, read into one form for both formats                    */
 /* ------------------------------------------------------------------ */
 
-typedef enum JitKind { JIT_SKIP, JIT_CODE, JIT_CONST, JIT_DATA } JitKind;
+typedef enum JitKind { JIT_SKIP, JIT_CODE, JIT_CONST, JIT_DATA, JIT_TLS } JitKind;
 
 typedef struct JitSec {
     JitKind kind;
@@ -67,6 +91,7 @@ typedef struct JitSec {
     unsigned long objaddr;          /* Mach-O: its address in the object, which symbols are relative to */
     unsigned long reloff;           /* Mach-O: where its relocations are, and how many */
     unsigned long nreloc;
+    int tvars;                      /* Mach-O __thread_vars: thread-local variables' descriptors */
     unsigned char *addr;            /* where it was loaded; NULL when skipped */
 } JitSec;
 
@@ -80,6 +105,7 @@ typedef struct JitSym {
     int weak;                       /* undefined and weak: 0 when nothing has it */
     int used;                       /* a relocation names it */
     long got;                       /* its GOT slot's offset in the const part, or -1 */
+    long tlsgd;                     /* ELF: its TLS GOT pair's offset after the GOT, or -1 */
     long stub;                      /* its stub's offset in the code part, or -1 */
     unsigned char *addr;
 } JitSym;
@@ -95,7 +121,10 @@ typedef enum JitRelKind {
     JIT_R_PAGE21,                   /* arm64 adrp of S + A */
     JIT_R_PAGEOFF12,                /* arm64 add/ldr/str low 12 bits of S + A */
     JIT_R_GOT_PAGE21,               /* adrp of G */
-    JIT_R_GOT_PAGEOFF12             /* ldr low 12 bits of G */
+    JIT_R_GOT_PAGEOFF12,            /* ldr low 12 bits of G */
+    JIT_R_TLVP_PAGE21,              /* Mach-O: adrp of G, the slot holding a thread-local variable's descriptor */
+    JIT_R_TLVP_PAGEOFF12,           /* ldr low 12 bits of that G */
+    JIT_R_TLSGD                     /* ELF: T + A - P, T the symbol's TLS GOT pair */
 } JitRelKind;
 
 typedef struct JitRel {
@@ -126,13 +155,66 @@ typedef struct JitExport {
     void *addr;
 } JitExport;
 
+/*
+ * A module's thread-local storage: the image every thread's copy starts
+ * as, and the key a thread's copy is kept under. A descriptor's key
+ * word (Mach-O) or a GOT pair's first word (ELF) points here.
+ */
+typedef struct JitTls {
+    pthread_key_t key;
+    const unsigned char *image;
+    unsigned long size;
+    unsigned long align;
+} JitTls;
+
+/* an ELF TLS GOT pair, as __tls_get_addr receives it */
+typedef struct JitTlsIndex {
+    JitTls *tls;
+    unsigned long off;
+} JitTlsIndex;
+
+/* a Mach-O thread-local variable's descriptor, as its thunk receives it */
+typedef struct JitTlv {
+    void *thunk;
+    JitTls *tls;
+    unsigned char *init;            /* the variable in the image */
+} JitTlv;
+
 struct JccJit {
     unsigned char *base;
     size_t size;
     JitExport *exports;             /* sorted by name */
     size_t nexports;
     char *names;
+    JitTls *tls;                    /* NULL without thread-local storage */
 };
+
+/* the calling thread's copy of a module's thread-local storage, made on first use */
+static unsigned char *jit_tls_block(JitTls *t) {
+    void *b = pthread_getspecific(t->key);
+    if (!b) {
+        /* out of memory here has no way to report: the access faults on the null pointer */
+        if (posix_memalign(&b, t->align < sizeof(void *) ? sizeof(void *) : t->align, t->size ? t->size : 1) != 0) {
+            return NULL;
+        }
+        memcpy(b, t->image, t->size);
+        if (pthread_setspecific(t->key, b) != 0) {
+            free(b);
+            return NULL;
+        }
+    }
+    return b;
+}
+
+/* ELF: what a module's `call __tls_get_addr` reaches */
+static void *jit_tls_get_addr(JitTlsIndex *ti) {
+    return jit_tls_block(ti->tls) + ti->off;
+}
+
+/* Mach-O: what a module's descriptors' thunk word holds */
+static void *jit_tlv_thunk(JitTlv *d) {
+    return jit_tls_block(d->tls) + (d->init - d->tls->image);
+}
 
 static const Loc jit_noloc = { NULL, 0, 0 };
 
@@ -234,9 +316,8 @@ static int jit_macho_relocs(JitObj *o, int sec, const int *secmap, unsigned long
             case 4: kind = JIT_R_PAGEOFF12; break;
             case 5: kind = JIT_R_GOT_PAGE21; break;
             case 6: kind = JIT_R_GOT_PAGEOFF12; break;
-            case 8: case 9:
-                diag_error(jit_noloc, "thread-local storage is not supported in a loaded module");
-                return -1;
+            case 8: kind = JIT_R_TLVP_PAGE21; break;
+            case 9: kind = JIT_R_TLVP_PAGEOFF12; break;
             default:
                 diag_error(jit_noloc, "Mach-O relocation type %lu is not supported in a loaded module", type);
                 return -1;
@@ -331,18 +412,23 @@ static int jit_macho(JitObj *o) {
                     if (jit_name16(h, "__eh_frame")) {
                         continue;
                     }
-                    if (type >= 0x11 && type <= 0x15) {
-                        diag_error(jit_noloc, "thread-local storage is not supported in a loaded module");
+                    if (type == 0x14 || type == 0x15) {
+                        diag_error(jit_noloc, "thread-local variable pointers and initializers are not supported in a loaded module");
                         return -1;
                     }
-                    if (flags & 0x80000400ul) {
+                    if (type == 0x11 || type == 0x12) {         /* S_THREAD_LOCAL_REGULAR, S_THREAD_LOCAL_ZEROFILL */
+                        s->kind = JIT_TLS;
+                    } else if (type == 0x13) {                  /* S_THREAD_LOCAL_VARIABLES */
+                        s->kind = JIT_DATA;
+                        s->tvars = 1;
+                    } else if (flags & 0x80000400ul) {
                         s->kind = JIT_CODE;
                     } else if (jit_name16(h + 16, "__TEXT")) {
                         s->kind = JIT_CONST;
                     } else {
                         s->kind = JIT_DATA;
                     }
-                    if (type == 1 || type == 0xc) {   /* S_ZEROFILL, S_GB_ZEROFILL */
+                    if (type == 1 || type == 0xc || type == 0x12) {   /* S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL */
                         s->bytes = NULL;
                     } else if (jit_within(o, jit_rd32(h + 48), s->size)) {
                         s->bytes = p + jit_rd32(h + 48);
@@ -389,6 +475,7 @@ static int jit_macho(JitObj *o) {
         }
         s->name = (const char *)p + stroff + strx;
         s->got = -1;
+        s->tlsgd = -1;
         s->stub = -1;
         if (type & 0xe0) {          /* a debugging entry */
             s->sec = JIT_ABS;
@@ -493,11 +580,7 @@ static int jit_elf(JitObj *o) {
         if (!(flags & 2)) {         /* SHF_ALLOC */
             continue;
         }
-        if (flags & 0x400) {        /* SHF_TLS */
-            diag_error(jit_noloc, "thread-local storage is not supported in a loaded module");
-            return -1;
-        }
-        s->kind = flags & 4 ? JIT_CODE : flags & 1 ? JIT_DATA : JIT_CONST;
+        s->kind = flags & 0x400 ? JIT_TLS : flags & 4 ? JIT_CODE : flags & 1 ? JIT_DATA : JIT_CONST;   /* SHF_TLS */
         if (type == 8) {            /* SHT_NOBITS */
             s->bytes = NULL;
         } else if (jit_within(o, off, s->size)) {
@@ -523,6 +606,7 @@ static int jit_elf(JitObj *o) {
         s->value = jit_rd64(e + 8);
         s->global = bind == 1 || bind == 2;
         s->got = -1;
+        s->tlsgd = -1;
         s->stub = -1;
         if (shndx == 0) {
             s->sec = JIT_UNDEF;
@@ -574,8 +658,9 @@ static int jit_elf(JitObj *o) {
                 case 9: case 41: case 42: kind = JIT_R_GOTPCREL; break;   /* GOTPCREL, GOTPCRELX, REX_GOTPCRELX */
                 case 10: kind = JIT_R_ABS32; break;
                 case 11: kind = JIT_R_ABS32S; break;
-                case 19: case 20: case 21: case 22: case 23:
-                    diag_error(jit_noloc, "thread-local storage is not supported in a loaded module");
+                case 19: kind = JIT_R_TLSGD; break;
+                case 16: case 17: case 18: case 20: case 21: case 22: case 23:
+                    diag_error(jit_noloc, "thread-local storage is supported in a loaded module only in the general dynamic model (relocation type %lu)", rtype);
                     return -1;
                 default:
                     diag_error(jit_noloc, "ELF relocation type %lu is not supported in a loaded module", rtype);
@@ -626,7 +711,7 @@ static int jit_by_name(const void *x, const void *y) {
 }
 
 /* patch one relocation; P, S, G and L as in the ELF psABI */
-static int jit_apply(const JitObj *o, const JitRel *r, unsigned char *code, unsigned char *cnst) {
+static int jit_apply(const JitObj *o, const JitRel *r, unsigned char *code, unsigned char *cnst, unsigned char *tlsgd) {
     unsigned char *at = o->secs[r->sec].addr + r->off;
     unsigned long P = (unsigned long)at;
     unsigned long S;
@@ -640,6 +725,9 @@ static int jit_apply(const JitObj *o, const JitRel *r, unsigned char *code, unsi
         name = jit_cname(o, s->name);
         S = (unsigned long)s->addr;
         G = s->got >= 0 ? (unsigned long)(cnst + s->got) : 0;
+        if (r->kind == JIT_R_TLSGD) {
+            G = (unsigned long)(tlsgd + s->tlsgd);
+        }
         L = s->stub >= 0 ? (unsigned long)(code + s->stub) : S;
     } else {
         S = (unsigned long)o->secs[r->target].addr;
@@ -666,6 +754,7 @@ static int jit_apply(const JitObj *o, const JitRel *r, unsigned char *code, unsi
         case JIT_R_PC32:
         case JIT_R_PLT32:
         case JIT_R_GOTPCREL:
+        case JIT_R_TLSGD:
             v = (long)((r->kind == JIT_R_PC32 ? S : r->kind == JIT_R_PLT32 ? L : G) + (unsigned long)r->addend - P);
             if (v < -0x80000000l || v > 0x7fffffffl) {
                 break;
@@ -681,6 +770,7 @@ static int jit_apply(const JitObj *o, const JitRel *r, unsigned char *code, unsi
             return 0;
         case JIT_R_PAGE21:
         case JIT_R_GOT_PAGE21:
+        case JIT_R_TLVP_PAGE21:
             v = (long)(((r->kind == JIT_R_PAGE21 ? S + (unsigned long)r->addend : G) & ~0xffful) - (P & ~0xffful)) >> 12;
             if (v < -(1l << 20) || v >= (1l << 20)) {
                 break;
@@ -690,7 +780,8 @@ static int jit_apply(const JitObj *o, const JitRel *r, unsigned char *code, unsi
             jit_wr32(at, insn);
             return 0;
         case JIT_R_PAGEOFF12:
-        case JIT_R_GOT_PAGEOFF12: {
+        case JIT_R_GOT_PAGEOFF12:
+        case JIT_R_TLVP_PAGEOFF12: {
             unsigned long lo = (r->kind == JIT_R_PAGEOFF12 ? S + (unsigned long)r->addend : G) & 0xfff;
             unsigned shift = 0;
             if ((insn & 0x3b000000ul) == 0x39000000ul) {
@@ -723,8 +814,9 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
     JccJit *j = NULL;
     unsigned long pagesize = (unsigned long)sysconf(_SC_PAGESIZE);
     unsigned long code_size = 0, const_size = 0, data_size = 0;
-    unsigned long got_off, stub_off;
-    unsigned long nstubs = 0, ngot = 0, nexports = 0, names_size = 0;
+    unsigned long got_off, stub_off, tlsgd_off;
+    unsigned long tls_start = 0, tls_end = 0, tls_align = 1;
+    unsigned long nstubs = 0, ngot = 0, ntlsgd = 0, nexports = 0, names_size = 0;
     unsigned long pass;
     unsigned char *base;
     unsigned char *code, *cnst, *data;
@@ -759,15 +851,29 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
         return NULL;
     }
 
-    /* a GOT slot for every symbol a GOT relocation names, a stub for every undefined one a call names */
+    /*
+     * A GOT slot for every symbol a GOT relocation names (a TLVP one's
+     * holds the descriptor's address), a TLS pair for every one a TLSGD
+     * names, a stub for every undefined one a call names.
+     */
     for (i = 0; i < o.nrels; i++) {
         const JitRel *r = &o.rels[i];
         JitSym *s = r->sym >= 0 ? &o.syms[r->sym] : NULL;
+        int tlvp = r->kind == JIT_R_TLVP_PAGE21 || r->kind == JIT_R_TLVP_PAGEOFF12;
         if (!s) {
             continue;
         }
-        if ((r->kind == JIT_R_GOTPCREL || r->kind == JIT_R_GOT_PAGE21 || r->kind == JIT_R_GOT_PAGEOFF12) && s->got < 0) {
+        if ((tlvp && (s->sec < 0 || !o.secs[s->sec].tvars)) || (r->kind == JIT_R_TLSGD && (s->sec < 0 || o.secs[s->sec].kind != JIT_TLS))) {
+            diag_error(jit_noloc, "thread-local variable %s is not defined in the module, which can only reach its own",
+                       jit_cname(&o, s->name));
+            jit_free_obj(&o);
+            return NULL;
+        }
+        if ((r->kind == JIT_R_GOTPCREL || r->kind == JIT_R_GOT_PAGE21 || r->kind == JIT_R_GOT_PAGEOFF12 || tlvp) && s->got < 0) {
             s->got = (long)(8 * ngot++);
+        }
+        if (r->kind == JIT_R_TLSGD && s->tlsgd < 0) {
+            s->tlsgd = (long)(16 * ntlsgd++);
         }
         if ((r->kind == JIT_R_PLT32 || r->kind == JIT_R_BRANCH26) && s->sec == JIT_UNDEF && s->stub < 0) {
             s->stub = (long)(16 * nstubs++);
@@ -779,8 +885,18 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
      * `addr` until the mapping exists), the stubs after the code and the
      * GOT after the read-only sections.
      */
-    for (pass = JIT_CODE; pass <= JIT_DATA; pass++) {
+    for (i = 0; i < o.nsecs; i++) {
+        if (o.secs[i].kind == JIT_TLS && o.secs[i].align > tls_align) {
+            tls_align = o.secs[i].align;
+        }
+    }
+    for (pass = JIT_CODE; pass <= JIT_TLS; pass++) {
         unsigned long *size = pass == JIT_CODE ? &code_size : pass == JIT_CONST ? &const_size : &data_size;
+        if (pass == JIT_TLS) {
+            /* the thread-local image, after the data: its start aligned for the strictest of its sections */
+            data_size = jit_round(data_size, tls_align);
+            tls_start = data_size;
+        }
         for (i = 0; i < o.nsecs; i++) {
             JitSec *s = &o.secs[i];
             if (s->kind != (JitKind)pass) {
@@ -791,10 +907,12 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
             *size += s->size;
         }
     }
+    tls_end = data_size;
     stub_off = code_size = jit_round(code_size, 16);
     code_size = jit_round(code_size + 16 * nstubs, pagesize);
     got_off = const_size = jit_round(const_size, 8);
-    const_size = jit_round(const_size + 8 * ngot, pagesize);
+    tlsgd_off = got_off + 8 * ngot;
+    const_size = jit_round(const_size + 8 * ngot + 16 * ntlsgd, pagesize);
     data_size = jit_round(data_size, pagesize);
     if (code_size == 0) {
         code_size = pagesize;       /* a module with no code still gets a mapping to own */
@@ -803,7 +921,7 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
     /* the exports, allocated before the mapping so that running out of memory cannot leak it */
     for (i = 0; i < o.nsyms; i++) {
         const JitSym *s = &o.syms[i];
-        if (s->global && s->sec >= 0) {
+        if (s->global && s->sec >= 0 && o.secs[s->sec].kind != JIT_TLS && !o.secs[s->sec].tvars) {
             nexports++;
             names_size += strlen(jit_cname(&o, s->name)) + 1;
         }
@@ -811,6 +929,21 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
     j = xcalloc(1, sizeof(*j));
     j->exports = xmalloc((nexports + 1) * sizeof(JitExport));
     j->names = xmalloc(names_size + 1);
+    for (i = 0; i < o.nsecs; i++) {
+        if (o.secs[i].kind == JIT_TLS) {
+            j->tls = xcalloc(1, sizeof(JitTls));
+            break;
+        }
+    }
+    if (j->tls && pthread_key_create(&j->tls->key, free) != 0) {
+        diag_error(jit_noloc, "cannot create a key for the module's thread-local storage");
+        free(j->tls);
+        free(j->exports);
+        free(j->names);
+        free(j);
+        jit_free_obj(&o);
+        return NULL;
+    }
 
     /* the mapping */
     j->size = code_size + const_size + data_size;
@@ -827,6 +960,10 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
 #endif
     if (base == MAP_FAILED) {
         diag_error(jit_noloc, "cannot map %lu bytes for the module", (unsigned long)j->size);
+        if (j->tls) {
+            pthread_key_delete(j->tls->key);
+            free(j->tls);
+        }
         free(j->exports);
         free(j->names);
         free(j);
@@ -842,6 +979,11 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
 #endif
 
     /* the sections' contents in place (the mapping starts zeroed, which is the zero-fill) */
+    if (j->tls) {
+        j->tls->image = data + tls_start;
+        j->tls->size = tls_end - tls_start;
+        j->tls->align = tls_align;
+    }
     for (i = 0; i < o.nsecs; i++) {
         JitSec *s = &o.secs[i];
         unsigned char *part = s->kind == JIT_CODE ? code : s->kind == JIT_CONST ? cnst : data;
@@ -864,6 +1006,15 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
             s->addr = (unsigned char *)s->value;
         } else if (s->used) {
             const char *name = jit_cname(&o, s->name);
+            /* the thread-local storage runtime is the loader's own */
+            if (j->tls && !o.macho && strcmp(name, "__tls_get_addr") == 0) {
+                s->addr = (unsigned char *)jit_tls_get_addr;
+                continue;
+            }
+            if (j->tls && o.macho && strcmp(name, "_tlv_bootstrap") == 0) {
+                s->addr = (unsigned char *)jit_tlv_thunk;
+                continue;
+            }
             s->addr = resolve ? resolve(user, name) : NULL;
             if (!s->addr) {
                 s->addr = jit_host_symbol(name);
@@ -883,6 +1034,10 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
             if (s->got >= 0) {
                 jit_wr64(cnst + got_off + (unsigned long)s->got, (unsigned long)s->addr);
             }
+            if (s->tlsgd >= 0) {
+                jit_wr64(cnst + tlsgd_off + (unsigned long)s->tlsgd, (unsigned long)j->tls);
+                jit_wr64(cnst + tlsgd_off + (unsigned long)s->tlsgd + 8, (unsigned long)(s->addr - j->tls->image));
+            }
             if (s->stub < 0) {
                 continue;
             }
@@ -899,8 +1054,23 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
             }
         }
         for (i = 0; i < o.nrels; i++) {
-            if (jit_apply(&o, &o.rels[i], code + stub_off, cnst + got_off) != 0) {
+            if (jit_apply(&o, &o.rels[i], code + stub_off, cnst + got_off, cnst + tlsgd_off) != 0) {
                 errors++;
+            }
+        }
+        /* the Mach-O descriptors: their key word is the module's record */
+        for (i = 0; i < o.nsecs; i++) {
+            unsigned long k;
+            if (!o.secs[i].tvars) {
+                continue;
+            }
+            if (!j->tls) {
+                diag_error(jit_noloc, "thread-local variable descriptors without thread-local data");
+                errors++;
+                break;
+            }
+            for (k = 0; k + 24 <= o.secs[i].size; k += 24) {
+                jit_wr64(o.secs[i].addr + k + 8, (unsigned long)j->tls);
             }
         }
     }
@@ -932,7 +1102,7 @@ JccJit *jit_load(const char *obj, size_t len, JccResolveFn resolve, void *user) 
         for (i = 0; i < o.nsyms; i++) {
             const JitSym *s = &o.syms[i];
             const char *name;
-            if (!s->global || s->sec < 0) {
+            if (!s->global || s->sec < 0 || o.secs[s->sec].kind == JIT_TLS || o.secs[s->sec].tvars) {
                 continue;
             }
             name = jit_cname(&o, s->name);
@@ -966,6 +1136,11 @@ void jcc_jit_unload(JccJit *j) {
     }
     if (j->base) {
         munmap(j->base, j->size);
+    }
+    if (j->tls) {
+        free(pthread_getspecific(j->tls->key));
+        pthread_key_delete(j->tls->key);
+        free(j->tls);
     }
     free(j->exports);
     free(j->names);

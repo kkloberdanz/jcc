@@ -61,7 +61,10 @@ enum {
     SYM_GOTPAGE,    /* name@GOTPAGE */
     SYM_GOTPAGEOFF, /* name@GOTPAGEOFF */
     SYM_PLT,        /* name@PLT */
-    SYM_GOTPCREL    /* name@GOTPCREL */
+    SYM_GOTPCREL,   /* name@GOTPCREL */
+    SYM_TLVPPAGE,   /* Mach-O name@TLVPPAGE: the page of a thread-local variable's descriptor pointer */
+    SYM_TLVPPAGEOFF,/* name@TLVPPAGEOFF */
+    SYM_TLSGD       /* ELF name@tlsgd(%rip): the general dynamic TLS model's GOT pair */
 };
 
 /* OP_MEM modes */
@@ -70,7 +73,7 @@ enum {
     MEM_PRE,        /* arm64 [Xn, #imm]! */
     MEM_POST,       /* arm64 [Xn], #imm */
     MEM_INDEX,      /* arm64 [Xn, Xm]; x86_64 disp(%base, %index, scale) */
-    MEM_SYM,        /* arm64 [Xn, sym@GOTPAGEOFF]; x86_64 sym(%rip) and sym@GOTPCREL(%rip) with `base` the rip marker */
+    MEM_SYM,        /* arm64 [Xn, sym@GOTPAGEOFF] (or @TLVPPAGEOFF, in cls); x86_64 sym(%rip), sym@GOTPCREL(%rip) and sym@tlsgd(%rip) (the SYM_ mode in cls) with `base` the rip marker */
     MEM_INDIRECT    /* x86_64 *%reg: a register operand marked indirect; reg and cls are set */
 };
 
@@ -102,7 +105,16 @@ typedef struct AsmInst {
 /* sections, symbols, items                                            */
 /* ------------------------------------------------------------------ */
 
-typedef enum SecKind { SEC_TEXT, SEC_DATA, SEC_BSS, SEC_RODATA, SEC_NOTE, SEC_COUNT } SecKind;
+/*
+ * The thread-local ones: SEC_TDATA is ELF .tdata and Mach-O __thread_data
+ * (initial values), SEC_TBSS ELF .tbss (zero ones; Mach-O puts those in
+ * __thread_data too), SEC_TVARS Mach-O's __thread_vars (the descriptors
+ * code reaches a variable through).
+ */
+typedef enum SecKind { SEC_TEXT, SEC_DATA, SEC_BSS, SEC_RODATA, SEC_NOTE, SEC_TDATA, SEC_TBSS, SEC_TVARS, SEC_COUNT } SecKind;
+
+/* a zero-fill section: no bytes in the object */
+#define AS_SEC_IS_BSS(sec) ((sec) == SEC_BSS || (sec) == SEC_TBSS)
 
 typedef enum ItemKind {
     ITEM_BYTES,     /* u.bytes: a run of the section's data buffer */
@@ -140,7 +152,10 @@ enum {
     R_PC32,                 /* x86_64 sym(%rip) */
     R_PLT32,                /* x86_64 call sym@PLT */
     R_GOTPCRELX,            /* x86_64 sym@GOTPCREL(%rip) in an instruction without a REX prefix */
-    R_REX_GOTPCRELX         /* the same with one (movq sym@GOTPCREL(%rip), %r64) */
+    R_REX_GOTPCRELX,        /* the same with one (movq sym@GOTPCREL(%rip), %r64) */
+    R_TLVP_PAGE21,          /* arm64 adrp sym@TLVPPAGE */
+    R_TLVP_PAGEOFF12,       /* arm64 ldr [Xn, sym@TLVPPAGEOFF] */
+    R_TLSGD                 /* x86_64 leaq sym@tlsgd(%rip), %rdi */
 };
 
 typedef struct AsmReloc {
@@ -177,6 +192,7 @@ typedef struct AsmSym {
     int is_func;            /* .type @function */
     int sized;              /* has a .size */
     int is_obj;             /* .type @object */
+    int is_tls;             /* .type @tls_object: ELF STT_TLS */
     int is_section;         /* ELF: the section symbol made when its section was first entered */
     size_t off;             /* in its section, once laid out */
     size_t size;            /* .size sym, .-sym: the distance, once laid out */

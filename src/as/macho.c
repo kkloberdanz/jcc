@@ -28,6 +28,9 @@
 #define LC_BUILD_VERSION 0x32
 #define PLATFORM_MACOS 1
 #define S_ZEROFILL 1
+#define S_THREAD_LOCAL_REGULAR 0x11
+#define S_THREAD_LOCAL_ZEROFILL 0x12
+#define S_THREAD_LOCAL_VARIABLES 0x13
 #define S_ATTR_PURE_INSTRUCTIONS 0x80000000ul
 #define S_ATTR_SOME_INSTRUCTIONS 0x00000400ul
 #define N_EXT 0x01
@@ -40,6 +43,8 @@ enum {
     ARM64_RELOC_PAGEOFF12 = 4,
     ARM64_RELOC_GOT_LOAD_PAGE21 = 5,
     ARM64_RELOC_GOT_LOAD_PAGEOFF12 = 6,
+    ARM64_RELOC_TLVP_LOAD_PAGE21 = 8,
+    ARM64_RELOC_TLVP_LOAD_PAGEOFF12 = 9,
     ARM64_RELOC_ADDEND = 10
 };
 
@@ -198,6 +203,8 @@ static int macho_relocs(As *a, AsmSection *s, const int *index, MSec *m) {
             case R_PAGEOFF12: type = ARM64_RELOC_PAGEOFF12; pcrel = 0; length = 2; break;
             case R_GOT_PAGE21: type = ARM64_RELOC_GOT_LOAD_PAGE21; pcrel = 1; length = 2; break;
             case R_GOT_PAGEOFF12: type = ARM64_RELOC_GOT_LOAD_PAGEOFF12; pcrel = 0; length = 2; break;
+            case R_TLVP_PAGE21: type = ARM64_RELOC_TLVP_LOAD_PAGE21; pcrel = 1; length = 2; break;
+            case R_TLVP_PAGEOFF12: type = ARM64_RELOC_TLVP_LOAD_PAGEOFF12; pcrel = 0; length = 2; break;
             default:
                 as_error(a, "relocation kind %d is not for Mach-O", r->kind);
                 return -1;
@@ -269,6 +276,9 @@ int macho_write(As *a, char **out, size_t *out_len) {
             case SEC_DATA: m->sectname = "__data"; m->segname = "__DATA"; m->flags = 0; break;
             case SEC_BSS: m->sectname = "__bss"; m->segname = "__DATA"; m->flags = S_ZEROFILL; break;
             case SEC_RODATA: m->sectname = "__const"; m->segname = "__TEXT"; m->flags = 0; break;
+            case SEC_TDATA: m->sectname = "__thread_data"; m->segname = "__DATA"; m->flags = S_THREAD_LOCAL_REGULAR; break;
+            case SEC_TBSS: m->sectname = "__thread_bss"; m->segname = "__DATA"; m->flags = S_THREAD_LOCAL_ZEROFILL; break;
+            case SEC_TVARS: m->sectname = "__thread_vars"; m->segname = "__DATA"; m->flags = S_THREAD_LOCAL_VARIABLES; break;
             default:
                 as_error(a, "a section Mach-O has no name for");
                 goto done;
@@ -281,7 +291,7 @@ int macho_write(As *a, char **out, size_t *out_len) {
     for (i = 0; i < nsects; i++) {
         AsmSection *s = &a->sec[secs[i].kind];
         unsigned long align = 1ul << s->p2align;
-        if (secs[i].kind == SEC_BSS) {
+        if (AS_SEC_IS_BSS(secs[i].kind)) {
             continue;
         }
         addr = (addr + align - 1) & ~(align - 1);
@@ -292,7 +302,7 @@ int macho_write(As *a, char **out, size_t *out_len) {
     for (i = 0; i < nsects; i++) {
         AsmSection *s = &a->sec[secs[i].kind];
         unsigned long align = 1ul << s->p2align;
-        if (secs[i].kind != SEC_BSS) {
+        if (!AS_SEC_IS_BSS(secs[i].kind)) {
             continue;
         }
         addr = (addr + align - 1) & ~(align - 1);
@@ -306,7 +316,7 @@ int macho_write(As *a, char **out, size_t *out_len) {
     reloff = relstart;
     for (i = 0; i < nsects; i++) {
         AsmSection *s = &a->sec[secs[i].kind];
-        secs[i].fileoff = secs[i].kind == SEC_BSS ? 0 : hdr_size + secs[i].addr;
+        secs[i].fileoff = AS_SEC_IS_BSS(secs[i].kind) ? 0 : hdr_size + secs[i].addr;
         if (macho_relocs(a, s, index, &secs[i]) != 0) {
             goto done;
         }
@@ -385,7 +395,7 @@ int macho_write(As *a, char **out, size_t *out_len) {
     /* contents */
     for (i = 0; i < nsects; i++) {
         AsmSection *s = &a->sec[secs[i].kind];
-        if (secs[i].kind == SEC_BSS) {
+        if (AS_SEC_IS_BSS(secs[i].kind)) {
             continue;
         }
         macho_put_zero(&b, secs[i].fileoff - b.len);

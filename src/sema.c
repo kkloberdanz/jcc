@@ -39,6 +39,10 @@ typedef struct SwitchCtx {
 
 static SwitchCtx *switch_ctx = NULL;
 
+/* analysing the initializer of an object with static storage: a compound literal in it is static too */
+static int init_static_ctx = 0;
+static int ncompound_lits = 0;     /* numbers the static ones' names */
+
 /* a specifier list, combined */
 typedef struct Specs {
     Type *type;
@@ -48,6 +52,7 @@ typedef struct Specs {
     int packed;         /* __attribute__((packed)) seen */
     size_t aligned;     /* __attribute__((aligned(n))) seen */
     int only_tag;       /* the list is just `struct S` or `enum E` (with or without body) */
+    int is_thread;      /* _Thread_local or __thread */
 } Specs;
 
 static Type *sema_expr(AST **slot);
@@ -58,6 +63,7 @@ static Type *sema_type_name(AST *tn);
 static void sema_declaration(AST *decl, int file_scope);
 static void sema_stmt(AST *stmt);
 static void sema_initializer(AST **slot, Type **ptype, int is_static);
+static int static_assertion(AST *decl);
 static int float_eval(AST *e, long double *out);
 static Type *builtin_type(const char *name);
 static Type *sema_atomic(AST *e, int is_store);
@@ -506,14 +512,14 @@ int sema_const_eval(AST *e, long *out) {
         }
 
         case N_SIZEOF_EXPR:
-            if (!e->u.cast.expr->type) {
+            if (!e->u.cast.expr->type || type_is_vla(e->u.cast.expr->type)) {
                 return 0;
             }
             *out = (long)type_size(e->u.cast.expr->type);
             return 1;
 
         case N_SIZEOF_TYPE:
-            if (!e->u.cast.type->type) {
+            if (!e->u.cast.type->type || type_is_vla(e->u.cast.type->type)) {
                 return 0;
             }
             *out = (long)type_size(e->u.cast.type->type);
@@ -703,9 +709,12 @@ static int is_static_object(AST *o) {
     long v;
     switch (o->kind) {
         case N_IDENT:
-            return o->sym && is_static_storage(o->sym);
+            /* a thread-local object's address differs per thread: not a constant */
+            return o->sym && is_static_storage(o->sym) && !o->sym->tls;
         case N_STRING:
             return 1;
+        case N_COMPOUND_LIT:
+            return o->sym != NULL;
         case N_MEMBER:
             if (o->u.member.arrow) {
                 return is_address_constant(o->u.member.object);
@@ -881,6 +890,9 @@ static void sema_struct_spec(AST *spec, Type *type, const Specs *attrs) {
         Specs *spp = &sp;
         Type *base;
 
+        if (static_assertion(decl)) {
+            continue;
+        }
         sema_specs(decl->u.decl.specs, spp, 0, decl->loc);
         base = sp.type;
         if (decl->u.decl.declarators->len == 0) {
@@ -923,6 +935,10 @@ static void sema_struct_spec(AST *spec, Type *type, const Specs *attrs) {
                     diag_error(sd->loc, "named bit-field '%s' has zero width", name);
                 }
                 bits = (int)w;
+            }
+            if (type_is_vm(mt)) {
+                diag_error(sd->loc, "field '%s' has a variably modified type", name ? name : "");
+                mt = int_type();
             }
             if (bits < 0) {
                 if (mt->kind == TY_FUNC) {
@@ -1013,6 +1029,15 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
             case N_STORAGE_CLASS:
                 if (s->u.storage == STORAGE_INLINE) {
                     out->is_inline = 1;
+                    break;
+                }
+                if (s->u.storage == STORAGE_THREAD) {
+                    if (!allow_storage) {
+                        diag_error(s->loc, "storage class specifier is not allowed here");
+                    } else if (out->is_thread) {
+                        diag_error(s->loc, "duplicate _Thread_local");
+                    }
+                    out->is_thread = 1;
                     break;
                 }
                 if (!allow_storage) {
@@ -1233,6 +1258,7 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
 
             case N_DECL_ARRAY: {
                 long length = -1;
+                int vla = 0;
                 if (t->kind == TY_FUNC) {
                     diag_error(node->loc, "array of functions");
                     t = type_pointer(t);
@@ -1243,10 +1269,15 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
                 if (node->u.declarator.size) {
                     long n;
                     sema_rvalue(&node->u.declarator.size);
-                    if (!type_is_integer(node->u.declarator.size->type)
-                            || !sema_const_eval(node->u.declarator.size, &n)) {
-                        diag_error(node->loc, "array size is not an integer constant expression");
+                    if (poisoned(node->u.declarator.size)) {
                         n = 1;
+                    } else if (!type_is_integer(node->u.declarator.size->type)) {
+                        diag_error(node->loc, "size of array has non-integer type %s", ts(node->u.declarator.size->type));
+                        n = 1;
+                    } else if (!sema_const_eval(node->u.declarator.size, &n)) {
+                        /* C99: a variable length array, sized when the declarator is reached; where one may appear is checked by the declaration */
+                        vla = 1;
+                        n = 0;
                     } else if (n < 0) {
                         /* a zero length is a GNU extension, common in system headers */
                         diag_error(node->loc, "array size is negative");
@@ -1254,7 +1285,8 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
                     }
                     length = (long)n;
                 }
-                t = type_array(t, length);
+                t = vla ? type_vla(t, node->u.declarator.size) : type_array(t, length);
+                node->type = t;
                 node = node->u.declarator.inner;
                 break;
             }
@@ -2211,6 +2243,106 @@ static Type *sema_va_arg(AST *e) {
     return e->type;
 }
 
+/*
+ * `(T){ ... }`: an unnamed object of type T (an array of unknown size
+ * takes its size from the list). At file scope, or inside the
+ * initializer of a static object, it has static storage: a file scope
+ * symbol with a name no C program can spell, emitted as data like any
+ * static. Otherwise it is automatic, and the code that evaluates it
+ * initializes a frame slot of its own (src/lower.c).
+ */
+static Type *sema_compound_lit(AST *e) {
+    Type *t = sema_type_name(e->u.cast.type);
+    AST *holder = e->u.cast.expr;
+    int is_static = init_static_ctx || !cur_return;
+    int saved = init_static_ctx;
+
+    e->lvalue = 1;
+    if (t->kind == TY_FUNC || t->kind == TY_VOID
+            || (!type_is_complete(t) && !(t->kind == TY_ARRAY && t->length < 0 && type_is_complete(t->base)))) {
+        diag_error(e->loc, "compound literal of incomplete type %s", ts(t));
+        return error_type(e);
+    }
+    if (type_is_vm(t)) {
+        diag_error(e->loc, "compound literal has variable length array type %s", ts(t));
+        return error_type(e);
+    }
+    init_static_ctx = is_static;
+    sema_initializer(&holder->u.init_decl.init, &t, is_static);
+    init_static_ctx = saved;
+    holder->type = t;
+    e->type = t;
+    if (is_static) {
+        char name[48];
+        Scope *here = cur_symtab->current;
+        Symbol *sym;
+        snprintf(name, sizeof(name), "__compound_literal.%d", ++ncompound_lits);
+        cur_symtab->current = cur_symtab->file;
+        sym = symtab_declare(cur_symtab, NS_ORDINARY, SYM_VARIABLE, name, holder, e->loc);
+        cur_symtab->current = here;
+        sym->type = t;
+        sym->storage = STORAGE_STATIC;
+        sym->def = holder;
+        holder->sym = sym;
+        e->sym = sym;
+    }
+    return t;
+}
+
+/*
+ * C11 `_Generic(e, T1: e1, ..., default: d)`: the controlling expression
+ * is not evaluated; its type after lvalue conversion picks the
+ * association with a compatible type (or the default), and that
+ * expression replaces the whole node.
+ */
+static Type *sema_generic(AST **slot) {
+    AST *e = *slot;
+    ASTList *assocs = e->u.call.args;
+    Type *ct = sema_rvalue(&e->u.call.func);
+    AST **chosen = NULL;
+    AST **deflt = NULL;
+    AST *r;
+    size_t i;
+
+    for (i = 0; i < assocs->len; i++) {
+        AST *a = assocs->items[i];
+        Type *at;
+        if (!a->u.cast.type) {
+            if (deflt) {
+                diag_error(a->loc, "duplicate default association in _Generic");
+            }
+            deflt = &a->u.cast.expr;
+            continue;
+        }
+        at = sema_type_name(a->u.cast.type);
+        if (!type_is_complete(at) || at->kind == TY_FUNC) {
+            diag_error(a->loc, "type %s in a _Generic association is not a complete object type", ts(at));
+            continue;
+        }
+        if (!poisoned(e->u.call.func) && type_compatible(ct, at)) {
+            if (chosen) {
+                diag_error(a->loc, "controlling expression type %s is compatible with more than one association", ts(ct));
+            } else {
+                chosen = &a->u.cast.expr;
+            }
+        }
+    }
+    if (!chosen) {
+        chosen = deflt;
+    }
+    if (!chosen) {
+        if (!poisoned(e->u.call.func)) {
+            diag_error(e->loc, "controlling expression type %s is not compatible with any _Generic association", ts(ct));
+        }
+        return error_type(e);
+    }
+    r = *chosen;
+    *chosen = NULL;
+    *slot = r;
+    ast_free(e);
+    return sema_expr(slot);
+}
+
 static Type *sema_expr(AST **slot) {
     AST *e = *slot;
 
@@ -2265,6 +2397,12 @@ static Type *sema_expr(AST **slot) {
 
         case N_CAST:
             return sema_cast(e);
+
+        case N_COMPOUND_LIT:
+            return sema_compound_lit(e);
+
+        case N_GENERIC:
+            return sema_generic(slot);
 
         case N_SIZEOF_EXPR:
         case N_SIZEOF_TYPE:
@@ -2448,8 +2586,7 @@ static void init_scalar(AST **slot, Type *t, int is_static) {
     AST *init = *slot;
     if (init->kind == N_INIT_LIST) {
         if (init->u.list->len == 0) {
-            diag_error(init->loc, "empty initializer for scalar");
-            return;
+            return;     /* `{}`: zero */
         }
         if (init->u.list->len > 1) {
             diag_warning(init->loc, "excess elements in scalar initializer");
@@ -2537,7 +2674,7 @@ static void init_elem(Type *t, Cursor *c, int is_static) {
             Type *et = sema_rvalue(slot);
             if (type_is_record(et) && type_compatible_unqual(et, t)) {
                 cur_advance(c);
-                if (is_static) {
+                if (is_static && !((*slot)->kind == N_COMPOUND_LIT && (*slot)->sym)) {
                     diag_error((*slot)->loc, "initializer element is not a compile-time constant");
                 }
                 return;
@@ -2638,7 +2775,16 @@ static void init_object(Type *t, Cursor *c, int is_static, long *count_out, int 
     }
 }
 
+static void sema_initializer_in(AST **slot, Type **pt, int is_static);
+
 static void sema_initializer(AST **slot, Type **pt, int is_static) {
+    int saved = init_static_ctx;
+    init_static_ctx = is_static;
+    sema_initializer_in(slot, pt, is_static);
+    init_static_ctx = saved;
+}
+
+static void sema_initializer_in(AST **slot, Type **pt, int is_static) {
     Type *t = *pt;
     AST *init = *slot;
 
@@ -2666,7 +2812,7 @@ static void sema_initializer(AST **slot, Type **pt, int is_static) {
         Type *et = sema_rvalue(slot);
         if (!type_compatible_unqual(et, t)) {
             diag_error(init->loc, "initializing %s from incompatible type %s", ts(t), ts(et));
-        } else if (is_static) {
+        } else if (is_static && !(init->kind == N_COMPOUND_LIT && init->sym)) {
             diag_error(init->loc, "initializer element is not a compile-time constant");
         }
         return;
@@ -2691,10 +2837,38 @@ static int only_attributes(const ASTList *specs) {
     return specs->len > 0;
 }
 
+/* a Declaration (or struct member declaration) that is a _Static_assert: check it; returns 1 if it was one */
+static int static_assertion(AST *decl) {
+    AST *sa;
+    long v;
+    if (decl->u.decl.declarators->len != 0 || decl->u.decl.specs->len != 1
+            || decl->u.decl.specs->items[0]->kind != N_STATIC_ASSERT) {
+        return 0;
+    }
+    sa = decl->u.decl.specs->items[0];
+    sema_rvalue(&sa->u.binary.left);
+    if (poisoned(sa->u.binary.left)) {
+        return 1;
+    }
+    if (!type_is_integer(sa->u.binary.left->type) || !sema_const_eval(sa->u.binary.left, &v)) {
+        diag_error(sa->loc, "static assertion expression is not an integer constant expression");
+    } else if (v == 0) {
+        if (sa->u.binary.right) {
+            diag_error(sa->loc, "static assertion failed: %s", sa->u.binary.right->u.text);
+        } else {
+            diag_error(sa->loc, "static assertion failed");
+        }
+    }
+    return 1;
+}
+
 static void sema_declaration(AST *decl, int file_scope) {
     Specs sp;
     size_t i;
 
+    if (static_assertion(decl)) {
+        return;
+    }
     if (decl->u.decl.declarators->len == 0 && only_attributes(decl->u.decl.specs)) {
         /* `__attribute__((fallthrough));`: an attribute declaration, nothing to do */
         return;
@@ -2718,13 +2892,39 @@ static void sema_declaration(AST *decl, int file_scope) {
         Type *t = sema_declarator(id->u.init_decl.declarator, sp.type, &name);
         Symbol *sym = id->sym;
         int is_static;
+        StorageKind prev;   /* a redeclaration's linkage comes from the earlier one */
 
         id->type = t;
         if (!sym || !name) {
             diag_error(id->loc, "internal error: declarator was not declared");
             continue;
         }
+        prev = sym->storage;
         sym->storage = sp.storage;
+        if (type_is_vm(t) && t->kind != TY_FUNC) {
+            /* C99 6.7.5.2: variably modified types only for names with no linkage at block scope, VLAs only for automatic objects */
+            if (file_scope) {
+                diag_error(id->loc, "variable length array declaration not allowed at file scope");
+                t = type_is_vla(t) ? type_array(t->base, 1) : type_pointer(type_basic(TY_CHAR));
+            } else if (sp.storage == STORAGE_EXTERN || (sp.storage == STORAGE_STATIC && type_is_vla(t))) {
+                diag_error(id->loc, "variable length array '%s' cannot have %s storage", name,
+                           sp.storage == STORAGE_EXTERN ? "extern" : "static");
+                t = type_is_vla(t) ? type_array(t->base, 1) : t;
+            } else if (*init && type_is_vla(t) && !sp.is_typedef) {
+                diag_error(id->loc, "variable-sized object '%s' may not be initialized", name);
+                ast_free(*init);
+                *init = NULL;
+            }
+            id->type = t;
+        }
+
+        if (sp.is_thread && (sp.is_typedef || t->kind == TY_FUNC)) {
+            diag_error(id->loc, "'%s' cannot be thread-local", name);
+            sp.is_thread = 0;
+        } else if (sp.is_thread && !file_scope && sp.storage != STORAGE_STATIC && sp.storage != STORAGE_EXTERN) {
+            diag_error(id->loc, "thread-local variable '%s' at block scope must also be static or extern", name);
+            sp.is_thread = 0;
+        }
 
         if (sp.is_typedef) {
             if (sym->kind != SYM_TYPEDEF) {
@@ -2771,7 +2971,7 @@ static void sema_declaration(AST *decl, int file_scope) {
                     sym->type = type_composite(sym->type, t);
                 }
                 if (sym->decl != id) {
-                    sym->storage = sym->storage == STORAGE_STATIC ? STORAGE_STATIC : sp.storage;
+                    sym->storage = prev == STORAGE_STATIC ? STORAGE_STATIC : sp.storage;
                 }
             } else {
                 sym->type = t;
@@ -2804,6 +3004,13 @@ static void sema_declaration(AST *decl, int file_scope) {
             sym->type = adjust_param(t);
             continue;
         }
+        if (sym->type && sym->decl != id && sym->tls != sp.is_thread) {
+            diag_error(id->loc, "%s declaration of '%s' follows %s declaration", sp.is_thread ? "thread-local" : "non-thread-local",
+                       name, sp.is_thread ? "non-thread-local" : "thread-local");
+            diag_note(sym->loc, "previous declaration is here");
+            continue;
+        }
+        sym->tls = sp.is_thread;
         if (sym->type && sym->decl != id) {
             /* a redeclaration in the same scope */
             if (!file_scope && !(sp.storage == STORAGE_EXTERN && sym->storage == STORAGE_EXTERN)) {
@@ -2817,10 +3024,10 @@ static void sema_declaration(AST *decl, int file_scope) {
             }
             t = type_composite(sym->type, t);
             if (sp.storage == STORAGE_EXTERN) {
-                sym->storage = sym->storage == STORAGE_NONE ? STORAGE_NONE : sym->storage;
-            } else if (sym->storage == STORAGE_EXTERN) {
+                sym->storage = prev;    /* `int x = 1; extern int x;` still defines x */
+            } else if (prev == STORAGE_EXTERN) {
                 sym->storage = sp.storage;
-            } else if (sp.storage == STORAGE_STATIC && sym->storage != STORAGE_STATIC) {
+            } else if (sp.storage == STORAGE_STATIC && prev != STORAGE_STATIC) {
                 diag_error(id->loc, "static declaration of '%s' follows non-static declaration", name);
             }
         }
@@ -3166,6 +3373,8 @@ int sema(AST *tu, SymTab *st) {
     size_t i;
 
     cur_symtab = st;
+    init_static_ctx = 0;
+    ncompound_lits = 0;
     if (tu->kind != N_TRANSLATION_UNIT) {
         diag_error(tu->loc, "internal error: expected a translation unit");
         return diag_error_count();

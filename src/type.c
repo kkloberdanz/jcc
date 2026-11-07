@@ -10,6 +10,7 @@
 /* arena: every Type and Record ever made, so they can be freed at once */
 static Type *all_types = NULL;
 static Record *all_records = NULL;
+static Vla *all_vlas = NULL;
 
 /* the unqualified basic types are singletons */
 static Type *basic[TY_NKINDS];
@@ -43,6 +44,29 @@ Type *type_array(Type *elem, long length) {
     return t;
 }
 
+Type *type_vla(Type *elem, struct AST *size) {
+    Type *t = type_array(elem, 0);
+    t->vla = xcalloc(1, sizeof(*t->vla));
+    t->vla->size = size;
+    t->vla->next_alloc = all_vlas;
+    all_vlas = t->vla;
+    return t;
+}
+
+int type_is_vla(const Type *t) {
+    return t->kind == TY_ARRAY && t->vla != NULL;
+}
+
+int type_is_vm(const Type *t) {
+    while (t->kind == TY_POINTER || t->kind == TY_ARRAY) {
+        if (t->vla) {
+            return 1;
+        }
+        t = t->base;
+    }
+    return 0;
+}
+
 Type *type_func(Type *ret, Param *params, size_t nparams, int variadic, int has_proto) {
     Type *t = type_alloc(TY_FUNC);
     t->base = ret;
@@ -73,6 +97,7 @@ Type *type_qualify(Type *t, unsigned quals) {
     q->nparams = t->nparams;
     q->variadic = t->variadic;
     q->has_proto = t->has_proto;
+    q->vla = t->vla;
     return q;
 }
 
@@ -92,6 +117,7 @@ Type *type_unqualified(Type *t) {
     q->nparams = t->nparams;
     q->variadic = t->variadic;
     q->has_proto = t->has_proto;
+    q->vla = t->vla;
     return q;
 }
 
@@ -288,6 +314,11 @@ void type_free_all(void) {
         t = next;
     }
     all_types = NULL;
+    while (all_vlas) {
+        Vla *next = all_vlas->next_alloc;
+        free(all_vlas);
+        all_vlas = next;
+    }
     while (r) {
         Record *next = r->next_alloc;
         for (i = 0; i < r->nmembers; i++) {
@@ -649,7 +680,7 @@ int type_compatible(const Type *a, const Type *b) {
         case TY_POINTER:
             return type_compatible(a->base, b->base);
         case TY_ARRAY:
-            if (a->length >= 0 && b->length >= 0 && a->length != b->length) {
+            if (a->length >= 0 && b->length >= 0 && a->length != b->length && !a->vla && !b->vla) {
                 return 0;
             }
             return type_compatible(a->base, b->base);
@@ -788,7 +819,9 @@ static void format_type(StrBuf *out, const Type *t, const char *inner) {
         case TY_ARRAY: {
             char n[32];
             buf_add(&d, inner);
-            if (t->length >= 0) {
+            if (t->vla) {
+                strcpy(n, "[*]");
+            } else if (t->length >= 0) {
                 snprintf(n, sizeof(n), "[%ld]", t->length);
             } else {
                 strcpy(n, "[]");
