@@ -56,6 +56,7 @@ stage c-testsuite   sh tests/run-c-testsuite.sh
 stage gcc-torture   sh tests/run-gcc-torture.sh
 stage csmith        env N="$N" sh tests/run-csmith.sh
 stage lua           sh tests/run-lua.sh
+stage lua-jit       make -s lua-jit
 stage sqlite        sh tests/run-sqlite.sh
 
 # x86_64 Linux: cross compiled here, run in Docker
@@ -67,6 +68,7 @@ else
     export X86_64_SYSROOT="$SYSROOT"
     stage test-x86_64        sh tests/run-x86_64.sh
     stage abi-x86_64         sh tests/abi.sh x86_64
+    stage jit-x86_64         make -s jit-x86_64
     if [ -f "${PEWTER:-$HOME/src/pewter}/pewter.c" ]; then
         stage pewter-x86_64  sh tests/run-x86_64.sh pewter
     else
@@ -76,6 +78,7 @@ else
     stage gcc-torture-x86_64 sh tests/run-gcc-torture.sh x86_64
     stage csmith-x86_64      env N="$N" sh tests/run-csmith.sh x86_64
     stage lua-x86_64         sh tests/run-lua.sh x86_64
+    stage lua-jit-x86_64     make -s lua-jit-x86_64
     stage sqlite-x86_64      sh tests/run-sqlite.sh x86_64
 fi
 
@@ -103,7 +106,7 @@ asan_suites() {
     cp -R Makefile src tests tools "$1" || return 1
     make -C "$1" -s sanitize >/dev/null 2>&1 || { echo "the sanitizer build failed"; return 1; }
     (cd "$1" && sh tests/run.sh && sh tests/target.sh && sh tests/abi.sh && sh tests/embed.sh \
-        && sh tests/limits.sh && sh tests/c89.sh) || return 1
+        && sh tests/jit.sh && sh tests/limits.sh && sh tests/c89.sh) || return 1
     if [ -f "$DATA/sqlite-amalgamation-3530400/sqlite3.c" ]; then
         "$1/jcc" -std=gnu89 -S -o /dev/null "$DATA/sqlite-amalgamation-3530400/sqlite3.c" || return 1
         echo "sqlite3.c compiled under ASan"

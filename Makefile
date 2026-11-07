@@ -106,12 +106,26 @@ test-O0: jcc
 	sh tests/target.sh
 	sh tests/abi.sh
 	sh tests/embed.sh
+	sh tests/jit.sh
 	sh tests/limits.sh
 	sh tests/c89.sh
 	sh tests/as.sh
 	sh tests/as-obj.sh
 
 # the x86_64 Linux target: cross compile on this machine, assemble here, link and run in Docker
+# in-process execution on x86_64 Linux: the amalgamation and tests/jit/jit.c built and run in Docker
+.PHONY: jit-x86_64
+jit-x86_64: amalgamation
+	sh tests/jit.sh x86_64
+
+# Lua's test suite on the interpreter jit-compiled in process (tests/jit/lua.c), here and on x86_64 Linux in Docker
+.PHONY: lua-jit lua-jit-x86_64
+lua-jit: jcc
+	sh tests/run-lua.sh jit
+
+lua-jit-x86_64: amalgamation
+	sh tests/run-lua.sh jit-x86_64
+
 .PHONY: test-x86_64
 test-x86_64: jcc
 	X86_64_SYSROOT='$(X86_64_SYSROOT)' sh tests/run-x86_64.sh

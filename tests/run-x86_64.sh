@@ -25,13 +25,25 @@ mkdir -p "$tmp/work"
 if [ "$1" = pewter ]; then
     src=${PEWTER:-$HOME/src/pewter}
     cp "$src/test.sh" "$tmp/work/"
+    # Docker on an arm64 host runs this amd64 image emulated on an arm64
+    # kernel, which rejects pewter's x86_64 seccomp filter (EINVAL; a
+    # gcc-built pewter fails the same way), so there the sandbox code is
+    # compiled to check jcc on it and the server under test is built
+    # without it
+    pflags=""
+    if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
+        echo "compiling pewter.c with its seccomp sandbox"
+        $X -c -o "$tmp/pewter-seccomp.o" "$src/pewter.c" || exit 1
+        echo "an emulated amd64 container cannot install the filter: testing with -DPEWTER_NO_SECCOMP"
+        pflags="-DPEWTER_NO_SECCOMP"
+    fi
     if [ "$hostlink" = 1 ]; then
         echo "cross compiling and linking pewter.c here"
-        $X -o "$tmp/work/pewter" "$src/pewter.c" || exit 1
+        $X $pflags -o "$tmp/work/pewter" "$src/pewter.c" || exit 1
         link=true
     else
         echo "cross compiling pewter.c"
-        $X -c -o "$tmp/work/pewter.o" "$src/pewter.c" || exit 1
+        $X $pflags -c -o "$tmp/work/pewter.o" "$src/pewter.c" || exit 1
         link="gcc -o pewter pewter.o"
     fi
     echo "testing in Docker (as root, so the chroot works)"

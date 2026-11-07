@@ -6,7 +6,9 @@
 # pass tests/run.sh. Run from the repository root (make selfhost does).
 # The backends need each target's default header locations as macros
 # (tests/target-defs.sh; make selfhost passes the Makefile's values). Both
-# stages get the same values, so the objects stay comparable.
+# stages get the same values, so the objects stay comparable. The JIT
+# test (tests/jit/jit.c) is also run against stage 2's library, so the
+# loader jcc compiled loads and runs code jcc compiled.
 # `sh tests/selfhost.sh amalgamation` does the same with one file: each
 # stage is dist/jcc.c (make amalgamation) and the driver, so jcc compiles
 # the whole library in one translation unit. JCCFLAGS (say -O1) is passed
@@ -68,6 +70,16 @@ if JCC="$tmp/stage2/jcc" sh tests/run.sh >"$tmp/run.out" 2>&1; then
     tail -1 "$tmp/run.out"
 else
     cat "$tmp/run.out"
+    fail=1
+fi
+# the loader as jcc compiled it: tests/jit/jit.c against stage 2's library
+echo "running tests/jit/jit.c against stage 2's library"
+if [ "$mode" = amalgamation ]; then stage2lib="$tmp/stage2/jcc.o"; else stage2lib="$tmp/stage2/libjcc.a"; fi
+if cc -std=c89 -Isrc -o "$tmp/jit" tests/jit/jit.c "$stage2lib" && "$tmp/jit" >"$tmp/jit.out" 2>&1; then
+    tail -1 "$tmp/jit.out"
+else
+    grep -v "^PASS" "$tmp/jit.out" 2>/dev/null
+    echo "FAIL: the JIT test against stage 2's library"
     fail=1
 fi
 [ "$fail" -eq 0 ] && echo "SELFHOST OK"

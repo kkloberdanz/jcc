@@ -13,7 +13,9 @@
  * with threads serializes its calls. Everything the library allocates
  * for the host (output buffers) is freed with free().
  *
- * Linking is not part of the library: the driver runs the system linker.
+ * Linking an executable is not part of the library: the driver runs the
+ * system linker. Running the code in this process is: see "In-process
+ * execution" below.
  * Objects are written by jcc's own assembler (Step 14 of the plan), which
  * reads the backends' output and nothing else; -fexternal-as hands the
  * assembly to the host's `cc -c` instead. A unit whose name ends in `.s`
@@ -80,8 +82,45 @@ int jcc_check(Jcc *k, const char *name, const char *text);        /* parse and a
 int jcc_compile_to_asm(Jcc *k, const char *name, const char *text, char **out, size_t *len);
 int jcc_compile_to_obj(Jcc *k, const char *name, const char *text, char **out, size_t *len);
 
-/* the errors and warnings the last compile reported */
+/* the errors and warnings the last compile (or load) reported */
 int jcc_errors(const Jcc *k);
 int jcc_warnings(const Jcc *k);
+
+/*
+ * In-process execution: an object is loaded into this process as a
+ * module, its relocations applied and its undefined symbols resolved,
+ * and its functions and variables are then reached by their C names.
+ * The hosts are those jcc targets natively, arm64 macOS (Mach-O) and
+ * x86_64 Linux and FreeBSD (ELF); the compiler's target must be the
+ * host's (jcc_new(NULL)). An undefined symbol is asked of the resolver
+ * first, by its C name, then looked up in the process (dlsym), so the
+ * module can call the C library and whatever the host exports, and the
+ * resolver can hand it the host's own functions and variables, or
+ * another module's (jcc_jit_symbol). A module stays loaded until
+ * jcc_jit_unload, independently of the Jcc that loaded it (jcc_free
+ * does not unload it), and any number can be loaded at once.
+ *
+ * Not supported in a module: thread-local storage, common symbols, and
+ * unwinding through its frames (no unwind tables are registered). A
+ * macOS host with the hardened runtime needs the
+ * com.apple.security.cs.allow-jit entitlement.
+ */
+typedef struct JccJit JccJit;
+
+/* the address of `name` for a module, or NULL to leave it to the process */
+typedef void *(*JccResolveFn)(void *user, const char *name);
+void jcc_set_resolver(Jcc *k, JccResolveFn fn, void *user);
+
+/* load an object (from jcc_compile_to_obj, or a file); NULL after errors, which went to the diagnostic handler */
+JccJit *jcc_jit_load(Jcc *k, const char *obj, size_t len);
+
+/* compile a unit (as jcc_compile_to_obj takes it) and load it; NULL after errors */
+JccJit *jcc_compile_to_jit(Jcc *k, const char *name, const char *text);
+
+/* the address of a global function or variable the module defines, or NULL; cast to the function pointer type to call it */
+void *jcc_jit_symbol(const JccJit *j, const char *name);
+
+/* unmap the module; addresses taken from it are dangling afterwards. NULL is ignored */
+void jcc_jit_unload(JccJit *j);
 
 #endif /* JCC_H */

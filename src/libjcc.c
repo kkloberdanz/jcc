@@ -21,6 +21,7 @@
 #include "diag.h"
 #include "target.h"
 #include "as/as.h"
+#include "jit.h"
 
 /* a growable list of owned strings */
 typedef struct Strings {
@@ -35,6 +36,8 @@ struct Jcc {
     void *diag_user;
     JccReadFn read;
     void *read_user;
+    JccResolveFn resolve;   /* undefined symbols of a loaded module (src/jit.c) */
+    void *resolve_user;
     char *std;
     char *sysroot;
     Strings include_dirs;
@@ -121,6 +124,11 @@ void jcc_set_diag(Jcc *k, JccDiagFn fn, void *user) {
 void jcc_set_reader(Jcc *k, JccReadFn fn, void *user) {
     k->read = fn;
     k->read_user = user;
+}
+
+void jcc_set_resolver(Jcc *k, JccResolveFn fn, void *user) {
+    k->resolve = fn;
+    k->resolve_user = user;
 }
 
 int jcc_set_option(Jcc *k, const char *name, const char *value) {
@@ -473,4 +481,39 @@ int jcc_compile_to_asm(Jcc *k, const char *name, const char *text, char **out, s
 
 int jcc_compile_to_obj(Jcc *k, const char *name, const char *text, char **out, size_t *len) {
     return run(k, name, text, OBJECT, out, len);
+}
+
+/* load an object into this process (src/jit.c), with the handler and recovery point a compile has */
+JccJit *jcc_jit_load(Jcc *k, const char *obj, size_t len) {
+    JccJit *volatile j = NULL;
+    jmp_buf recover;
+    jmp_buf *previous;
+
+    diag_set_handler(k->diag, k->diag_user);
+    diag_reset();
+    previous = diag_set_recovery(&recover);
+    if (setjmp(recover) == 0) {
+        j = jit_load(obj, len, k->resolve, k->resolve_user);
+    }
+    diag_set_recovery(previous);
+    k->nerrors = diag_error_count();
+    k->nwarnings = diag_warning_count();
+    diag_set_handler(NULL, NULL);
+    return j;
+}
+
+JccJit *jcc_compile_to_jit(Jcc *k, const char *name, const char *text) {
+    char *obj;
+    size_t len;
+    JccJit *j;
+    int warnings;
+
+    if (run(k, name, text, OBJECT, &obj, &len) != 0) {
+        return NULL;
+    }
+    warnings = k->nwarnings;
+    j = jcc_jit_load(k, obj, len);
+    k->nwarnings += warnings;   /* the compile's warnings still count */
+    free(obj);
+    return j;
 }

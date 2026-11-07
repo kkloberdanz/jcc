@@ -47,10 +47,15 @@ for src in src/*.c y.tab.c; do
 done
 for src in src/arch/arch.*.c; do
     check "$src" gnu89 -Isrc -DJCC_ARM64_MACOS_SYSROOT='"/"' -DJCC_ARM64_MACOS_RESOURCE_INC='"/"' \
-        -DJCC_X86_64_LINUX_SYSROOT='"/"' -DJCC_X86_64_LINUX_GCC_DIR='"/"'
+        -DJCC_X86_64_LINUX_SYSROOT='"/"' -DJCC_X86_64_LINUX_GCC_DIR='"/"' -DJCC_X86_64_FREEBSD_SYSROOT='"/"'
 done
+# _FORTIFY_SOURCE=0: Apple's fortified snprintf and vsnprintf are macros,
+# and cc -E puts a macro call spanning lines, and whatever follows it on
+# its last line, all on the call's first output line, so the reference
+# misplaces those tokens (pewter's log_append calls) while jcc's own
+# preprocessing has them on their real line
 if [ -f "$HOME/src/pewter/pewter.c" ]; then
-    check "$HOME/src/pewter/pewter.c" c90
+    check "$HOME/src/pewter/pewter.c" c90 -D_FORTIFY_SOURCE=0
 fi
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

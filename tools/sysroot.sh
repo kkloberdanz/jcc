@@ -5,7 +5,7 @@
 #     $X86_64_SYSROOT (default ~/.local/share/jcc/x86_64-linux-musl), so jcc can
 #     preprocess, compile and (with ld.lld, `brew install lld`) link
 #     statically for Linux here;
-#   - a Docker image, jcc-x86_64-linux, with gcc, musl-dev, curl and procps (pewter's test uses ps -p), which
+#   - a Docker image, jcc-x86_64-linux, with gcc, musl-dev, linux-headers (pewter uses linux/seccomp.h), curl and procps (pewter's test uses ps -p), which
 #     tests/run-x86_64.sh uses to link and run what jcc produced.
 # Needs Docker running. Safe to rerun.
 set -e
@@ -13,7 +13,7 @@ SYSROOT=${X86_64_SYSROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/jcc/x86_64-linux-
 docker info >/dev/null 2>&1 || { echo "docker is not running" >&2; exit 1; }
 
 echo "building image jcc-x86_64-linux"
-printf 'FROM alpine:3.20\nRUN apk add --no-cache gcc musl-dev curl procps\n' | docker build --platform linux/amd64 -q -t jcc-x86_64-linux - >/dev/null
+printf 'FROM alpine:3.20\nRUN apk add --no-cache gcc musl-dev linux-headers curl procps\n' | docker build --platform linux/amd64 -q -t jcc-x86_64-linux - >/dev/null
 
 echo "copying the sysroot to $SYSROOT"
 rm -rf "$SYSROOT"
