@@ -237,7 +237,7 @@ int elf_write(As *a, char **out, size_t *out_len) {
             case SEC_DATA: name = ".data"; h->flags = SHF_ALLOC | SHF_WRITE; break;
             case SEC_BSS: name = ".bss"; h->flags = SHF_ALLOC | SHF_WRITE; break;
             case SEC_RODATA: name = ".rodata"; h->flags = SHF_ALLOC; break;
-            case SEC_NOTE: name = ".note.GNU-stack"; h->flags = 0; break;
+            case SEC_NOTE: name = ".note.GNU-stack"; h->flags = a->exec_stack ? SHF_EXECINSTR : 0; break;
             case SEC_TDATA: name = ".tdata"; h->flags = SHF_ALLOC | SHF_WRITE | SHF_TLS; break;
             case SEC_TBSS: name = ".tbss"; h->flags = SHF_ALLOC | SHF_WRITE | SHF_TLS; break;
             default:

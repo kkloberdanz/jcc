@@ -50,6 +50,11 @@ void ir_func_free(IRFunc *f) {
     free(f->switches);
     free(f->jt);
     free(f->argtypes);
+    for (i = 0; i < f->nasms; i++) {
+        free(f->asms[i].ops);
+        free((void *)f->asms[i].clobbers);
+    }
+    free(f->asms);
     free(f);
 }
 
@@ -76,6 +81,7 @@ int ir_block(IRFunc *f) {
     b = &f->blocks[f->nblocks];
     b->start = -1;
     b->end = -1;
+    b->addr_label = 0;
     return f->nblocks++;
 }
 
@@ -141,6 +147,12 @@ int ir_add_call(IRFunc *f, const IRCall *c) {
     GROW(f->calls, f->ncalls, f->calls_cap, IRCall);
     f->calls[f->ncalls] = *c;
     return f->ncalls++;
+}
+
+int ir_add_asm(IRFunc *f, const IRAsm *a) {
+    GROW(f->asms, f->nasms, f->asms_cap, IRAsm);
+    f->asms[f->nasms] = *a;
+    return f->nasms++;
 }
 
 int ir_add_arg(IRFunc *f, const IRArg *a) {
@@ -299,7 +311,8 @@ int ir_type_is_float(IRType t) {
 }
 
 int ir_is_terminator(IROp op) {
-    return op == IR_BR || op == IR_CONDBR || op == IR_RET || op == IR_UNREACHABLE || op == IR_SWITCH;
+    return op == IR_BR || op == IR_CONDBR || op == IR_RET || op == IR_UNREACHABLE || op == IR_SWITCH || op == IR_IJMP
+        || op == IR_ASMBR || op == IR_NLGOTO;
 }
 
 int ir_nsuccs(const IRFunc *f, const IRInst *t) {
@@ -307,11 +320,16 @@ int ir_nsuccs(const IRFunc *f, const IRInst *t) {
         case IR_BR: return 1;
         case IR_CONDBR: return 2;
         case IR_SWITCH: return 1 + f->switches[t->imm].n;
+        case IR_IJMP:
+        case IR_ASMBR: return f->switches[t->imm].n;
         default: return 0;
     }
 }
 
 int ir_succ(const IRFunc *f, const IRInst *t, int k) {
+    if (t->op == IR_IJMP || t->op == IR_ASMBR) {
+        return f->jt[f->switches[t->imm].first + k];
+    }
     if (t->op == IR_SWITCH) {
         return k == 0 ? t->aux : f->jt[f->switches[t->imm].first + k - 1];
     }
@@ -319,7 +337,9 @@ int ir_succ(const IRFunc *f, const IRInst *t, int k) {
 }
 
 void ir_set_succ(IRFunc *f, IRInst *t, int k, int block) {
-    if (t->op == IR_SWITCH) {
+    if (t->op == IR_IJMP || t->op == IR_ASMBR) {
+        f->jt[f->switches[t->imm].first + k] = block;
+    } else if (t->op == IR_SWITCH) {
         if (k == 0) {
             t->aux = block;
         } else {
@@ -477,6 +497,20 @@ static void dump_inst(const IRFunc *f, const IRInst *i, FILE *out) {
         fprintf(out, ", b%ld, b%d", i->imm, i->aux);
         return;
     }
+    if (i->op == IR_IJMP || i->op == IR_ASMBR) {
+        const IRSwitch *sw = &f->switches[i->imm];
+        fputc(' ', out);
+        if (i->op == IR_IJMP) {
+            dump_vreg(f, i->a, out);
+            fprintf(out, ", ");
+        }
+        fprintf(out, "[");
+        for (k = 0; k < sw->n; k++) {
+            fprintf(out, "%sb%d", k ? " " : "", f->jt[sw->first + k]);
+        }
+        fputc(']', out);
+        return;
+    }
     if (i->op == IR_SWITCH) {
         const IRSwitch *sw = &f->switches[i->imm];
         fputc(' ', out);
@@ -547,6 +581,7 @@ static void dump_inst(const IRFunc *f, const IRInst *i, FILE *out) {
         case IR_ICONST:
         case IR_ADDR_LOCAL:
         case IR_ADDR_STRING:
+        case IR_LABEL_ADDR:
             fprintf(out, " %ld", i->imm);
             break;
         case IR_FCONST:
@@ -696,7 +731,7 @@ int ir_verify(IRFunc *f) {
             if (in_->op == IR_CONDBR && (!block_ok((int)in_->imm) || !block_ok(in_->aux))) {
                 problem("conditional branch to a block that does not exist", i);
             }
-            if (in_->op == IR_SWITCH) {
+            if (in_->op == IR_SWITCH || in_->op == IR_IJMP || in_->op == IR_ASMBR) {
                 if (in_->imm < 0 || in_->imm >= f->nswitches) {
                     problem("switch table index out of range", i);
                 } else {

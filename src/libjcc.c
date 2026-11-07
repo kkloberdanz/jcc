@@ -439,6 +439,14 @@ static int run(Jcc *k, const char *name, const char *text, Stage stage, char **o
      * the backend's output is checked against its subset and the host's
      * cc makes the object instead.
      */
+    if (codegen_user_asm) {
+        /*
+         * An asm statement's own instructions are not only the backend's,
+         * which are all jcc's assembler knows: the host's assembles the unit.
+         */
+        status = assemble(asm_text, asm_len, out, out_len);
+        goto cleanup;
+    }
     if (as_can_write() && !k->external_as) {
         status = as_assemble(name, asm_text, asm_len, out, out_len);
         goto cleanup;

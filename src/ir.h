@@ -52,6 +52,7 @@ typedef enum IRType {
     X(IR_ADDR_LOCAL, "addr_local")  /* dst:i64 = fp + imm */ \
     X(IR_ADDR_GLOBAL, "addr_global")/* dst:i64 = &sym; IRF_EXTERN: defined elsewhere, so through the GOT */ \
     X(IR_ADDR_STRING, "addr_string")/* dst:i64 = &string literal imm */ \
+    X(IR_LABEL_ADDR, "label_addr")  /* dst:i64 = the address of the block whose addr_label is imm (GNU &&label) */ \
     X(IR_MOV, "mov")                /* dst = a */ \
     /* memory */ \
     X(IR_LOAD, "load")              /* dst = the `size` bytes at *a, extended to the type (IRF_SIGNED) */ \
@@ -111,6 +112,11 @@ typedef enum IRType {
     X(IR_RET, "ret")                /* a (or none); IRF_RECORD: a is the address of a record returned in registers, imm its ArgType index */ \
     X(IR_UNREACHABLE, "unreachable") \
     X(IR_SWITCH, "switch")          /* a (i64) < n: to block switches[imm] entry a, else to block aux; only from -O1 */ \
+    X(IR_IJMP, "ijmp")              /* GNU `goto *a`: to the address in a, the start of one of the blocks switches[imm] lists */ \
+    X(IR_NLGOTO, "nlgoto")          /* a jump out of a GNU nested function to its label in the enclosing function whose frame */ \
+                                    /*   pointer is a: sp = *(a + imm), fp = a, then to the address in b; with imm -1 */ \
+                                    /*   (__builtin_longjmp) a is the buffer: fp = a[0], to a[1], sp = a[2] */ \
+    X(IR_ASMBR, "asmbr")            /* after an asm goto: on to block switches[imm] entry 0, unless the asm jumped to a later one */ \
     /* calls and variadic functions */ \
     X(IR_CALL, "call")              /* imm = index into calls[]; dst = the scalar result, or none */ \
     X(IR_VASTART, "va_start")       /* a = the address of the va_list */ \
@@ -137,6 +143,7 @@ typedef enum IRCond {
 #define IRF_RECORD  8u      /* ret: a record returned in registers */
 #define IRF_VOLATILE 16u    /* load, store, loadbits, storebits: a volatile object, which the optimizer leaves alone */
 #define IRF_NSW     32u     /* i32 add, sub, mul: C's signed int arithmetic, whose overflow is undefined (-O1 relies on it) */
+#define IRF_APPLY   64u     /* ret: __builtin_return, a is __builtin_apply's results block (rax, rdx, xmm0, xmm1) */
 
 typedef struct IRInst {
     unsigned char op;       /* IROp */
@@ -157,6 +164,7 @@ typedef struct IRInst {
 typedef struct IRBlock {
     int start;
     int end;                /* one past the last instruction */
+    int addr_label;         /* GNU &&label takes its address: the unit-wide number of its assembler label, else 0 */
 } IRBlock;
 
 typedef struct IRVReg {
@@ -189,7 +197,41 @@ typedef struct IRCall {
     int sret_addr;          /* the virtual register with the address a record result is written through, or -1 */
     int result_addr;        /* the virtual register with the address of the temporary a record returned in registers is stored to, or -1 */
     ArgType ret;            /* result_addr: how the record comes back */
+    int asm_index;          /* an asm statement, not a call: IRFunc.asms[asm_index - 1]; 0 for a call */
+    long chain_slot;        /* a call of a GNU nested function: the frame slot holding its static chain, which the
+                               backend puts in the chain register (x86_64 r11, arm64 x15) for it; 0 for none */
 } IRCall;
+
+/*
+ * An asm statement is a call (IRCall.asm_index) for everything but the
+ * backend: its arguments are the addresses of the frame slots its
+ * operands go through and of its memory operands, so the optimizer sees
+ * those objects escape and be changed, and it clobbers what a call does.
+ * The backend places the operands, writes the template with them, and
+ * stores the outputs.
+ */
+typedef struct IRAsmOp {
+    char kind;              /* 'r' a register, 'm' memory (its address is in the slot), 'i' a constant */
+    char specific;          /* x86: the register the constraint letter names, else 0 */
+    char fp;                /* a floating point register */
+    char is_output;
+    char is_input;          /* read before the asm: an input, or an in-out output (+) */
+    int match;              /* an input sharing output `match`'s register, else -1 */
+    int size;               /* bytes of the value */
+    long slot;              /* the frame slot: the value, or for 'm' the address */
+    long imm;               /* 'i' */
+    const char *name;       /* [name], or NULL */
+} IRAsmOp;
+
+typedef struct IRAsm {
+    const char *text;       /* the template; for a basic asm, the text to write as it is */
+    int basic;
+    IRAsmOp *ops;           /* outputs then inputs, as the template numbers them */
+    int nops;
+    const char **clobbers;  /* register names (and "memory", "cc") */
+    int nclobbers;
+    int nlabels;            /* asm goto: its labels, numbered after the operands, are the targets of the asmbr after it */
+} IRAsm;
 
 /* a jump table: IR_SWITCH's targets for the indices 0..n-1, at IRFunc.jt[first] */
 typedef struct IRSwitch {
@@ -212,7 +254,7 @@ typedef struct IRParam {
 
 typedef struct IRFunc {
     const char *name;
-    int is_global;
+    int is_global;          /* 0 static, 1 global, 2 global and weak */
     int is_variadic;
     int is_main;
     int opt_level;          /* -O: at 1 the backends and the allocator may also do what -O0 does not */
@@ -243,11 +285,20 @@ typedef struct IRFunc {
     ArgType *argtypes;      /* for ret and va_arg */
     int nargtypes;
     int argtypes_cap;
+    IRAsm *asms;            /* the asm statements (IRCall.asm_index) */
+    int nasms;
+    int asms_cap;
     char **names;           /* copies of symbol names the instructions point at, freed with the function */
     int nnames;
     int names_cap;
     long locals_size;       /* bytes below the frame pointer that lowering gave to locals and temporaries, a multiple of 16 */
     long sret_off;          /* the slot holding the hidden return pointer, 0 when there is none */
+    long apply_args_off;    /* __builtin_apply_args: the block the prologue saves the argument registers in (rdi..r9 at 8,
+                               rax at 56, xmm0..7 at 64), the stack arguments' address at 0; else 0 */
+    long chain_off;         /* a GNU nested function: the slot the prologue stores its static chain register in, else 0 */
+    size_t align;           /* __attribute__((aligned(n))) on the function: where its code starts, else 0 */
+    int save_all;           /* a nested function may jump back into this one past the epilogues of the frames between:
+                               it saves and restores every callee-saved register, as their callers expect of it */
     size_t nreg_params;     /* argument registers the named parameters used (va_start needs them) */
     size_t nfreg_params;
     size_t nstack_params;
@@ -274,6 +325,7 @@ int ir_emit(IRFunc *f, IROp op, IRType type, int dst, int a, int b);
 IRInst *ir_inst(IRFunc *f, int index);
 int ir_last(IRFunc *f);                                     /* the index of the last instruction emitted */
 int ir_add_call(IRFunc *f, const IRCall *c);                /* copies; returns its index */
+int ir_add_asm(IRFunc *f, const IRAsm *a);                  /* takes its ops and clobbers arrays; returns its index */
 int ir_add_arg(IRFunc *f, const IRArg *a);
 int ir_add_argtype(IRFunc *f, const ArgType *t);
 int ir_add_switch(IRFunc *f, const int *targets, int n);   /* a jump table; returns its index */

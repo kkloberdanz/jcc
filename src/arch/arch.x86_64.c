@@ -1,9 +1,11 @@
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "arch.h"
+#include "diag.h"
 #include "ir.h"
 #include "peep.h"
 #include "regalloc.h"
@@ -171,7 +173,8 @@ static void x64_cg_begin(FILE *out) {
 }
 
 static void x64_cg_end(void) {
-    x64_emit(".section .note.GNU-stack,\"\",@progbits");
+    /* executable when a nested function's trampoline is on the stack */
+    x64_emit(codegen_exec_stack ? ".section .note.GNU-stack,\"x\",@progbits" : ".section .note.GNU-stack,\"\",@progbits");
 }
 
 /* ------------------------------------------------------------------ */
@@ -185,7 +188,7 @@ static void x64_cg_data_begin(const char *name, int is_global, size_t align, int
         x64_emit(zero ? ".bss" : ".data");
     }
     if (is_global) {
-        x64_emit(".globl %s", name);
+        x64_emit(is_global == 2 ? ".weak %s" : ".globl %s", name);
     }
     if (align > 1) {
         x64_emit(".p2align %d", x64_log2_of(align));
@@ -206,6 +209,124 @@ static int x64_cg_alias(const char *name, const char *to, int is_global, int wea
     return 0;
 }
 
+/* the atomic helpers (src/arch.h), assembled from the instructions in each comment */
+static const AtomicHelper x64_atomics[] = {
+    /* __builtin_apply's (src/lower.c): fn, the __builtin_apply_args block, the stack bytes, the result block;
+       saves rbx and r12-r14, copies the stack arguments, loads the argument registers, calls, stores rax, rdx,
+       xmm0 and xmm1 (apply.s in the comments of the history: push rbp ... call *%r12 ... ret) */
+    { "apply", 0, "\x55\x48\x89\xe5\x53\x41\x54\x41\x55\x41\x56\x49\x89\xfc\x48\x89\xf3\x49\x89\xcd\x48\x89\xd1\x48\x83\xc1\x0f\x48\x83\xe1\xf0\x48\x29\xcc\x48\x8b\x33\x48\x89\xe7\x48\x89\xd1\xf3\xa4\x0f\x10\x43\x40\x0f\x10\x4b\x50\x0f\x10\x53\x60\x0f\x10\x5b\x70\x0f\x10\xa3\x80\x00\x00\x00\x0f\x10\xab\x90\x00\x00\x00\x0f\x10\xb3\xa0\x00\x00\x00\x0f\x10\xbb\xb0\x00\x00\x00\x48\x8b\x7b\x08\x48\x8b\x73\x10\x48\x8b\x53\x18\x48\x8b\x4b\x20\x4c\x8b\x43\x28\x4c\x8b\x4b\x30\x48\x8b\x43\x38\x41\xff\xd4\x49\x89\x45\x00\x49\x89\x55\x08\x41\x0f\x11\x45\x10\x41\x0f\x11\x4d\x20\x48\x8d\x65\xe0\x41\x5e\x41\x5d\x41\x5c\x5b\x5d\xc3", 151 },
+    /* movzbl (%rdi), %eax; ret */
+    { "load", 1, "\x0f\xb6\x07\xc3", 4 },
+    /* xchgb %sil, (%rdi); ret */
+    { "store", 1, "\x40\x86\x37\xc3", 4 },
+    /* movl %esi, %eax; xchgb %al, (%rdi); movzbl %al, %eax; ret */
+    { "xchg", 1, "\x89\xf0\x86\x07\x0f\xb6\xc0\xc3", 8 },
+    /* movl %esi, %eax; lock cmpxchgb %dl, (%rdi); movzbl %al, %eax; ret */
+    { "cas", 1, "\x89\xf0\xf0\x0f\xb0\x17\x0f\xb6\xc0\xc3", 10 },
+    /* movl %esi, %eax; lock xaddb %al, (%rdi); movzbl %al, %eax; ret */
+    { "add", 1, "\x89\xf0\xf0\x0f\xc0\x07\x0f\xb6\xc0\xc3", 10 },
+    /* movl %esi, %eax; negl %eax; lock xaddb %al, (%rdi); movzbl %al, %eax; ret */
+    { "sub", 1, "\x89\xf0\xf7\xd8\xf0\x0f\xc0\x07\x0f\xb6\xc0\xc3", 12 },
+    /* movb (%rdi), %al; 1:; movl %eax, %ecx; andl %esi, %ecx; lock cmpxchgb %cl, (%rdi); jne 1b; movzbl %al, %eax; ret */
+    { "and", 1, "\x8a\x07\x89\xc1\x21\xf1\xf0\x0f\xb0\x0f\x75\xf6\x0f\xb6\xc0\xc3", 16 },
+    /* movb (%rdi), %al; 1:; movl %eax, %ecx; orl %esi, %ecx; lock cmpxchgb %cl, (%rdi); jne 1b; movzbl %al, %eax; ret */
+    { "or", 1, "\x8a\x07\x89\xc1\x09\xf1\xf0\x0f\xb0\x0f\x75\xf6\x0f\xb6\xc0\xc3", 16 },
+    /* movb (%rdi), %al; 1:; movl %eax, %ecx; xorl %esi, %ecx; lock cmpxchgb %cl, (%rdi); jne 1b; movzbl %al, %eax; ret */
+    { "xor", 1, "\x8a\x07\x89\xc1\x31\xf1\xf0\x0f\xb0\x0f\x75\xf6\x0f\xb6\xc0\xc3", 16 },
+    /* movb (%rdi), %al; 1:; movl %eax, %ecx; andl %esi, %ecx; notl %ecx; lock cmpxchgb %cl, (%rdi); jne 1b; movzbl %al, %eax; ret */
+    { "nand", 1, "\x8a\x07\x89\xc1\x21\xf1\xf7\xd1\xf0\x0f\xb0\x0f\x75\xf4\x0f\xb6\xc0\xc3", 18 },
+    /* movzwl (%rdi), %eax; ret */
+    { "load", 2, "\x0f\xb7\x07\xc3", 4 },
+    /* xchgw %si, (%rdi); ret */
+    { "store", 2, "\x66\x87\x37\xc3", 4 },
+    /* movl %esi, %eax; xchgw %ax, (%rdi); movzwl %ax, %eax; ret */
+    { "xchg", 2, "\x89\xf0\x66\x87\x07\x0f\xb7\xc0\xc3", 9 },
+    /* movl %esi, %eax; lock cmpxchgw %dx, (%rdi); movzwl %ax, %eax; ret */
+    { "cas", 2, "\x89\xf0\x66\xf0\x0f\xb1\x17\x0f\xb7\xc0\xc3", 11 },
+    /* movl %esi, %eax; lock xaddw %ax, (%rdi); movzwl %ax, %eax; ret */
+    { "add", 2, "\x89\xf0\x66\xf0\x0f\xc1\x07\x0f\xb7\xc0\xc3", 11 },
+    /* movl %esi, %eax; negl %eax; lock xaddw %ax, (%rdi); movzwl %ax, %eax; ret */
+    { "sub", 2, "\x89\xf0\xf7\xd8\x66\xf0\x0f\xc1\x07\x0f\xb7\xc0\xc3", 13 },
+    /* movw (%rdi), %ax; 1:; movl %eax, %ecx; andl %esi, %ecx; lock cmpxchgw %cx, (%rdi); jne 1b; movzwl %ax, %eax; ret */
+    { "and", 2, "\x66\x8b\x07\x89\xc1\x21\xf1\x66\xf0\x0f\xb1\x0f\x75\xf5\x0f\xb7\xc0\xc3", 18 },
+    /* movw (%rdi), %ax; 1:; movl %eax, %ecx; orl %esi, %ecx; lock cmpxchgw %cx, (%rdi); jne 1b; movzwl %ax, %eax; ret */
+    { "or", 2, "\x66\x8b\x07\x89\xc1\x09\xf1\x66\xf0\x0f\xb1\x0f\x75\xf5\x0f\xb7\xc0\xc3", 18 },
+    /* movw (%rdi), %ax; 1:; movl %eax, %ecx; xorl %esi, %ecx; lock cmpxchgw %cx, (%rdi); jne 1b; movzwl %ax, %eax; ret */
+    { "xor", 2, "\x66\x8b\x07\x89\xc1\x31\xf1\x66\xf0\x0f\xb1\x0f\x75\xf5\x0f\xb7\xc0\xc3", 18 },
+    /* movw (%rdi), %ax; 1:; movl %eax, %ecx; andl %esi, %ecx; notl %ecx; lock cmpxchgw %cx, (%rdi); jne 1b; movzwl %ax, %eax; ret */
+    { "nand", 2, "\x66\x8b\x07\x89\xc1\x21\xf1\xf7\xd1\x66\xf0\x0f\xb1\x0f\x75\xf3\x0f\xb7\xc0\xc3", 20 },
+    /* movl (%rdi), %eax; ret */
+    { "load", 4, "\x8b\x07\xc3", 3 },
+    /* xchgl %esi, (%rdi); ret */
+    { "store", 4, "\x87\x37\xc3", 3 },
+    /* movl %esi, %eax; xchgl %eax, (%rdi); ret */
+    { "xchg", 4, "\x89\xf0\x87\x07\xc3", 5 },
+    /* movl %esi, %eax; lock cmpxchgl %edx, (%rdi); ret */
+    { "cas", 4, "\x89\xf0\xf0\x0f\xb1\x17\xc3", 7 },
+    /* movl %esi, %eax; lock xaddl %eax, (%rdi); ret */
+    { "add", 4, "\x89\xf0\xf0\x0f\xc1\x07\xc3", 7 },
+    /* movl %esi, %eax; negl %eax; lock xaddl %eax, (%rdi); ret */
+    { "sub", 4, "\x89\xf0\xf7\xd8\xf0\x0f\xc1\x07\xc3", 9 },
+    /* movl (%rdi), %eax; 1:; movl %eax, %ecx; andl %esi, %ecx; lock cmpxchgl %ecx, (%rdi); jne 1b; ret */
+    { "and", 4, "\x8b\x07\x89\xc1\x21\xf1\xf0\x0f\xb1\x0f\x75\xf6\xc3", 13 },
+    /* movl (%rdi), %eax; 1:; movl %eax, %ecx; orl %esi, %ecx; lock cmpxchgl %ecx, (%rdi); jne 1b; ret */
+    { "or", 4, "\x8b\x07\x89\xc1\x09\xf1\xf0\x0f\xb1\x0f\x75\xf6\xc3", 13 },
+    /* movl (%rdi), %eax; 1:; movl %eax, %ecx; xorl %esi, %ecx; lock cmpxchgl %ecx, (%rdi); jne 1b; ret */
+    { "xor", 4, "\x8b\x07\x89\xc1\x31\xf1\xf0\x0f\xb1\x0f\x75\xf6\xc3", 13 },
+    /* movl (%rdi), %eax; 1:; movl %eax, %ecx; andl %esi, %ecx; notl %ecx; lock cmpxchgl %ecx, (%rdi); jne 1b; ret */
+    { "nand", 4, "\x8b\x07\x89\xc1\x21\xf1\xf7\xd1\xf0\x0f\xb1\x0f\x75\xf4\xc3", 15 },
+    /* movq (%rdi), %rax; ret */
+    { "load", 8, "\x48\x8b\x07\xc3", 4 },
+    /* xchgq %rsi, (%rdi); ret */
+    { "store", 8, "\x48\x87\x37\xc3", 4 },
+    /* movq %rsi, %rax; xchgq %rax, (%rdi); ret */
+    { "xchg", 8, "\x48\x89\xf0\x48\x87\x07\xc3", 7 },
+    /* movq %rsi, %rax; lock cmpxchgq %rdx, (%rdi); ret */
+    { "cas", 8, "\x48\x89\xf0\xf0\x48\x0f\xb1\x17\xc3", 9 },
+    /* movq %rsi, %rax; lock xaddq %rax, (%rdi); ret */
+    { "add", 8, "\x48\x89\xf0\xf0\x48\x0f\xc1\x07\xc3", 9 },
+    /* movq %rsi, %rax; negq %rax; lock xaddq %rax, (%rdi); ret */
+    { "sub", 8, "\x48\x89\xf0\x48\xf7\xd8\xf0\x48\x0f\xc1\x07\xc3", 12 },
+    /* movq (%rdi), %rax; 1:; movq %rax, %rcx; andq %rsi, %rcx; lock cmpxchgq %rcx, (%rdi); jne 1b; ret */
+    { "and", 8, "\x48\x8b\x07\x48\x89\xc1\x48\x21\xf1\xf0\x48\x0f\xb1\x0f\x75\xf3\xc3", 17 },
+    /* movq (%rdi), %rax; 1:; movq %rax, %rcx; orq %rsi, %rcx; lock cmpxchgq %rcx, (%rdi); jne 1b; ret */
+    { "or", 8, "\x48\x8b\x07\x48\x89\xc1\x48\x09\xf1\xf0\x48\x0f\xb1\x0f\x75\xf3\xc3", 17 },
+    /* movq (%rdi), %rax; 1:; movq %rax, %rcx; xorq %rsi, %rcx; lock cmpxchgq %rcx, (%rdi); jne 1b; ret */
+    { "xor", 8, "\x48\x8b\x07\x48\x89\xc1\x48\x31\xf1\xf0\x48\x0f\xb1\x0f\x75\xf3\xc3", 17 },
+    /* movq (%rdi), %rax; 1:; movq %rax, %rcx; andq %rsi, %rcx; notq %rcx; lock cmpxchgq %rcx, (%rdi); jne 1b; ret */
+    { "nand", 8, "\x48\x8b\x07\x48\x89\xc1\x48\x21\xf1\x48\xf7\xd1\xf0\x48\x0f\xb1\x0f\x75\xf0\xc3", 20 },
+};
+
+static void x64_cg_atomic_helper(const char *op, int size) {
+    size_t i, k;
+    for (i = 0; i < sizeof(x64_atomics) / sizeof(x64_atomics[0]); i++) {
+        const AtomicHelper *h = &x64_atomics[i];
+        if (h->size != size || strcmp(h->op, op) != 0) {
+            continue;
+        }
+        x64_emit(".text");
+        x64_emit(".p2align 4");
+        x64_emit(".type __jcc_atomic_%s_%d, @function", op, size);
+        peep_flush();
+        fprintf(x64_cg_out, "__jcc_atomic_%s_%d:\n", op, size);
+        for (k = 0; k < h->len; k += 8) {
+            size_t j;
+            char line[128];
+            size_t n = 0;
+            n += (size_t)snprintf(line + n, sizeof(line) - n, ".byte ");
+            for (j = k; j < h->len && j < k + 8; j++) {
+                n += (size_t)snprintf(line + n, sizeof(line) - n, "%s%u", j > k ? ", " : "", (unsigned)(unsigned char)h->code[j]);
+            }
+            x64_emit("%s", line);
+        }
+        return;
+    }
+}
+
+static void x64_cg_weak_ref(const char *name) {
+    x64_emit(".weak %s", name);
+}
+
 static void x64_cg_data_int(size_t size, long value) {
     switch (size) {
         case 1: x64_emit(".byte %ld", value & 0xff); break;
@@ -214,6 +335,14 @@ static void x64_cg_data_int(size_t size, long value) {
         case 16: x64_emit(".quad %ld", value); x64_emit(".quad %d", value < 0 ? -1 : 0); break;
         default: x64_emit(".quad %ld", value); break;
     }
+}
+
+static void x64_cg_data_label_addr(int id) {
+    x64_emit(".quad .Ljcc_lbl%d", id);
+}
+
+static void x64_cg_data_label_diff(int a, int b) {
+    x64_emit(".long .Ljcc_lbl%d-.Ljcc_lbl%d", a, b);
 }
 
 static void x64_cg_data_addr(const char *name, long addend) {
@@ -317,6 +446,18 @@ static void x64_cg_args_next(ArgAlloc *a, const ArgType *t, ArgLoc *loc) {
     loc->type.hfa = 0;      /* HFAs are arm64's; here the eightbyte classes decide */
     if (kind == ARG_CX87) {
         x64_stack_bytes(a, 4, 16, loc);     /* class COMPLEX_X87: in memory */
+        return;
+    }
+    if (kind == ARG_F128) {
+        /* classes SSE and SSEUP: one vector register for the whole of it */
+        if (a->nfregs < 8) {
+            loc->in_regs = 1;
+            loc->in_fregs = 1;
+            loc->reg = loc->freg = a->nfregs++;
+            loc->nregs = 1;
+            return;
+        }
+        x64_stack_bytes(a, 2, 16, loc);
         return;
     }
     if (kind == ARG_FLOAT) {
@@ -1014,7 +1155,7 @@ static void emit_move(const Move *m) {
         /* the record's address in rax, r10 as the piece scratch: neither is an argument register */
         move(RAX, use_r(m->base_v, RAX), IR_I64);
         if (m->dst < 0) {
-            x64_emit("%s %lu(%%rax), %s", m->len > 4 ? "movq" : "movd", (unsigned long)m->off, xmm(m->fdst));
+            x64_emit("%s %lu(%%rax), %s", m->len == 16 ? "movups" : m->len > 4 ? "movq" : "movd", (unsigned long)m->off, xmm(m->fdst));
         } else {
             x64_load_word(m->dst, RAX, m->off, m->len);
         }
@@ -1074,9 +1215,317 @@ static void register_args(Move *moves, int n) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* asm statements (IRAsm, src/ir.h)                                    */
+/* ------------------------------------------------------------------ */
+
+static int x64_nasm_ids = 0;
+
+/* the register a clobber names (any width of it), as a reg64 index; NREGS + k for xmm k; -1 if none */
+static int x64_clobber_reg(const char *name) {
+    int k;
+    if (*name == '%') {
+        name++;
+    }
+    if (strncmp(name, "xmm", 3) == 0) {
+        return NREGS + atoi(name + 3);
+    }
+    for (k = 0; k < NREGS; k++) {
+        if (strcmp(name, reg64[k] + 1) == 0 || strcmp(name, reg32[k] + 1) == 0 || strcmp(name, reg16[k] + 1) == 0
+                || strcmp(name, reg8[k] + 1) == 0) {
+            return k;
+        }
+    }
+    if (strcmp(name, "ah") == 0) return RAX;
+    if (strcmp(name, "bh") == 0) return RBX;
+    if (strcmp(name, "ch") == 0) return RCX;
+    if (strcmp(name, "dh") == 0) return RDX;
+    return -1;
+}
+
+static int x64_is_callee_saved(int r) {
+    return r == RBX || r == R12 || r == R13 || r == R14 || r == R15;
+}
+
+/* append operand k of the asm, as modifier `mod` asks, to `out` */
+static void x64_asm_operand(const IRAsm *as, const int *reg, int k, int mod, char *out, size_t cap) {
+    const IRAsmOp *o = &as->ops[k];
+    size_t n = strlen(out);
+    int r = reg[k];
+    if (o->specific == 't' || o->specific == 'u') {
+        snprintf(out + n, cap - n, o->specific == 't' ? "%%st" : "%%st(1)");
+    } else if (o->kind == 'i') {
+        long v = mod == 'n' ? -o->imm : o->imm;
+        snprintf(out + n, cap - n, mod == 'c' || mod == 'n' || mod == 'P' || mod == 'p' ? "%ld" : "$%ld", v);
+    } else if (o->kind == 'm') {
+        snprintf(out + n, cap - n, "(%s)", reg64[r]);
+    } else if (o->fp) {
+        snprintf(out + n, cap - n, "%%xmm%d", r - NREGS);
+    } else if (mod == 'a') {
+        snprintf(out + n, cap - n, "(%s)", reg64[r]);
+    } else if (mod == 'z') {
+        snprintf(out + n, cap - n, "%s", o->size == 1 ? "b" : o->size == 2 ? "w" : o->size == 4 ? "l" : "q");
+    } else {
+        int size = mod == 'b' ? 1 : mod == 'w' ? 2 : mod == 'k' ? 4 : mod == 'q' ? 8 : mod == 'h' ? -1 : o->size;
+        const char *name = size == -1 ? (r == RAX ? "%ah" : r == RBX ? "%bh" : r == RCX ? "%ch" : r == RDX ? "%dh" : reg8[r])
+                           : size == 1 ? reg8[r] : size == 2 ? reg16[r] : size == 4 ? reg32[r] : reg64[r];
+        snprintf(out + n, cap - n, "%s", mod == 'V' ? name + 1 : name);
+    }
+}
+
+/* write the template with its operands in; each line of it goes out as it is */
+static void x64_asm_template(const IRAsm *as, const int *reg, const int *labels) {
+    const char *p = as->text;
+    char line[4096];
+    int id = ++x64_nasm_ids;
+    int in_alt = 0;     /* inside {att|intel}: 1 in the first alternative, 2 past the | */
+    line[0] = '\0';
+    for (; *p; p++) {
+        size_t n = strlen(line);
+        if (n + 64 >= sizeof(line)) {
+            fatal("asm template line too long");
+            return;
+        }
+        if (*p == '\n') {
+            fprintf(x64_cg_out, "\t%s\n", line);
+            line[0] = '\0';
+            continue;
+        }
+        if (!as->basic && *p == '{') {
+            in_alt = 1;
+            continue;
+        }
+        if (!as->basic && in_alt && *p == '|') {
+            in_alt = 2;
+            continue;
+        }
+        if (!as->basic && in_alt && *p == '}') {
+            in_alt = 0;
+            continue;
+        }
+        if (in_alt == 2) {
+            continue;
+        }
+        if (as->basic || *p != '%') {
+            line[n] = *p;
+            line[n + 1] = '\0';
+            continue;
+        }
+        p++;
+        if (*p == '%' || *p == '{' || *p == '}' || *p == '|') {
+            line[n] = *p;
+            line[n + 1] = '\0';
+            continue;
+        }
+        if (*p == '=') {
+            snprintf(line + n, sizeof(line) - n, "%d", id);
+            continue;
+        }
+        {
+            int mod = 0;
+            int k = -1;
+            if (isalpha((unsigned char)*p) && (isdigit((unsigned char)p[1]) || p[1] == '[')) {
+                mod = *p++;
+            }
+            if (*p == '[') {
+                const char *e = strchr(p, ']');
+                int j;
+                for (j = 0; e && j < as->nops; j++) {
+                    if (as->ops[j].name && strlen(as->ops[j].name) == (size_t)(e - p - 1)
+                            && strncmp(as->ops[j].name, p + 1, (size_t)(e - p - 1)) == 0) {
+                        k = j;
+                    }
+                }
+                p = e ? e : p + strlen(p) - 1;
+            } else if (isdigit((unsigned char)*p)) {
+                k = (int)strtol(p, (char **)&p, 10);
+                p--;
+            }
+            if (mod == 'l' && k >= as->nops && k < as->nops + as->nlabels) {
+                snprintf(line + n, sizeof(line) - n, "%s", x64_blabel(labels[k - as->nops]));
+            } else if (k >= 0 && k < as->nops) {
+                x64_asm_operand(as, reg, k, mod, line, sizeof(line));
+            } else {
+                fatal("asm template refers to an operand that does not exist");
+                return;
+            }
+        }
+    }
+    if (line[0]) {
+        fprintf(x64_cg_out, "\t%s\n", line);
+    }
+}
+
+static void x64_select_asm(const IRInst *ins, const IRAsm *as) {
+    /* every caller-saved register is free: the allocator treats the asm as a call */
+    static const int pool[] = { RDI, RSI, R8, R9, R10, R11, RCX, RDX, RAX };
+    int used[NREGS + 16];
+    int reg[64];
+    int saved[NREGS];
+    int nsaved = 0;
+    int labels[64];
+    int k, j;
+    int nf = 0;
+    int x87_depth = 0;      /* x87 inputs on the stack */
+
+    memset(used, 0, sizeof(used));
+    if (as->nops > 64 || as->nlabels > 64) {
+        fatal("too many asm operands");
+        return;
+    }
+    if (as->nlabels) {
+        /* the asmbr after the asm lists its targets: the fall through first */
+        const IRInst *br = ins + 1;
+        for (k = 0; k < as->nlabels; k++) {
+            labels[k] = x64_F->jt[x64_F->switches[br->imm].first + 1 + k];
+        }
+    }
+    for (k = 0; k < as->nclobbers; k++) {
+        int r = x64_clobber_reg(as->clobbers[k]);
+        if (r >= 0 && r < NREGS + 16) {
+            used[r] = 1;
+            if (r < NREGS && x64_is_callee_saved(r)) {
+                saved[nsaved++] = r;
+            }
+        }
+    }
+    /* the registers: named ones, then the outputs' and the inputs', an input tied to an output in that one's */
+    for (k = 0; k < as->nops; k++) {
+        const IRAsmOp *o = &as->ops[k];
+        int r = -1;
+        reg[k] = -1;
+        if (o->kind == 'i' || (o->match >= 0 && o->kind == 'r') || o->specific == 't' || o->specific == 'u') {
+            continue;   /* (the x87 ones are the stack's, see below) */
+        }
+        if (o->kind == 'r' && o->specific) {
+            r = o->specific == 'a' ? RAX : o->specific == 'b' ? RBX : o->specific == 'c' ? RCX
+                : o->specific == 'd' ? RDX : o->specific == 'S' ? RSI : RDI;
+            if (x64_is_callee_saved(r)) {
+                for (j = 0; j < nsaved && saved[j] != r; j++) {
+                }
+                if (j == nsaved) {
+                    saved[nsaved++] = r;
+                }
+            }
+        } else if (o->kind == 'r' && o->fp) {
+            for (j = nf; j < 16 && used[NREGS + j]; j++) {
+            }
+            if (j == 16) {
+                fatal("asm: no xmm register left for an operand");
+                return;
+            }
+            r = NREGS + j;
+            nf = j + 1;
+        } else {
+            for (j = 0; j < (int)(sizeof(pool) / sizeof(pool[0])) && used[pool[j]]; j++) {
+            }
+            if (j == (int)(sizeof(pool) / sizeof(pool[0]))) {
+                fatal("asm: no register left for an operand");
+                return;
+            }
+            r = pool[j];
+        }
+        used[r] = 1;
+        reg[k] = r;
+    }
+    for (k = 0; k < as->nops; k++) {
+        if (as->ops[k].match >= 0 && as->ops[k].kind == 'r') {
+            reg[k] = reg[as->ops[k].match];
+        }
+    }
+    peep_flush();
+    /* callee-saved registers the asm uses or clobbers: kept below the stack pointer's 16 aligned new place */
+    if (nsaved) {
+        fprintf(x64_cg_out, "\tsubq $%d, %%rsp\n", (nsaved * 8 + 15) & ~15);
+        for (k = 0; k < nsaved; k++) {
+            fprintf(x64_cg_out, "\tmovq %s, %d(%%rsp)\n", reg64[saved[k]], 8 * k);
+        }
+    }
+    /* the x87 inputs onto its stack: the one for st(1) first, then the one for the top */
+    for (j = 0; j < 2; j++) {
+        for (k = 0; k < as->nops; k++) {
+            const IRAsmOp *o = &as->ops[k];
+            char want = j == 0 ? 'u' : 't';
+            char sp = o->match >= 0 ? as->ops[o->match].specific : o->specific;
+            if (!o->is_input || sp != want) {
+                continue;
+            }
+            fprintf(x64_cg_out, "\t%s %ld(%%rbp)\n", o->size == 4 ? "flds" : o->size == 8 ? "fldl" : "fldt", o->slot);
+            x87_depth++;
+        }
+    }
+    /* the inputs, and the addresses of the memory operands */
+    for (k = 0; k < as->nops; k++) {
+        const IRAsmOp *o = &as->ops[k];
+        int r = reg[k];
+        if (o->kind == 'm' && !(o->match >= 0)) {
+            fprintf(x64_cg_out, "\tmovq %ld(%%rbp), %s\n", o->slot, reg64[r]);
+        } else if (o->kind == 'm') {
+            reg[k] = reg[o->match];
+        } else if (o->kind == 'r' && o->is_input && (o->specific == 't' || o->specific == 'u'
+                    || (o->match >= 0 && (as->ops[o->match].specific == 't' || as->ops[o->match].specific == 'u')))) {
+            continue;   /* on the x87 stack already */
+        } else if (o->kind == 'r' && o->is_input) {
+            if (o->fp) {
+                fprintf(x64_cg_out, "\t%s %ld(%%rbp), %%xmm%d\n", o->size == 4 ? "movss" : "movsd", o->slot, r - NREGS);
+            } else if (o->size == 1) {
+                fprintf(x64_cg_out, "\tmovzbl %ld(%%rbp), %s\n", o->slot, reg32[r]);
+            } else if (o->size == 2) {
+                fprintf(x64_cg_out, "\tmovzwl %ld(%%rbp), %s\n", o->slot, reg32[r]);
+            } else {
+                fprintf(x64_cg_out, "\tmov%s %ld(%%rbp), %s\n", o->size == 8 ? "q" : "l", o->slot, o->size == 8 ? reg64[r] : reg32[r]);
+            }
+        }
+    }
+    x64_asm_template(as, reg, labels);
+    if (x87_depth) {
+        /* the x87 outputs, from the top; then what the asm left of the inputs (an st(1) clobber says it popped one) */
+        for (k = 0; k < as->nops; k++) {
+            const IRAsmOp *o = &as->ops[k];
+            if (o->is_output && o->specific == 't' && x87_depth > 0) {
+                fprintf(x64_cg_out, "\t%s %ld(%%rbp)\n", o->size == 4 ? "fstps" : o->size == 8 ? "fstpl" : "fstpt", o->slot);
+                x87_depth--;
+            }
+        }
+        for (k = 0; k < as->nclobbers; k++) {
+            if (strcmp(as->clobbers[k], "st(1)") == 0 && x87_depth > 0) {
+                x87_depth--;
+            }
+        }
+        while (x87_depth-- > 0) {
+            fprintf(x64_cg_out, "\tfstp %%st(0)\n");
+        }
+    }
+    /* the outputs in registers, to their slots */
+    for (k = 0; k < as->nops; k++) {
+        const IRAsmOp *o = &as->ops[k];
+        int r = reg[k];
+        if (!o->is_output || o->kind != 'r' || o->specific == 't' || o->specific == 'u') {
+            continue;
+        }
+        if (o->fp) {
+            fprintf(x64_cg_out, "\t%s %%xmm%d, %ld(%%rbp)\n", o->size == 4 ? "movss" : "movsd", r - NREGS, o->slot);
+        } else {
+            const char *name = o->size == 1 ? reg8[r] : o->size == 2 ? reg16[r] : o->size == 4 ? reg32[r] : reg64[r];
+            fprintf(x64_cg_out, "\tmov%s %s, %ld(%%rbp)\n", o->size == 1 ? "b" : o->size == 2 ? "w" : o->size == 4 ? "l" : "q",
+                    name, o->slot);
+        }
+    }
+    if (nsaved) {
+        for (k = 0; k < nsaved; k++) {
+            fprintf(x64_cg_out, "\tmovq %d(%%rsp), %s\n", 8 * k, reg64[saved[k]]);
+        }
+        fprintf(x64_cg_out, "\taddq $%d, %%rsp\n", (nsaved * 8 + 15) & ~15);
+    }
+}
+
 static void x64_select_call(const IRInst *ins) {
     const IRCall *c = &x64_F->calls[ins->imm];
     ArgLoc *locs = NULL;
+    if (c->asm_index) {
+        x64_select_asm(ins, &x64_F->asms[c->asm_index - 1]);
+        return;
+    }
     Move *moves = NULL;
     int nmoves = 0;
     ArgAlloc alloc;
@@ -1159,7 +1608,14 @@ static void x64_select_call(const IRInst *ins) {
         if (!l->in_regs) {
             continue;
         }
-        if (a->by_addr) {
+        if (a->by_addr && a->type.kind == ARG_F128) {
+            Move *mv = &moves[nmoves++];
+            memset(mv, 0, sizeof(*mv));
+            mv->base_v = a->v;
+            mv->len = 16;
+            mv->dst = -1;
+            mv->fdst = (int)l->freg;
+        } else if (a->by_addr) {
             size_t n = (a->type.size + 7) / 8;
             size_t ni = 0;
             size_t nf = 0;
@@ -1215,6 +1671,9 @@ static void x64_select_call(const IRInst *ins) {
     if (c->variadic) {
         x64_emit("movl $%lu, %%eax", (unsigned long)alloc.nfregs);    /* vector registers used */
     }
+    if (c->chain_slot) {
+        x64_emit("movq %ld(%%rbp), %%r11", c->chain_slot);     /* a nested function's static chain */
+    }
     if (c->name) {
         x64_emit("call %s@PLT", c->name);
     } else {
@@ -1252,6 +1711,10 @@ static void x64_select_call(const IRInst *ins) {
             x64_emit("fstpt 16(%s)", reg64[r]);
             return;
         }
+        if (t->kind == ARG_F128) {
+            x64_emit("movups %%xmm0, (%s)", reg64[r]);
+            return;
+        }
         for (m = 0; m < n; m++) {
             if ((t->sse >> m) & 1) {
                 x64_emit("movq %s, %lu(%s)", xmm((int)nf++), (unsigned long)(8 * m), reg64[r]);
@@ -1264,7 +1727,16 @@ static void x64_select_call(const IRInst *ins) {
 
 /* a return: the value to rax / xmm0 / st(0) / rax:rdx, or a record's eightbytes, then the epilogue */
 static void x64_select_ret(const IRInst *i) {
-    if (i->flags & IRF_RECORD) {
+    if (i->flags & IRF_APPLY) {
+        int r = use_r(i->a, RDI);
+        if (r != RDI) {
+            move(RDI, r, IR_I64);
+        }
+        x64_emit("movups 16(%%rdi), %%xmm0");
+        x64_emit("movups 32(%%rdi), %%xmm1");
+        x64_emit("movq 8(%%rdi), %%rdx");
+        x64_emit("movq (%%rdi), %%rax");
+    } else if (i->flags & IRF_RECORD) {
         const ArgType *t = &x64_F->argtypes[i->imm];
         int r = use_r(i->a, RDI);
         size_t n = (t->size + 7) / 8;
@@ -1274,6 +1746,8 @@ static void x64_select_ret(const IRInst *i) {
         if (t->kind == ARG_CX87) {
             x64_emit("fldt 16(%s)", reg64[r]);     /* the real part ends up in st(0), the imaginary one in st(1) */
             x64_emit("fldt (%s)", reg64[r]);
+        } else if (t->kind == ARG_F128) {
+            x64_emit("movups (%s), %%xmm0", reg64[r]);
         } else {
             move(RDI, r, IR_I64);
             for (k = 0; k < n; k++) {
@@ -1575,6 +2049,12 @@ static int x64_select_inst(int index, int next_block) {
         case IR_ADDR_STRING:
             d = x64_def_reg(i->dst, RAX);
             x64_emit("leaq .L.str.%ld(%%rip), %s", i->imm, reg64[d]);
+            def_done_r(i->dst, d);
+            return 0;
+
+        case IR_LABEL_ADDR:
+            d = x64_def_reg(i->dst, RAX);
+            x64_emit("leaq .Ljcc_lbl%ld(%%rip), %s", i->imm, reg64[d]);
             def_done_r(i->dst, d);
             return 0;
 
@@ -2108,6 +2588,42 @@ static int x64_select_inst(int index, int next_block) {
             x64_select_ret(i);
             return 0;
 
+        case IR_IJMP:
+            a = use_r(i->a, RAX);
+            x64_emit("jmp *%s", reg64[a]);
+            return 0;
+
+        case IR_NLGOTO:
+            if (i->imm == -1) {
+                /* __builtin_longjmp: the buffer's address in rax, then the resume address, the stack and frame pointers */
+                a = use_r(i->a, RAX);
+                if (a != RAX) {
+                    move(RAX, a, IR_I64);
+                }
+                x64_emit("movq 8(%%rax), %%r10");
+                x64_emit("movq 16(%%rax), %%r11");
+                x64_emit("movq (%%rax), %%rbp");
+                x64_emit("movq %%r11, %%rsp");
+                x64_emit("jmp *%%r10");
+                return 0;
+            }
+            /* both operands in registers before rbp and rsp change */
+            a = use_r(i->a, RAX);
+            b = use_r(i->b, a == RCX ? RDX : RCX);
+            x64_emit("movq %ld(%s), %%rsp", i->imm, reg64[a]);
+            x64_emit("movq %s, %%rbp", reg64[a]);
+            x64_emit("jmp *%s", reg64[b]);
+            return 0;
+
+        case IR_ASMBR: {
+            /* the asm goto before it jumped, or falls through to the first target */
+            int target = x64_F->jt[x64_F->switches[i->imm].first];
+            if (target != next_block) {
+                x64_emit("jmp %s", x64_blabel(target));
+            }
+            return 0;
+        }
+
         case IR_UNREACHABLE:
             x64_emit("ud2");
             return 0;
@@ -2161,9 +2677,12 @@ static void x64_prologue(void) {
 
     x64_emit(".text");
     if (x64_F->is_global) {
-        x64_emit(".globl %s", x64_F->name);
+        x64_emit(x64_F->is_global == 2 ? ".weak %s" : ".globl %s", x64_F->name);
     }
     x64_emit(".type %s, @function", x64_F->name);
+    if (x64_F->align > 1) {
+        x64_emit(".p2align %d", x64_log2_of(x64_F->align));
+    }
     peep_flush();
     fprintf(x64_cg_out, "%s:\n", x64_F->name);
     x64_emit(".cfi_startproc");
@@ -2173,6 +2692,20 @@ static void x64_prologue(void) {
         x64_emit("subq $%lu, %%rsp", (unsigned long)x64_F->frame_size);
     }
     x64_saved_regs(0);
+    if (x64_F->chain_off) {
+        x64_emit("movq %%r11, %ld(%%rbp)", x64_F->chain_off);    /* a nested function's static chain */
+    }
+    if (x64_F->apply_args_off) {
+        /* __builtin_apply_args: the argument registers as they came */
+        long o = x64_F->apply_args_off;
+        for (m = 0; m < 6; m++) {
+            x64_emit("movq %s, %ld(%%rbp)", reg64[m], o + 8 + 8 * (long)m);
+        }
+        x64_emit("movq %%rax, %ld(%%rbp)", o + 56);
+        for (m = 0; m < 8; m++) {
+            x64_emit("movups %%xmm%d, %ld(%%rbp)", (int)m, o + 64 + 16 * (long)m);
+        }
+    }
     if (x64_F->is_variadic) {
         /*
          * The register save area: the six integer argument registers,
@@ -2221,6 +2754,8 @@ static void x64_prologue(void) {
             }
         } else if (l->by_ref) {
             x64_emit("movq %s, %ld(%%rbp)", reg64[l->reg], p->offset);
+        } else if (p->by_addr && l->type.kind == ARG_F128) {
+            x64_emit("movups %s, %ld(%%rbp)", xmm((int)l->freg), p->offset);
         } else if (p->by_addr) {
             /* eightbytes, each from its own register of its class */
             size_t ni = 0;
@@ -2286,6 +2821,11 @@ static void x64_cg_select(IRFunc *f) {
             x64_npreds[ir_succ(f, t, i)]++;
         }
     }
+    for (b = 0; b < f->nblocks; b++) {
+        if (f->blocks[b].addr_label) {
+            x64_npreds[b]++;    /* reached through its address, which is taken */
+        }
+    }
     {
         int next = -1;
         for (b = f->nblocks - 1; b >= 0; b--) {
@@ -2307,6 +2847,9 @@ static void x64_cg_select(IRFunc *f) {
         if (b != 0 || x64_npreds[b] > 0) {
             peep_flush();
             fprintf(x64_cg_out, "%s:\n", x64_blabel(b));
+            if (blk->addr_label) {
+                fprintf(x64_cg_out, ".Ljcc_lbl%d:\n", blk->addr_label);
+            }
         }
         for (i = blk->start; i < blk->end; i++) {
             i += x64_select_inst(i, next_of[b]);
@@ -2366,6 +2909,8 @@ static const Backend x64_backend = {
     x64_cg_data_string_addr,
     x64_cg_data_bytes,
     x64_cg_data_zero,
+    x64_cg_data_label_addr,
+    x64_cg_data_label_diff,
     x64_cg_string,
     x64_cg_stack_param_offset,
     x64_cg_args_begin,
@@ -2373,7 +2918,9 @@ static const Backend x64_backend = {
     x64_cg_args_end,
     x64_cg_record_ret_regs,
     x64_cg_select,
-    x64_cg_alias
+    x64_cg_alias,
+    x64_cg_weak_ref,
+    x64_cg_atomic_helper
 };
 
 /* the static link line of Alpine's gcc, less the stack protector library */

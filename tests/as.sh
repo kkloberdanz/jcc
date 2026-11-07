@@ -24,6 +24,8 @@ fi
 n=0
 for src in tests/*.c tests/abi/*.c; do
     name=$(basename "$src" .c)
+    # a test marked `jcc: user asm` has asm statements with instructions of their own, outside the subset by design
+    head -5 "$src" | grep -q "jcc: user asm" && continue
     for mode in arm64 x86_64; do
         if [ "$mode" = arm64 ]; then X="$ARM"; else X="$X86"; fi
         [ -n "$X" ] || continue

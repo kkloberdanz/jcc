@@ -85,6 +85,7 @@ for arch in arm64 x86_64; do
     if [ -n "$X" ]; then
         for src in tests/*.c tests/abi/*.c; do
             name=$(basename "$src" .c)
+            head -5 "$src" | grep -q "jcc: user asm" && continue    # instructions outside jcc's assembler's subset, by design
             $X -S -o "$tmp/$name.$arch.s" "$src" 2>/dev/null || continue
             n=$((n + 1))
             sh "$tmp/one.sh" "$arch" "$name" "$tmp/$name.$arch.s" || fail=$((fail + 1))

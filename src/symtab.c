@@ -53,6 +53,7 @@ static void scope_free(Scope *scope) {
         Symbol *next = sym->next;
         free(sym->name);
         free(sym->alias);
+        free(sym->asm_name);
         free(sym);
         sym = next;
     }

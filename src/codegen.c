@@ -48,7 +48,9 @@ typedef enum PieceKind {
     PIECE_INT,
     PIECE_ADDR,
     PIECE_STRING_ADDR,
-    PIECE_BYTES
+    PIECE_BYTES,
+    PIECE_LABEL_ADDR,       /* GNU &&label: `label` is its number (codegen_label_id) */
+    PIECE_LABEL_DIFF        /* &&a - &&b, 4 bytes: `label` and `label2` */
 } PieceKind;
 
 typedef struct Piece {
@@ -57,7 +59,8 @@ typedef struct Piece {
     size_t size;
     long value;        /* PIECE_INT, or the addend */
     char *name;             /* PIECE_ADDR */
-    int label;              /* PIECE_STRING_ADDR */
+    int label;              /* PIECE_STRING_ADDR, PIECE_LABEL_ADDR, PIECE_LABEL_DIFF */
+    int label2;             /* PIECE_LABEL_DIFF */
     char *bytes;            /* PIECE_BYTES, owned */
 } Piece;
 
@@ -169,6 +172,32 @@ static void record_arg_type(Type *t, ArgType *at) {
 
 void codegen_arg_type(Type *t, ArgType *at) {
     memset(at, 0, sizeof(*at));
+    if (type_is_record(t) && t->record->vm) {
+        /* GNU: a struct of a size known at run time goes by a copy's address */
+        at->size = 8;
+        at->align = 8;
+        at->kind = ARG_INT;
+        return;
+    }
+    if (type_is_vector(t)) {
+        /*
+         * A GNU vector, as GCC passes one on x86_64: up to 4 bytes in an
+         * integer register, 8 in the low half of a vector register, 16 in a
+         * whole one, larger in memory. On arm64 jcc passes it as a struct of
+         * its size (Apple's clang uses vector registers: not compatible).
+         */
+        at->size = type_size(t);
+        at->align = type_align(t) > 16 ? 16 : type_align(t);
+        if (strcmp(arch_info->name, "x86_64") == 0 && at->size == 16) {
+            at->kind = ARG_F128;
+        } else if (at->size > 16 && strcmp(arch_info->name, "x86_64") == 0) {
+            at->kind = ARG_RECORD_MEMORY;
+        } else {
+            at->kind = ARG_RECORD;
+            at->sse = strcmp(arch_info->name, "x86_64") == 0 && at->size == 8 ? 1u : 0u;
+        }
+        return;
+    }
     if (type_is_record(t)) {
         record_arg_type(t, at);
     } else if (type_is_complex(t)) {
@@ -184,6 +213,16 @@ void codegen_arg_type(Type *t, ArgType *at) {
             at->hfa_size = cs;
             at->sse = cs == 4 ? 1u : 3u;
         }
+    } else if (t->kind == TY_FLOAT128 || t->kind == TY_DECIMAL128) {
+        at->size = 16;
+        at->align = 16;
+        at->kind = ARG_F128;
+    } else if (type_is_decimal(t)) {
+        /* _Decimal32 and _Decimal64: class SSE, as a struct of one float or double would be */
+        at->size = type_size(t);
+        at->align = at->size;
+        at->kind = ARG_RECORD;
+        at->sse = 1;
     } else if (type_is_floating(t)) {
         at->size = type_size(t);
         at->align = at->size == 16 ? 16 : 8;
@@ -211,6 +250,35 @@ int codegen_sym_is_static_local(const Symbol *s) {
     return s->kind == SYM_VARIABLE && s->scope->kind != SCOPE_FILE && s->storage == STORAGE_STATIC;
 }
 
+/* a label whose address is taken (GNU &&label): its number, unique in the unit, for its assembler name */
+static int nlabel_ids = 0;
+
+int codegen_new_label_id(void) {
+    return ++nlabel_ids;
+}
+
+int codegen_label_id(Symbol *label) {
+    if (!label->value) {
+        label->value = ++nlabel_ids;
+    }
+    return (int)label->value;
+}
+
+static int nnested_names = 0;      /* numbers the GNU nested functions' assembler names */
+
+/* the atomic helpers the unit calls (AtomicHelper, src/arch.h), emitted at its end */
+static const char *const atomic_ops[] = { "load", "store", "xchg", "cas", "add", "sub", "and", "or", "xor", "nand", "apply" };
+static unsigned char atomic_used[sizeof(atomic_ops) / sizeof(atomic_ops[0])][9];
+
+void codegen_use_atomic(const char *op, int size) {
+    size_t i;
+    for (i = 0; i < sizeof(atomic_ops) / sizeof(atomic_ops[0]); i++) {
+        if (strcmp(atomic_ops[i], op) == 0) {
+            atomic_used[i][size] = 1;
+        }
+    }
+}
+
 /* what an alias (__attribute__((alias))) stands for, through any aliases of aliases; `s` itself otherwise */
 static const Symbol *alias_target(const Symbol *s) {
     int hops = 0;
@@ -224,15 +292,34 @@ static const Symbol *alias_target(const Symbol *s) {
 const char *codegen_sym_name(const Symbol *s) {
     static char buf[1024];
     s = alias_target(s);
+    if (s->asm_name) {
+        /*
+         * An asm label is the symbol's name as the assembler has it. The
+         * Mach-O backend puts C's underscore in front of every name, so
+         * the label's own one comes off there.
+         */
+        return strcmp(arch_info->name, "arm64") == 0 && s->asm_name[0] == '_' ? s->asm_name + 1 : s->asm_name;
+    }
     if (codegen_sym_is_static_local(s)) {
         snprintf(buf, sizeof(buf), "%s.%d", s->name, s->label);
+        return buf;
+    }
+    if (s->kind == SYM_FUNCTION && s->parent_fn) {
+        /* a GNU nested function: local, and named apart from any other of its name */
+        if (!s->label) {
+            ((Symbol *)s)->label = ++nnested_names;
+        }
+        snprintf(buf, sizeof(buf), "%s.%s.%d", s->parent_fn->name, s->name, s->label);
         return buf;
     }
     return s->name;
 }
 
-/* defined in this translation unit, so its address need not go through the GOT */
+/* defined in this translation unit, so its address need not go through the GOT (a weak definition may be replaced at link time) */
 int codegen_sym_defined_here(const Symbol *s) {
+    if (s->weak && !s->alias) {
+        return 0;
+    }
     s = alias_target(s);
     if (s->kind == SYM_FUNCTION) {
         return s->def != NULL;
@@ -284,6 +371,7 @@ static void add_piece(PieceKind kind, long offset, size_t size) {
 typedef struct Addr {
     const char *name;   /* a global, or NULL */
     int label;          /* a string literal, or 0 */
+    int block_label;    /* GNU &&label: codegen_label_id of the label, or 0 */
     long addend;
 } Addr;
 
@@ -381,6 +469,13 @@ static int static_addr(AST *e, Addr *a) {
         case N_STRING:
             return static_lvalue(e, a);
 
+        case N_LABEL_ADDR:
+            if (!e->sym) {
+                return 0;
+            }
+            a->block_label = codegen_label_id(e->sym);
+            return 1;
+
         case N_BINARY: {
             AST *l = e->u.binary.left;
             AST *r = e->u.binary.right;
@@ -414,7 +509,11 @@ static int static_addr(AST *e, Addr *a) {
 static void add_float_piece(long off, Type *t, long double f) {
     if (type_size(t) == 16) {
         unsigned char *enc = xrealloc(NULL, 16);
-        lower_ldouble_bytes(f, enc);
+        if (t->kind == TY_FLOAT128) {
+            lower_f128_bytes(f, enc);
+        } else {
+            lower_ldouble_bytes(f, enc);
+        }
         add_piece(PIECE_BYTES, off, 16);
         pieces[npieces - 1].bytes = (char *)enc;
         return;
@@ -429,12 +528,56 @@ static void static_scalar(long off, Type *t, AST *e) {
     long v;
     Addr a;
 
-    if (type_is_record(t) && e->kind == N_COMPOUND_LIT && e->sym) {
-        /* GNU: a static record initialized from a compound literal takes the literal's initializer */
+    while (type_is_vector(t) && (e->kind == N_IMPLICIT_CAST || e->kind == N_CAST)) {
+        e = e->u.cast.expr;     /* a vector from one of its size: the bits as they are */
+    }
+    if ((type_is_record(t) || type_is_vector(t)) && e->kind == N_COMPOUND_LIT && e->sym) {
+        /* GNU: a static record (or vector) initialized from a compound literal takes the literal's initializer */
         gen_initializer(e->sym->type, e->u.cast.expr->u.init_decl.init, off);
         return;
     }
 
+    if (type_is_decimal(t)) {
+        /* a decimal constant: a literal (negated, perhaps), or an integer or binary floating constant converted */
+        AST *x = e;
+        int neg = 0;
+        char text[64];
+        unsigned char *enc;
+        long double f;
+        for (;;) {
+            if (x->kind == N_IMPLICIT_CAST || x->kind == N_CAST) {
+                x = x->u.cast.expr;
+            } else if (x->kind == N_UNARY && (x->u.unary.op == OP_NEG || x->u.unary.op == OP_POS)) {
+                neg ^= x->u.unary.op == OP_NEG;
+                x = x->u.unary.operand;
+            } else {
+                break;
+            }
+        }
+        if (x->kind == N_FLOAT && type_is_decimal(x->type)) {
+            snprintf(text, sizeof(text), "%s", x->u.text);
+        } else if (x->type && type_is_integer(x->type) && sema_const_eval(x, &v)) {
+            if (v < 0) {
+                neg ^= 1;
+                v = -v;
+            }
+            snprintf(text, sizeof(text), "%lu", (unsigned long)v);
+        } else if (x->type && type_is_floating(x->type) && sema_const_eval_float(x, &f)) {
+            if (f < 0) {
+                neg ^= 1;
+                f = -f;
+            }
+            snprintf(text, sizeof(text), "%.40Le", f);
+        } else {
+            diag_error(e->loc, "initializer element is not a compile-time constant");
+            return;
+        }
+        enc = xrealloc(NULL, 16);
+        lower_bid_bytes(text, neg, t->kind, enc);
+        add_piece(PIECE_BYTES, off, type_size(t));
+        pieces[npieces - 1].bytes = (char *)enc;
+        return;
+    }
     if (type_is_complex(t)) {
         long double re, im;
         Type *base = type_complex_base(t);
@@ -450,6 +593,17 @@ static void static_scalar(long off, Type *t, AST *e) {
         return;
     }
     if (type_is_integer(t)) {
+        Symbol *la, *lb;
+        if (!sema_const_eval(e, &v) && sema_label_diff(e, &la, &lb)) {
+            if (type_size(t) != 4) {
+                diag_error(e->loc, "a label difference in a static initializer must be a 4 byte integer");
+                return;
+            }
+            add_piece(PIECE_LABEL_DIFF, off, 4);
+            pieces[npieces - 1].label = codegen_label_id(la);
+            pieces[npieces - 1].label2 = codegen_label_id(lb);
+            return;
+        }
         if (!sema_const_eval(e, &v)) {
             diag_error(e->loc, "initializer element is not a compile-time constant");
             return;
@@ -494,7 +648,14 @@ static void static_scalar(long off, Type *t, AST *e) {
         diag_error(e->loc, "initializer element is not a compile-time constant");
         return;
     }
-    if (a.name) {
+    if (a.block_label) {
+        if (a.addend || a.name || a.label) {
+            diag_error(e->loc, "a label address in a static initializer cannot have an offset");
+            return;
+        }
+        add_piece(PIECE_LABEL_ADDR, off, type_size(t));
+        pieces[npieces - 1].label = a.block_label;
+    } else if (a.name) {
         add_piece(PIECE_ADDR, off, type_size(t));
         pieces[npieces - 1].name = (char *)a.name;
     } else if (a.label) {
@@ -512,7 +673,17 @@ static void static_scalar(long off, Type *t, AST *e) {
 
 static void emit_scalar(long off, Type *t, AST *e) {
     if (init_static) {
+        size_t before = npieces;
         static_scalar(off, t, e);
+        if (lower_init_reverse && npieces == before + 1 && pieces[before].kind == PIECE_INT && pieces[before].size > 1) {
+            /* scalar_storage_order: the bytes the other way round */
+            unsigned long v = (unsigned long)pieces[before].value, r = 0;
+            size_t k;
+            for (k = 0; k < pieces[before].size; k++) {
+                r = r << 8 | ((v >> (8 * k)) & 0xff);
+            }
+            pieces[before].value = (long)r;
+        }
     } else {
         lower_init_scalar(off, t, e);
     }
@@ -643,6 +814,17 @@ static void init_bitfield(Member *m, InitCursor *c, long off) {
         diag_error(item->loc, "initializer element is not a compile-time constant");
         return;
     }
+    if (m->reverse) {
+        /* scalar_storage_order: counted from the unit's top, its bytes most significant first */
+        v = (long)(((unsigned long)v & mask) << (unit * 8 - m->bit_offset - (unsigned)m->bits));
+        for (k = 0; k < unit; k++) {
+            long byte = (v >> (8 * (unit - 1 - k))) & 0xff;
+            if (byte) {
+                byte_piece(off + (long)k)->value |= byte;
+            }
+        }
+        return;
+    }
     v = (long)(((unsigned long)v & mask) << m->bit_offset);
     for (k = 0; k < unit; k++) {
         long byte = (v >> (8 * k)) & 0xff;
@@ -689,7 +871,8 @@ static void gen_init_elem(Type *t, InitCursor *c, long off) {
         return;
     }
     if (t->kind == TY_ARRAY || type_is_record(t)) {
-        if (type_is_record(t) && item->type && type_is_record(item->type)) {
+        if ((type_is_record(t) && item->type && type_is_record(item->type))
+                || (type_is_vector(t) && item->type && type_is_vector(item->type))) {
             gen_advance(c);
             emit_scalar(off, t, item);
             return;
@@ -762,7 +945,10 @@ static void gen_init_object(Type *t, InitCursor *c, long off, int top) {
             if (m->bits >= 0) {
                 init_bitfield(m, c, off + (long)m->offset);
             } else {
+                int saved = lower_init_reverse;
+                lower_init_reverse = m->reverse;
                 gen_init_elem(m->type, c, off + (long)m->offset);
+                lower_init_reverse = saved;
             }
             i++;
         }
@@ -889,6 +1075,12 @@ static void flush_pieces(size_t total) {
             case PIECE_STRING_ADDR:
                 cg->data_string_addr(p->label, p->value);
                 break;
+            case PIECE_LABEL_ADDR:
+                cg->data_label_addr(p->label);
+                break;
+            case PIECE_LABEL_DIFF:
+                cg->data_label_diff(p->label, p->label2);
+                break;
             case PIECE_BYTES:
                 cg->data_bytes(p->bytes, p->size);
                 free(p->bytes);
@@ -916,11 +1108,11 @@ static void gen_global(Symbol *s) {
     }
     size = type_size(t);
     if (!init) {
-        cg->data_begin(codegen_sym_name(s), s->storage != STORAGE_STATIC, type_align(t), 1, s->tls);
+        cg->data_begin(codegen_sym_name(s), s->storage == STORAGE_STATIC ? 0 : s->weak ? 2 : 1, type_align(t), 1, s->tls);
         cg->data_zero(size ? size : 1);
         return;
     }
-    cg->data_begin(codegen_sym_name(s), s->storage != STORAGE_STATIC, type_align(t), 0, s->tls);
+    cg->data_begin(codegen_sym_name(s), s->storage == STORAGE_STATIC ? 0 : s->weak ? 2 : 1, type_align(t), 0, s->tls);
     init_static = 1;
     npieces = 0;
     gen_initializer(t, init, 0);
@@ -1069,8 +1261,17 @@ static void mark_refs(AST *n) {
         case N_WHILE:
         case N_DO:
         case N_RETURN:
+        case N_GOTO:
             mark_refs(n->u.stmt.expr);
             mark_refs(n->u.stmt.body);
+            break;
+        case N_ASM_STMT:
+            for (i = 0; n->u.asmst.outputs && i < n->u.asmst.outputs->len; i++) {
+                mark_refs(n->u.asmst.outputs->items[i]->u.asmop.expr);
+            }
+            for (i = 0; n->u.asmst.inputs && i < n->u.asmst.inputs->len; i++) {
+                mark_refs(n->u.asmst.inputs->items[i]->u.asmop.expr);
+            }
             break;
         case N_FOR:
             mark_refs(n->u.loop.init);
@@ -1083,7 +1284,44 @@ static void mark_refs(AST *n) {
     }
 }
 
+/* the GNU nested functions in a function's body, each before those nested in it */
+static void collect_nested(AST *n, AST ***list, size_t *len) {
+    size_t i;
+    if (!n) {
+        return;
+    }
+    switch (n->kind) {
+        case N_FUNCTION_DEF:
+            *list = xrealloc(*list, (*len + 1) * sizeof(AST *));
+            (*list)[(*len)++] = n;
+            collect_nested(n->u.func.body, list, len);
+            return;
+        case N_COMPOUND:
+            for (i = 0; i < n->u.block.items->len; i++) {
+                collect_nested(n->u.block.items->items[i], list, len);
+            }
+            return;
+        case N_IF:
+            collect_nested(n->u.cond.then, list, len);
+            collect_nested(n->u.cond.otherwise, list, len);
+            return;
+        case N_FOR:
+            collect_nested(n->u.loop.body, list, len);
+            return;
+        case N_LABEL: case N_CASE: case N_DEFAULT: case N_SWITCH: case N_WHILE: case N_DO:
+            collect_nested(n->u.stmt.body, list, len);
+            return;
+        default:
+            return;
+    }
+}
+
+int codegen_user_asm = 0;
+int codegen_exec_stack = 0;
+
 int codegen(AST *tu, SymTab *symtab, FILE *output) {
+    codegen_exec_stack = 0;
+    codegen_user_asm = 0;
     int errors_before = diag_error_count();
     Symbol *s;
     size_t i;
@@ -1154,20 +1392,40 @@ int codegen(AST *tu, SymTab *symtab, FILE *output) {
 
     if (codegen_opt_level > 0) {
         /* the whole unit first, so that the optimizer can inline across functions; then each in order */
-        IRFunc **funcs = xmalloc((tu->u.list->len + 1) * sizeof(IRFunc *));
-        char *droppable = xmalloc(tu->u.list->len + 1);
-        char *emit = xmalloc(tu->u.list->len + 1);
+        size_t cap = tu->u.list->len + 1;
+        IRFunc **funcs = xmalloc(cap * sizeof(IRFunc *));
+        char *droppable = xmalloc(cap);
+        char *emit;
         int n = 0, k;
         for (i = 0; i < tu->u.list->len; i++) {
             AST *item = tu->u.list->items[i];
-            if (item->kind == N_FUNCTION_DEF && (!item->sym || item->sym->used)) {
+            if (item->kind == N_FUNCTION_DEF && (!item->sym || item->sym->used)
+                    && !(lower_uses_va_arg_pack(item) && item->sym && !item->sym->addr_taken)) {
+                AST **nested = NULL;
+                size_t nnested = 0, j;
                 IRFunc *f = lower_function(item);
                 if (f) {
                     droppable[n] = (char)(item->sym && item->sym->storage == STORAGE_STATIC && !item->sym->addr_taken);
                     funcs[n++] = f;
                 }
+                /* its GNU nested functions, after it (whose frame layout they use) */
+                collect_nested(item->u.func.body, &nested, &nnested);
+                for (j = 0; j < nnested; j++) {
+                    if (!nested[j]->sym || !nested[j]->sym->used || !(f = lower_function(nested[j]))) {
+                        continue;
+                    }
+                    if ((size_t)n + 1 >= cap) {
+                        cap *= 2;
+                        funcs = xrealloc(funcs, cap * sizeof(IRFunc *));
+                        droppable = xrealloc(droppable, cap);
+                    }
+                    droppable[n] = 0;
+                    funcs[n++] = f;
+                }
+                free(nested);
             }
         }
+        emit = xmalloc((size_t)n + 1);
         opt_unit(funcs, n, droppable, emit);
         for (k = 0; k < n; k++) {
             if (emit[k]) {
@@ -1182,11 +1440,21 @@ int codegen(AST *tu, SymTab *symtab, FILE *output) {
     } else {
         for (i = 0; i < tu->u.list->len; i++) {
             AST *item = tu->u.list->items[i];
-            if (item->kind == N_FUNCTION_DEF && (!item->sym || item->sym->used)) {
+            if (item->kind == N_FUNCTION_DEF && (!item->sym || item->sym->used)
+                    && !(lower_uses_va_arg_pack(item) && item->sym && !item->sym->addr_taken)) {
+                AST **nested = NULL;
+                size_t nnested = 0, j;
                 IRFunc *f = lower_function(item);
                 if (f) {
                     lower_emit(f);
                 }
+                collect_nested(item->u.func.body, &nested, &nnested);
+                for (j = 0; j < nnested; j++) {
+                    if (nested[j]->sym && nested[j]->sym->used && (f = lower_function(nested[j])) != NULL) {
+                        lower_emit(f);
+                    }
+                }
+                free(nested);
             }
         }
     }
@@ -1194,6 +1462,25 @@ int codegen(AST *tu, SymTab *symtab, FILE *output) {
     for (i = 0; i < nstrings; i++) {
         cg->string(strings[i].label, strings[i].bytes, strings[i].len);
         free(strings[i].bytes);
+    }
+    {
+        size_t k;
+        int size;
+        for (k = 0; k < sizeof(atomic_ops) / sizeof(atomic_ops[0]); k++) {
+            for (size = 0; size <= 8; size = size ? size * 2 : 1) {
+                if (atomic_used[k][size]) {
+                    cg->atomic_helper(atomic_ops[k], size);
+                    atomic_used[k][size] = 0;
+                }
+            }
+        }
+    }
+    for (s = symtab->file->first; s; s = s->next) {
+        /* a weak reference: a symbol that may stay undefined, its address then null */
+        if (s->ns == NS_ORDINARY && s->weak && !s->alias && (s->kind == SYM_FUNCTION ? !s->def : s->kind == SYM_VARIABLE
+                && s->storage == STORAGE_EXTERN && !s->def)) {
+            cg->weak_ref(codegen_sym_name(s));
+        }
     }
     for (s = symtab->file->first; s; s = s->next) {
         if (s->ns == NS_ORDINARY && s->alias_to

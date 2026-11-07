@@ -77,8 +77,17 @@ struct Symbol {
     int addr_taken;         /* functions: referenced other than as the callee of a direct call (by emitted code or an initializer) */
     int tls;                /* variables: _Thread_local (or __thread), one object per thread */
     char *alias;            /* __attribute__((alias("target"))): the name it is another name for, else NULL */
-    int weak;               /* with alias: __attribute__((weak)) */
+    int weak;               /* __attribute__((weak)): a weak definition, or a weak reference to one elsewhere */
     struct Symbol *alias_to;    /* with alias: the symbol named, once code generation found it */
+    char *asm_name;         /* `__asm__("name")` after its declarator: the assembler name in place of its own */
+    /* GNU nested functions */
+    struct Symbol *parent_fn;   /* a nested function: the function it is defined in */
+    struct Symbol *owner_fn;    /* a local a nested function uses (captured): the function whose frame it is in */
+    int captured;               /* a local that a function nested in its own uses: it lives in memory */
+    long chain_off;             /* a nested function: the frame slot of its static chain (set by lowering) */
+    long tramp_off;             /* a nested function whose address is taken: its trampoline, in its parent's frame */
+    int nonlocal_target;        /* a function with a label a nested one jumps to (or takes the address of) */
+    long nl_sp_off;             /* and the slot its stack pointer is kept in, for the jump (set by lowering) */
 };
 
 struct Scope {

@@ -23,6 +23,7 @@
 #include "src/symtab.h"
 #include "src/parse.h"
 #include "src/diag.h"
+#include "src/util.h"
 
 #define YYERROR_VERBOSE
 #define YYSTYPE AST *
@@ -189,6 +190,8 @@ static Symbol *ident_sym = NULL;
  */
 static int function_body_pending = 0;
 static Symbol *current_function = NULL;
+static Symbol *function_stack[64];     /* the enclosing functions' current_function, around a nested one */
+static int function_depth = 0;
 
 static void declare_declarator(AST *init_decl);
 static void declare_param(AST *param);
@@ -204,11 +207,17 @@ static void func_begin(AST *declarator);
 static void func_end(AST *fdef);
 static void block_begin(Loc loc);
 static void block_end(AST *block);
+/* GNU local labels (__label__): the name a label written `name` has here, and declaring one */
+static char *local_label(char *name);
+static void declare_local_label(char *name);
 /* close a for's scope; with items, wrap them in a block that owns the scope */
 static AST *for_end(ASTList *items);
 
 /* steal the name out of an identifier token's node and free the node */
 static char *take_name(AST *ident);
+
+/* the list out of a temporary InitList node (NULL stays NULL) */
+static ASTList *asm_take_list(AST *node);
 
 /* pull the expression (possibly NULL) out of an expression statement */
 static AST *unwrap_expr_stmt(AST *stmt);
@@ -250,7 +259,7 @@ char *strdup(const char *s);
     if ($$ != tree) {
         ast_free($$);
     }
-} IDENTIFIER CONSTANT STRING_LITERAL TYPE_NAME ATTRIBUTE ASM PRAGMA
+} IDENTIFIER CONSTANT STRING_LITERAL TYPE_NAME ATTRIBUTE ASM ASM_EXT PRAGMA
     abstract_declarator additive_expression and_expression any_identifier argument_expression_list array_qualifiers array_suffix assignment_expression assignment_operator
     attribute_list basic_type_specifier block_item block_item_list cast_expression compound_statement conditional_expression
     constant_expression declaration declaration_list declaration_specifiers declarator designated_initializer designator designator_list
@@ -262,8 +271,9 @@ char *strdup(const char *s);
     primary_expression relational_expression selection_statement shift_expression specifier_qualifier_list statement storage_class_specifier string_literal
     struct_declaration struct_declaration_list struct_declarator struct_declarator_list struct_or_union struct_or_union_keyword struct_or_union_specifier translation_unit
     type_name type_qualifier type_qualifier_list type_specifier unary_expression unary_operator
-    aligned_attribute alignment_specifier
-%token ATTRIBUTE ASM PRAGMA ALIGNED_ATTR ALIGNAS
+    aligned_attribute alignment_specifier asm_statement asm_outputs asm_inputs asm_operand_list asm_operand asm_clobbers asm_clobber_list asm_labels asm_label_list
+    asm_operand_list_opt asm_clobber_list_opt asm_label_list_opt nested_function_definition
+%token ATTRIBUTE ASM PRAGMA ALIGNED_ATTR ALIGNAS TYPEOF AUTO_TYPE ATOMIC ATOMIC_SPEC LOCAL_LABEL ASM_EXT TYPES_COMPAT DECIMAL32 DECIMAL64 DECIMAL128
 
 /*
  * After a declarator, prefer shifting a trailing __attribute__ or __asm
@@ -446,6 +456,12 @@ unary_expression
         {
             $$ = ast_unary(@$, OP_PREDEC, $2);
         }
+    | AND_OP any_identifier
+        {
+            /* GNU &&label: the label's address */
+            $$ = ast_new(N_LABEL_ADDR, @$);
+            $$->u.stmt.name = local_label(take_name($2));
+        }
     | unary_operator cast_expression
         {
             $1->u.unary.operand = $2;
@@ -479,6 +495,13 @@ unary_expression
             $$ = ast_new(N_VA_ARG, @$);
             $$->u.cast.expr = $3;
             $$->u.cast.type = $5;
+        }
+    | TYPES_COMPAT '(' type_name ',' type_name ')'
+        {
+            /* sema folds this to 0 or 1 */
+            $$ = ast_new(N_TYPES_COMPAT, @$);
+            $$->u.cast.type = $3;
+            $$->u.cast.expr = $5;
         }
     | BUILTIN_OFFSETOF '(' type_name ',' offsetof_member ')'
         {
@@ -1074,11 +1097,57 @@ basic_type_specifier
             $$ = ast_new(N_TYPE_SPEC, @$);
             $$->u.type_spec = TS_FLOAT128;
         }
+    | DECIMAL32
+        {
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPE_SPEC, @$);
+            $$->u.type_spec = TS_DECIMAL32;
+        }
+    | DECIMAL64
+        {
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPE_SPEC, @$);
+            $$->u.type_spec = TS_DECIMAL64;
+        }
+    | DECIMAL128
+        {
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPE_SPEC, @$);
+            $$->u.type_spec = TS_DECIMAL128;
+        }
     | COMPLEX
         {
             spec_seen_type = 1;
             $$ = ast_new(N_TYPE_SPEC, @$);
             $$->u.type_spec = TS_COMPLEX;
+        }
+    | AUTO_TYPE
+        {
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPE_SPEC, @$);
+            $$->u.type_spec = TS_AUTO_TYPE;
+        }
+    | typeof_lparen expression ')'
+        {
+            spec_pop();
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPEOF, @$);
+            $$->u.cast.expr = $2;
+        }
+    | typeof_lparen type_name ')'
+        {
+            spec_pop();
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPEOF, @$);
+            $$->u.cast.type = $2;
+        }
+    | atomic_lparen type_name ')'
+        {
+            spec_pop();
+            spec_seen_type = 1;
+            $$ = ast_new(N_TYPEOF, @$);
+            $$->u.cast.type = $2;
+            $$->u.cast.align = 1;
         }
     | SIGNED
         {
@@ -1224,7 +1293,8 @@ aligned_attribute
         {
             $$ = ast_new(N_ALIGNAS, @$);
             $$->u.cast.expr = $3;
-            $$->u.cast.align = 1;
+            $$->u.cast.align = $1 && strcmp($1->u.text, "vector_size") == 0 ? 2 : 1;
+            ast_free($1);
         }
     ;
 
@@ -1566,6 +1636,11 @@ type_qualifier
             $$ = ast_new(N_TYPE_QUAL, @$);
             $$->u.qual = QUAL_VOLATILE;
         }
+    | ATOMIC
+        {
+            $$ = ast_new(N_TYPE_QUAL, @$);
+            $$->u.qual = QUAL_ATOMIC;
+        }
     | RESTRICT
         {
             $$ = ast_new(N_TYPE_QUAL, @$);
@@ -1698,6 +1773,22 @@ param_lparen
 
 lbrack
     : '['
+        {
+            spec_push();
+        }
+    ;
+
+/* C11 `_Atomic (`, the specifier (the lexer tells it from the qualifier by the parenthesis) */
+atomic_lparen
+    : ATOMIC_SPEC '('
+        {
+            spec_push();
+        }
+    ;
+
+/* GNU `typeof (`: what follows is an expression or a type name of its own */
+typeof_lparen
+    : TYPEOF '('
         {
             spec_push();
         }
@@ -2137,13 +2228,179 @@ statement
         {
             $$ = $1;
         }
+    | asm_statement
+        {
+            $$ = $1;
+        }
+    ;
+
+/*
+ * GNU asm statements. A basic one (no operands) is a single token; an
+ * extended one's keyword (ASM_EXT, with its qualifiers) is followed by
+ * the parenthesised template, outputs, inputs, clobbers and (asm goto)
+ * labels as tokens.
+ */
+asm_statement
+    : ASM ';'
+        {
+            $$ = ast_new(N_ASM_STMT, @$);
+            $$->u.asmst.text = $1->u.text;
+            $1->u.text = NULL;
+            ast_free($1);
+        }
+    | ASM_EXT '(' string_literal asm_outputs ')' ';'
+        {
+            $$ = $4;
+            $$->loc = @$;
+            $$->u.asmst.is_goto = strstr($1->u.text, "goto") != NULL;
+            ast_free($1);
+            $$->u.asmst.tmpl = $3;
+        }
+    ;
+
+/*
+ * The parts after the template, each begun by its colon and each
+ * optional, but only from the end: the colons say which is which. The
+ * value is the AsmStmt node they go in.
+ */
+asm_outputs
+    : /* empty */
+        {
+            $$ = ast_new(N_ASM_STMT, @$);
+        }
+    | ':' asm_operand_list_opt asm_inputs
+        {
+            $$ = $3;
+            $$->u.asmst.outputs = asm_take_list($2);
+        }
+    ;
+
+asm_inputs
+    : /* empty */
+        {
+            $$ = ast_new(N_ASM_STMT, @$);
+        }
+    | ':' asm_operand_list_opt asm_clobbers
+        {
+            $$ = $3;
+            $$->u.asmst.inputs = asm_take_list($2);
+        }
+    ;
+
+asm_clobbers
+    : /* empty */
+        {
+            $$ = ast_new(N_ASM_STMT, @$);
+        }
+    | ':' asm_clobber_list_opt asm_labels
+        {
+            $$ = $3;
+            $$->u.asmst.clobbers = asm_take_list($2);
+        }
+    ;
+
+asm_labels
+    : /* empty */
+        {
+            $$ = ast_new(N_ASM_STMT, @$);
+        }
+    | ':' asm_label_list_opt
+        {
+            $$ = ast_new(N_ASM_STMT, @$);
+            $$->u.asmst.labels = asm_take_list($2);
+        }
+    ;
+
+asm_operand_list_opt
+    : /* empty */
+        {
+            $$ = NULL;
+        }
+    | asm_operand_list
+        {
+            $$ = $1;
+        }
+    ;
+
+asm_clobber_list_opt
+    : /* empty */
+        {
+            $$ = NULL;
+        }
+    | asm_clobber_list
+        {
+            $$ = $1;
+        }
+    ;
+
+asm_label_list_opt
+    : /* empty */
+        {
+            $$ = NULL;
+        }
+    | asm_label_list
+        {
+            $$ = $1;
+        }
+    ;
+
+asm_operand_list
+    : asm_operand
+        {
+            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_push(NULL, $1));
+        }
+    | asm_operand_list ',' asm_operand
+        {
+            ast_list_push($1->u.list, $3);
+            $$ = $1;
+        }
+    ;
+
+asm_operand
+    : string_literal '(' expression ')'
+        {
+            $$ = ast_new(N_ASM_OPERAND, @$);
+            $$->u.asmop.constraint = $1;
+            $$->u.asmop.expr = $3;
+        }
+    | '[' any_identifier ']' string_literal '(' expression ')'
+        {
+            $$ = ast_new(N_ASM_OPERAND, @$);
+            $$->u.asmop.name = take_name($2);
+            $$->u.asmop.constraint = $4;
+            $$->u.asmop.expr = $6;
+        }
+    ;
+
+asm_clobber_list
+    : string_literal
+        {
+            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_push(NULL, $1));
+        }
+    | asm_clobber_list ',' string_literal
+        {
+            ast_list_push($1->u.list, $3);
+            $$ = $1;
+        }
+    ;
+
+asm_label_list
+    : any_identifier
+        {
+            $$ = ast_list_node(N_INIT_LIST, @$, ast_list_push(NULL, ast_name(N_GOTO, @1, local_label(take_name($1)))));
+        }
+    | asm_label_list ',' any_identifier
+        {
+            ast_list_push($1->u.list, ast_name(N_GOTO, @3, local_label(take_name($3))));
+            $$ = $1;
+        }
     ;
 
 /* a label is declared at its colon, so that `x: x: ;` reports the second one */
 labeled_statement
     : IDENTIFIER ':'
         {
-            $$ = pending_push(ast_name(N_LABEL, @1, take_name($1)));
+            $$ = pending_push(ast_name(N_LABEL, @1, local_label(take_name($1))));
             $1 = NULL;
             declare_label($$);
         }
@@ -2204,6 +2461,44 @@ block_item
     | pragma
         {
             $$ = ast_stmt(N_EXPR_STMT, @$, NULL, NULL);
+        }
+    | LOCAL_LABEL local_label_list ';'
+        {
+            $$ = ast_stmt(N_EXPR_STMT, @$, NULL, NULL);
+        }
+    | nested_function_definition
+        {
+            $$ = $1;
+        }
+    ;
+
+/* GNU nested functions: a definition among a block's items, which sees the enclosing functions' locals */
+nested_function_definition
+    : declaration_specifiers declarator
+        {
+            func_begin($2);
+        }
+      function_body
+        {
+            $$ = $4;
+            $$->loc = @$;
+            $$->u.func.specs = $1->u.list;
+            $$->u.func.declarator = $2;
+            $1->u.list = NULL;
+            ast_free($1);
+            func_end($$);
+        }
+    ;
+
+/* GNU `__label__ a, b;`: labels of these names in this block are its own */
+local_label_list
+    : any_identifier
+        {
+            declare_local_label(take_name($1));
+        }
+    | local_label_list ',' any_identifier
+        {
+            declare_local_label(take_name($3));
         }
     ;
 
@@ -2310,7 +2605,13 @@ for_begin
 jump_statement
     : GOTO any_identifier ';'
         {
-            $$ = ast_name(N_GOTO, @$, take_name($2));
+            $$ = ast_name(N_GOTO, @$, local_label(take_name($2)));
+        }
+    | GOTO '*' expression ';'
+        {
+            /* GNU computed goto */
+            $$ = ast_new(N_GOTO, @$);
+            $$->u.stmt.expr = $3;
         }
     | CONTINUE ';'
         {
@@ -2629,6 +2930,24 @@ static int translate_tok(const Token *tok) {
             return FLOAT128;
         case TOK_COMPLEX:
             return COMPLEX;
+        case TOK_TYPEOF:
+            return TYPEOF;
+        case TOK_DECIMAL32:
+            return DECIMAL32;
+        case TOK_DECIMAL64:
+            return DECIMAL64;
+        case TOK_DECIMAL128:
+            return DECIMAL128;
+        case TOK_TYPES_COMPAT:
+            return TYPES_COMPAT;
+        case TOK_ASM_EXT:
+            return ASM_EXT;
+        case TOK_LOCAL_LABEL:
+            return LOCAL_LABEL;
+        case TOK_ATOMIC:
+            return ATOMIC;
+        case TOK_AUTO_TYPE:
+            return AUTO_TYPE;
         case TOK_BUILTIN_OFFSETOF:
             return BUILTIN_OFFSETOF;
         case TOK_GENERIC:
@@ -2756,7 +3075,9 @@ static AST *token_value(const Token *tok, Loc loc) {
         case TOK_STRING:
             return ast_text(N_STRING, loc, strdup(tok->repr));
         case TOK_ATTRIBUTE:
+        case TOK_ALIGNED_ATTR:
         case TOK_ASM:
+        case TOK_ASM_EXT:
         case TOK_PRAGMA:
         case TOK_NORETURN:
             return ast_text(N_ATTRIBUTE, loc, strdup(tok->repr));
@@ -2802,6 +3123,9 @@ static int yylex(void) {
         current_token = skip_attribute(current_token);
         tok = translate_tok(&current_token->tok);
     }
+    if (tok == ATOMIC && current_token->next && current_token->next->tok.kind == TOK_LPAREN) {
+        tok = ATOMIC_SPEC;      /* `_Atomic (type name)`, the specifier */
+    }
     if (tok == ':' && (prev_tok == ENUM || prev_tok == IDENTIFIER || prev_tok == TYPE_NAME || prev_tok == ATTRIBUTE)
             && current_token->next && starts_type(&current_token->next->tok)) {
         tok = ENUM_COLON;
@@ -2810,10 +3134,6 @@ static int yylex(void) {
     yylloc.line = current_token->tok.lineno;
     yylloc.col = current_token->tok.col;
     yylval = token_value(&current_token->tok, yylloc);
-    if (tok == ATTRIBUTE && strstr(current_token->tok.repr, "vector_size")) {
-        /* ignoring it would turn vector arithmetic into scalar arithmetic */
-        diag_error(token_loc(), "vector types (__attribute__((vector_size))) are not supported");
-    }
     if (yylval && current_token->tok.kind == TOK_ID) {
         /* an identifier refers to whatever is in scope where it appears */
         yylval->sym = ident_sym;
@@ -2838,6 +3158,17 @@ static int yylex(void) {
         after_kr_list = 0;
     }
     return tok;
+}
+
+static ASTList *asm_take_list(AST *node) {
+    ASTList *list;
+    if (!node) {
+        return NULL;
+    }
+    list = node->u.list;
+    node->u.list = NULL;
+    ast_free(node);
+    return list;
 }
 
 static char *take_name(AST *ident) {
@@ -3012,6 +3343,11 @@ static void func_begin(AST *declarator) {
     }
     spec_reset();
     in_typedef = 0;
+    if (function_depth == (int)(sizeof(function_stack) / sizeof(function_stack[0]))) {
+        fatal_error("functions nested too deeply");
+        return;
+    }
+    function_stack[function_depth++] = current_function;
     current_function = symtab_declare(
         symtab, NS_ORDINARY, SYM_FUNCTION, name, declarator, declarator->loc
     );
@@ -3035,13 +3371,57 @@ static void func_end(AST *fdef) {
     if (current_function && !current_function->def) {
         current_function->def = fdef;
     }
-    current_function = NULL;
+    current_function = function_depth ? function_stack[--function_depth] : NULL;
     spec_reset();
 }
 
 /* blocks */
 
+/*
+ * GNU local labels. `__label__ x;` at the start of a block makes the
+ * labels named x inside it the block's own: the parser renames them to
+ * a name no other label can have (x.N), so that a macro's statement
+ * expression can define the same label each time it is expanded.
+ */
+typedef struct LocalLabel {
+    char *name;
+    char *unique;
+    int depth;
+} LocalLabel;
+static LocalLabel *local_labels = NULL;
+static size_t nlocal_labels = 0;
+static size_t local_labels_cap = 0;
+static int block_depth = 0;
+static int nunique_labels = 0;
+
+static void declare_local_label(char *name) {
+    char buf[32];
+    if (nlocal_labels == local_labels_cap) {
+        local_labels_cap = local_labels_cap ? local_labels_cap * 2 : 16;
+        local_labels = xrealloc(local_labels, local_labels_cap * sizeof(*local_labels));
+    }
+    snprintf(buf, sizeof(buf), ".%d", ++nunique_labels);
+    local_labels[nlocal_labels].unique = xmalloc(strlen(name) + strlen(buf) + 1);
+    strcpy(local_labels[nlocal_labels].unique, name);
+    strcat(local_labels[nlocal_labels].unique, buf);
+    local_labels[nlocal_labels].name = name;
+    local_labels[nlocal_labels].depth = block_depth;
+    nlocal_labels++;
+}
+
+static char *local_label(char *name) {
+    size_t i = nlocal_labels;
+    while (i-- > 0) {
+        if (strcmp(local_labels[i].name, name) == 0) {
+            free(name);
+            return xstrdup(local_labels[i].unique);
+        }
+    }
+    return name;
+}
+
 static void block_begin(Loc loc) {
+    block_depth++;
     spec_reset();
     if (function_body_pending) {
         /* the function scope is already current, see func_begin */
@@ -3052,6 +3432,12 @@ static void block_begin(Loc loc) {
 }
 
 static void block_end(AST *block) {
+    while (nlocal_labels && local_labels[nlocal_labels - 1].depth == block_depth) {
+        nlocal_labels--;
+        free(local_labels[nlocal_labels].name);
+        free(local_labels[nlocal_labels].unique);
+    }
+    block_depth--;
     block->u.block.scope = symtab_pop(symtab);
 }
 
@@ -3132,6 +3518,13 @@ AST *parse(const char *text, SymTab *st) {
     abort_requested = 0;
     function_body_pending = 0;
     current_function = NULL;
+    block_depth = 0;
+    function_depth = 0;
+    while (nlocal_labels) {
+        nlocal_labels--;
+        free(local_labels[nlocal_labels].name);
+        free(local_labels[nlocal_labels].unique);
+    }
     parse_cleanup();    /* anything a fatal error left behind in the previous unit */
     lex_set_text(text);
     if (yyparse() != 0 || parse_failed) {

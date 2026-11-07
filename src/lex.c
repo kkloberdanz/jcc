@@ -363,6 +363,25 @@ static TokenKind scan_number(void) {
         } else if ((c == 'f' || c == 'F') && kind == TOK_FLOAT_LIT) {
             text_push((char)c);
             next_char();
+            /* C23 / TS 18661: f16, f32, f64, f128, f32x, f64x */
+            if (isdigit(peekc())) {
+                while (isdigit(peekc())) {
+                    text_push((char)peekc());
+                    next_char();
+                }
+                if (peekc() == 'x' || peekc() == 'X') {
+                    text_push((char)peekc());
+                    next_char();
+                }
+            }
+        } else if ((c == 'd' || c == 'D') && kind == TOK_FLOAT_LIT && strchr("fFdDlL", peekc_at(1))) {
+            text_push((char)c);     /* df, dd, dl: _Decimal32, _Decimal64, _Decimal128 */
+            next_char();
+            text_push((char)peekc());
+            next_char();
+        } else if ((c == 'q' || c == 'Q') && kind == TOK_FLOAT_LIT) {
+            text_push((char)c);     /* GNU: __float128 */
+            next_char();
         } else if (c == 'i' || c == 'I' || c == 'j' || c == 'J') {
             text_push((char)c);
             next_char();
@@ -385,11 +404,13 @@ static TokenKind scan_number(void) {
  * so that the parser reads it as an expression.
  */
 static int aligned_arg_found;
+static const char *aligned_arg_word;    /* "aligned" or "vector_size": which attribute's argument it is */
+static int group_has_colon;     /* the group has a `:` of its own (outside strings and inner parentheses): an extended asm */
 static size_t aligned_arg_line, aligned_arg_col;    /* its '(' */
 static size_t aligned_arg_end_line, aligned_arg_end_col;    /* just past its ')' */
 
-/* does buf end with the word `aligned` (or `__aligned__`), past any spaces? */
-static int buf_ends_with_aligned(void) {
+/* does buf end with the word `word` (or `__word__`), past any spaces? */
+static int buf_ends_with_word(const char *word) {
     size_t n = buf_len;
     size_t k;
     while (n && buf[n - 1] == ' ') {
@@ -398,8 +419,8 @@ static int buf_ends_with_aligned(void) {
     if (n >= 2 && buf[n - 1] == '_' && buf[n - 2] == '_') {
         n -= 2;
     }
-    k = strlen("aligned");
-    if (n < k || memcmp(buf + n - k, "aligned", k) != 0) {
+    k = strlen(word);
+    if (n < k || memcmp(buf + n - k, word, k) != 0) {
         return 0;
     }
     n -= k;
@@ -438,6 +459,7 @@ static void scan_paren_group(void) {
     size_t arg_start = 0;
 
     aligned_arg_found = 0;
+    group_has_colon = 0;
     skip_space();
     if (peekc() != '(') {
         lex_error("expected '('");
@@ -459,11 +481,15 @@ static void scan_paren_group(void) {
             scan_quoted(c);
             continue;
         }
-        if (c == '(' && !aligned_arg_found && !arg_depth && buf_ends_with_aligned()) {
+        if (c == '(' && !aligned_arg_found && !arg_depth && (buf_ends_with_word("aligned") || buf_ends_with_word("vector_size"))) {
+            aligned_arg_word = buf_ends_with_word("aligned") ? "aligned" : "vector_size";
             arg_depth = depth + 1;
             arg_start = buf_len;
             aligned_arg_line = cur_line;
             aligned_arg_col = cur_col;
+        }
+        if (c == ':' && depth == 1) {
+            group_has_colon = 1;
         }
         text_push((char)c);
         next_char();
@@ -474,12 +500,61 @@ static void scan_paren_group(void) {
                 arg_depth = 0;
                 aligned_arg_end_line = cur_line;
                 aligned_arg_end_col = cur_col;
-                aligned_arg_found = !is_plain_number(buf, arg_start, buf_len);
+                /* a vector size is always read as an expression: the type, not the text, carries it */
+                aligned_arg_found = aligned_arg_word[0] == 'v' || !is_plain_number(buf, arg_start, buf_len);
             }
             depth--;
             if (depth == 0) {
                 break;
             }
+        }
+    }
+}
+
+/*
+ * After `asm`: its qualifiers (volatile, inline, goto, in any spelling)
+ * join the token's text, then the parenthesised group. An extended asm,
+ * whose group has operands after a colon, keeps only the keyword and
+ * qualifiers: the group is read again as tokens, which the parser makes
+ * the template, operands, clobbers and labels of.
+ */
+static void scan_asm(void) {
+    static const char *const quals[] = {
+        "volatile", "__volatile", "__volatile__", "inline", "__inline", "__inline__", "goto", NULL
+    };
+    for (;;) {
+        size_t line = cur_line, col = cur_col;
+        size_t len = 0;
+        size_t k;
+        skip_space();
+        while (isalnum((unsigned char)peekc_at(len)) || peekc_at(len) == '_') {
+            len++;
+        }
+        for (k = 0; quals[k]; k++) {
+            if (strlen(quals[k]) == len && !at_end() && strncmp(&lines[cur_line].text[cur_col], quals[k], len) == 0) {
+                break;
+            }
+        }
+        if (!len || !quals[k]) {
+            cur_line = line;
+            cur_col = col;
+            break;
+        }
+        text_push(' ');
+        while (len--) {
+            text_push((char)peekc());
+            next_char();
+        }
+    }
+    {
+        size_t line = cur_line, col = cur_col, len = buf_len;
+        scan_paren_group();
+        if (group_has_colon) {
+            /* the group again, as the next tokens */
+            cur_line = line;
+            cur_col = col;
+            buf_len = len;
+            buf[buf_len] = '\0';
         }
     }
 }
@@ -525,7 +600,12 @@ static int next_token(Token *out) {
                 kind = quote == '"' ? TOK_STRING : TOK_CHAR_LIT;
             } else {
                 kind = keyword_kind(buf);
-                if (kind == TOK_ATTRIBUTE || kind == TOK_ASM) {
+                if (kind == TOK_ASM) {
+                    scan_asm();
+                    if (group_has_colon) {
+                        kind = TOK_ASM_EXT;
+                    }
+                } else if (kind == TOK_ATTRIBUTE) {
                     scan_paren_group();
                 } else if (kind == TOK_EXTENSION) {
                     /* __extension__ only silences warnings; drop it */
@@ -615,7 +695,7 @@ TokList *lex(void) {
             size_t resume_line = cur_line, resume_col = cur_col;
             size_t end_line = aligned_arg_end_line, end_col = aligned_arg_end_col;
             Token arg;
-            tok_init(&arg, tok.lineno, tok.col, "aligned", TOK_ALIGNED_ATTR);
+            tok_init(&arg, tok.lineno, tok.col, aligned_arg_word, TOK_ALIGNED_ATTR);
             arg.file = tok.file;
             arg.line = tok.line;
             append_token(&head, &tail, arg);

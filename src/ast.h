@@ -86,7 +86,8 @@ typedef enum QualKind {
     QUAL_CONST,
     QUAL_VOLATILE,
     QUAL_RESTRICT,
-    QUAL_NULLABILITY
+    QUAL_NULLABILITY,
+    QUAL_ATOMIC
 } QualKind;
 
 /*
@@ -117,6 +118,8 @@ typedef enum QualKind {
     X(N_STATIC_ASSERT, "StaticAssert")   /* binary: left = the condition, right = the message (may be NULL); the one specifier of a Declaration with no declarators */ \
     X(N_GENERIC, "Generic")              /* call: func = the controlling expression, args = GenericAssoc nodes; C11 _Generic */ \
     X(N_GENERIC_ASSOC, "GenericAssoc")   /* cast: type = the TypeName (NULL for default), expr */ \
+    X(N_TYPES_COMPAT, "TypesCompatible")  /* cast: type and expr = the two TypeNames; GNU __builtin_types_compatible_p, which sema makes an Int */ \
+    X(N_LABEL_ADDR, "LabelAddr")         /* stmt: name; GNU &&label, whose sym is the label */ \
     X(N_COMPOUND_LIT, "CompoundLiteral") /* cast: type = the TypeName, expr = an InitDeclarator holding the braced list; sym = the object when it is static */ \
     /* statements */ \
     X(N_LABEL, "Label")                  /* stmt: name, body */ \
@@ -129,10 +132,12 @@ typedef enum QualKind {
     X(N_WHILE, "While")                  /* stmt: expr, body */ \
     X(N_DO, "Do")                        /* stmt: body, expr */ \
     X(N_FOR, "For")                      /* loop: init, cond, step, body; any but body may be NULL */ \
-    X(N_GOTO, "Goto")                    /* stmt: name */ \
+    X(N_GOTO, "Goto")                    /* stmt: name; or, for GNU `goto *expr`, name NULL and expr */ \
     X(N_CONTINUE, "Continue")            /* - */ \
     X(N_BREAK, "Break")                  /* - */ \
     X(N_RETURN, "Return")                /* stmt: expr (may be NULL) */ \
+    X(N_ASM_STMT, "Asm")                 /* asmst: an asm statement; basic: text is the whole basic asm */ \
+    X(N_ASM_OPERAND, "AsmOperand")       /* asmop: [name] "constraint" (expr) */ \
     /* declarations */ \
     X(N_TRANSLATION_UNIT, "TranslationUnit") /* list: external declarations */ \
     X(N_FUNCTION_DEF, "FunctionDef")     /* func: specs, declarator, kr_decls, body, scope */ \
@@ -151,7 +156,8 @@ typedef enum QualKind {
     X(N_TYPE_QUAL, "TypeQual")           /* qual */ \
     X(N_TYPEDEF_NAME, "TypedefName")     /* name */ \
     X(N_ATTRIBUTE, "Attribute")          /* text: the whole __attribute__ or __asm */ \
-    X(N_ALIGNAS, "Alignas")              /* cast: type = the TypeName or expr = the alignment; align: from `__attribute__((aligned(expr)))` rather than _Alignas */ \
+    X(N_TYPEOF, "Typeof")                /* cast: type = the TypeName or expr = the expression; GNU typeof / __typeof__; align: C11 _Atomic(type name) */ \
+    X(N_ALIGNAS, "Alignas")              /* cast: type = the TypeName or expr = the alignment; align: 1 from `__attribute__((aligned(expr)))` rather than _Alignas, 2 the bytes of __attribute__((vector_size(expr))) */ \
     X(N_STRUCT_SPEC, "StructSpec")       /* record: is_union, tag, has_body, members, scope */ \
     X(N_STRUCT_DECLARATION, "StructDeclaration") /* decl: specs, declarators (struct declarators) */ \
     X(N_STRUCT_DECLARATOR, "StructDeclarator") /* init_decl: declarator (may be NULL), init = bit width */ \
@@ -244,6 +250,20 @@ struct AST {
             AST *expr;
             int align;          /* N_SIZEOF_*: _Alignof / __alignof__ rather than sizeof */
         } cast;
+        struct {
+            char *text;         /* a basic asm (no operands): the token's text, keyword included; else NULL */
+            AST *tmpl;          /* the template, a String */
+            ASTList *outputs;   /* AsmOperand nodes */
+            ASTList *inputs;
+            ASTList *clobbers;  /* Strings */
+            ASTList *labels;    /* asm goto: Goto nodes naming them */
+            int is_goto;
+        } asmst;
+        struct {
+            char *name;         /* [name], or NULL */
+            AST *constraint;    /* a String */
+            AST *expr;
+        } asmop;
         struct {
             char *name;
             AST *expr;

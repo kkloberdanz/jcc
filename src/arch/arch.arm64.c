@@ -1,9 +1,11 @@
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "arch.h"
+#include "diag.h"
 #include "ir.h"
 #include "peep.h"
 #include "regalloc.h"
@@ -356,6 +358,9 @@ static void a64_cg_data_begin(const char *name, int is_global, size_t align, int
         a64_emit(".section __DATA,__thread_vars,thread_local_variables");
         if (is_global) {
             a64_emit(".globl _%s", name);
+            if (is_global == 2) {
+                a64_emit(".weak_definition _%s", name);
+            }
         }
         a64_emit(".p2align 3");
         peep_flush();
@@ -374,6 +379,9 @@ static void a64_cg_data_begin(const char *name, int is_global, size_t align, int
     a64_emit(zero ? ".bss" : ".data");
     if (is_global) {
         a64_emit(".globl _%s", name);
+        if (is_global == 2) {
+            a64_emit(".weak_definition _%s", name);
+        }
     }
     if (align > 1) {
         a64_emit(".p2align %d", a64_log2_of(align));
@@ -390,6 +398,14 @@ static void a64_cg_data_int(size_t size, long value) {
         case 16: a64_emit(".quad %ld", value); a64_emit(".quad %d", value < 0 ? -1 : 0); break;
         default: a64_emit(".quad %ld", value); break;
     }
+}
+
+static void a64_cg_data_label_addr(int id) {
+    a64_emit(".quad Ljcc_lbl%d", id);
+}
+
+static void a64_cg_data_label_diff(int a, int b) {
+    a64_emit(".long Ljcc_lbl%d-Ljcc_lbl%d", a, b);
 }
 
 static void a64_cg_data_addr(const char *name, long addend) {
@@ -572,6 +588,119 @@ static int a64_cg_alias(const char *name, const char *to, int is_global, int wea
     (void)weak;
     (void)is_func;
     return -1;
+}
+
+/* the atomic helpers (src/arch.h), assembled from the instructions in each comment */
+static const AtomicHelper a64_atomics[] = {
+    /* ldarb w0, [x0]; ret */
+    { "load", 1, "\x00\xfc\xdf\x08\xc0\x03\x5f\xd6", 8 },
+    /* stlrb w1, [x0]; ret */
+    { "store", 1, "\x01\xfc\x9f\x08\xc0\x03\x5f\xd6", 8 },
+    /* mov x8, x0; swpalb w1, w0, [x8]; ret */
+    { "xchg", 1, "\xe8\x03\x00\xaa\x00\x81\xe1\x38\xc0\x03\x5f\xd6", 12 },
+    /* casalb w1, w2, [x0]; mov w0, w1; ret */
+    { "cas", 1, "\x02\xfc\xe1\x08\xe0\x03\x01\x2a\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldaddalb w1, w0, [x8]; ret */
+    { "add", 1, "\xe8\x03\x00\xaa\x00\x01\xe1\x38\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; neg w1, w1; ldaddalb w1, w0, [x8]; ret */
+    { "sub", 1, "\xe8\x03\x00\xaa\xe1\x03\x01\x4b\x00\x01\xe1\x38\xc0\x03\x5f\xd6", 16 },
+    /* mov x8, x0; mvn w1, w1; ldclralb w1, w0, [x8]; ret */
+    { "and", 1, "\xe8\x03\x00\xaa\xe1\x03\x21\x2a\x00\x11\xe1\x38\xc0\x03\x5f\xd6", 16 },
+    /* mov x8, x0; ldsetalb w1, w0, [x8]; ret */
+    { "or", 1, "\xe8\x03\x00\xaa\x00\x31\xe1\x38\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldeoralb w1, w0, [x8]; ret */
+    { "xor", 1, "\xe8\x03\x00\xaa\x00\x21\xe1\x38\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldarb w9, [x8]; 1:; and w10, w9, w1; mvn w10, w10; mov w11, w9; casalb w11, w10, [x8]; cmp w11, w9; mov w9, w11; b.ne 1b; mov w0, w9; ret */
+    { "nand", 1, "\xe8\x03\x00\xaa\x09\xfd\xdf\x08\x2a\x01\x01\x0a\xea\x03\x2a\x2a\xeb\x03\x09\x2a\x0a\xfd\xeb\x08\x7f\x01\x09\x6b\xe9\x03\x0b\x2a\x41\xff\xff\x54\xe0\x03\x09\x2a\xc0\x03\x5f\xd6", 44 },
+    /* ldarh w0, [x0]; ret */
+    { "load", 2, "\x00\xfc\xdf\x48\xc0\x03\x5f\xd6", 8 },
+    /* stlrh w1, [x0]; ret */
+    { "store", 2, "\x01\xfc\x9f\x48\xc0\x03\x5f\xd6", 8 },
+    /* mov x8, x0; swpalh w1, w0, [x8]; ret */
+    { "xchg", 2, "\xe8\x03\x00\xaa\x00\x81\xe1\x78\xc0\x03\x5f\xd6", 12 },
+    /* casalh w1, w2, [x0]; mov w0, w1; ret */
+    { "cas", 2, "\x02\xfc\xe1\x48\xe0\x03\x01\x2a\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldaddalh w1, w0, [x8]; ret */
+    { "add", 2, "\xe8\x03\x00\xaa\x00\x01\xe1\x78\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; neg w1, w1; ldaddalh w1, w0, [x8]; ret */
+    { "sub", 2, "\xe8\x03\x00\xaa\xe1\x03\x01\x4b\x00\x01\xe1\x78\xc0\x03\x5f\xd6", 16 },
+    /* mov x8, x0; mvn w1, w1; ldclralh w1, w0, [x8]; ret */
+    { "and", 2, "\xe8\x03\x00\xaa\xe1\x03\x21\x2a\x00\x11\xe1\x78\xc0\x03\x5f\xd6", 16 },
+    /* mov x8, x0; ldsetalh w1, w0, [x8]; ret */
+    { "or", 2, "\xe8\x03\x00\xaa\x00\x31\xe1\x78\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldeoralh w1, w0, [x8]; ret */
+    { "xor", 2, "\xe8\x03\x00\xaa\x00\x21\xe1\x78\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldarh w9, [x8]; 1:; and w10, w9, w1; mvn w10, w10; mov w11, w9; casalh w11, w10, [x8]; cmp w11, w9; mov w9, w11; b.ne 1b; mov w0, w9; ret */
+    { "nand", 2, "\xe8\x03\x00\xaa\x09\xfd\xdf\x48\x2a\x01\x01\x0a\xea\x03\x2a\x2a\xeb\x03\x09\x2a\x0a\xfd\xeb\x48\x7f\x01\x09\x6b\xe9\x03\x0b\x2a\x41\xff\xff\x54\xe0\x03\x09\x2a\xc0\x03\x5f\xd6", 44 },
+    /* ldar w0, [x0]; ret */
+    { "load", 4, "\x00\xfc\xdf\x88\xc0\x03\x5f\xd6", 8 },
+    /* stlr w1, [x0]; ret */
+    { "store", 4, "\x01\xfc\x9f\x88\xc0\x03\x5f\xd6", 8 },
+    /* mov x8, x0; swpal w1, w0, [x8]; ret */
+    { "xchg", 4, "\xe8\x03\x00\xaa\x00\x81\xe1\xb8\xc0\x03\x5f\xd6", 12 },
+    /* casal w1, w2, [x0]; mov w0, w1; ret */
+    { "cas", 4, "\x02\xfc\xe1\x88\xe0\x03\x01\x2a\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldaddal w1, w0, [x8]; ret */
+    { "add", 4, "\xe8\x03\x00\xaa\x00\x01\xe1\xb8\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; neg w1, w1; ldaddal w1, w0, [x8]; ret */
+    { "sub", 4, "\xe8\x03\x00\xaa\xe1\x03\x01\x4b\x00\x01\xe1\xb8\xc0\x03\x5f\xd6", 16 },
+    /* mov x8, x0; mvn w1, w1; ldclral w1, w0, [x8]; ret */
+    { "and", 4, "\xe8\x03\x00\xaa\xe1\x03\x21\x2a\x00\x11\xe1\xb8\xc0\x03\x5f\xd6", 16 },
+    /* mov x8, x0; ldsetal w1, w0, [x8]; ret */
+    { "or", 4, "\xe8\x03\x00\xaa\x00\x31\xe1\xb8\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldeoral w1, w0, [x8]; ret */
+    { "xor", 4, "\xe8\x03\x00\xaa\x00\x21\xe1\xb8\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldar w9, [x8]; 1:; and w10, w9, w1; mvn w10, w10; mov w11, w9; casal w11, w10, [x8]; cmp w11, w9; mov w9, w11; b.ne 1b; mov w0, w9; ret */
+    { "nand", 4, "\xe8\x03\x00\xaa\x09\xfd\xdf\x88\x2a\x01\x01\x0a\xea\x03\x2a\x2a\xeb\x03\x09\x2a\x0a\xfd\xeb\x88\x7f\x01\x09\x6b\xe9\x03\x0b\x2a\x41\xff\xff\x54\xe0\x03\x09\x2a\xc0\x03\x5f\xd6", 44 },
+    /* ldar x0, [x0]; ret */
+    { "load", 8, "\x00\xfc\xdf\xc8\xc0\x03\x5f\xd6", 8 },
+    /* stlr x1, [x0]; ret */
+    { "store", 8, "\x01\xfc\x9f\xc8\xc0\x03\x5f\xd6", 8 },
+    /* mov x8, x0; swpal x1, x0, [x8]; ret */
+    { "xchg", 8, "\xe8\x03\x00\xaa\x00\x81\xe1\xf8\xc0\x03\x5f\xd6", 12 },
+    /* casal x1, x2, [x0]; mov x0, x1; ret */
+    { "cas", 8, "\x02\xfc\xe1\xc8\xe0\x03\x01\xaa\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldaddal x1, x0, [x8]; ret */
+    { "add", 8, "\xe8\x03\x00\xaa\x00\x01\xe1\xf8\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; neg x1, x1; ldaddal x1, x0, [x8]; ret */
+    { "sub", 8, "\xe8\x03\x00\xaa\xe1\x03\x01\xcb\x00\x01\xe1\xf8\xc0\x03\x5f\xd6", 16 },
+    /* mov x8, x0; mvn x1, x1; ldclral x1, x0, [x8]; ret */
+    { "and", 8, "\xe8\x03\x00\xaa\xe1\x03\x21\xaa\x00\x11\xe1\xf8\xc0\x03\x5f\xd6", 16 },
+    /* mov x8, x0; ldsetal x1, x0, [x8]; ret */
+    { "or", 8, "\xe8\x03\x00\xaa\x00\x31\xe1\xf8\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldeoral x1, x0, [x8]; ret */
+    { "xor", 8, "\xe8\x03\x00\xaa\x00\x21\xe1\xf8\xc0\x03\x5f\xd6", 12 },
+    /* mov x8, x0; ldar x9, [x8]; 1:; and x10, x9, x1; mvn x10, x10; mov x11, x9; casal x11, x10, [x8]; cmp x11, x9; mov x9, x11; b.ne 1b; mov x0, x9; ret */
+    { "nand", 8, "\xe8\x03\x00\xaa\x09\xfd\xdf\xc8\x2a\x01\x01\x8a\xea\x03\x2a\xaa\xeb\x03\x09\xaa\x0a\xfd\xeb\xc8\x7f\x01\x09\xeb\xe9\x03\x0b\xaa\x41\xff\xff\x54\xe0\x03\x09\xaa\xc0\x03\x5f\xd6", 44 },
+};
+
+static void a64_cg_atomic_helper(const char *op, int size) {
+    size_t i, k;
+    for (i = 0; i < sizeof(a64_atomics) / sizeof(a64_atomics[0]); i++) {
+        const AtomicHelper *h = &a64_atomics[i];
+        if (h->size != size || strcmp(h->op, op) != 0) {
+            continue;
+        }
+        a64_emit(".text");
+        a64_emit(".p2align 4");
+        peep_flush();
+        fprintf(a64_cg_out, "___jcc_atomic_%s_%d:\n", op, size);
+        for (k = 0; k < h->len; k += 8) {
+            size_t j;
+            char line[128];
+            size_t n = 0;
+            n += (size_t)snprintf(line + n, sizeof(line) - n, ".byte ");
+            for (j = k; j < h->len && j < k + 8; j++) {
+                n += (size_t)snprintf(line + n, sizeof(line) - n, "%s%u", j > k ? ", " : "", (unsigned)(unsigned char)h->code[j]);
+            }
+            a64_emit("%s", line);
+        }
+        return;
+    }
+}
+
+static void a64_cg_weak_ref(const char *name) {
+    a64_emit(".weak_reference _%s", name);
 }
 
 static int a64_cg_record_ret_regs(const ArgType *t) {
@@ -1456,7 +1585,7 @@ static int a64_tail_call(int index, const IRCall *c, size_t nstack) {
     const IRInst *r;
     int i;
     if (a64_F->opt_level <= 0 || index + 1 >= a64_F->ninsts || nstack || c->sret_addr >= 0 || c->result_addr >= 0
-            || a64_F->is_variadic) {
+            || a64_F->is_variadic || c->chain_slot || c->asm_index) {
         return 0;
     }
     r = &a64_F->insts[index + 1];
@@ -1475,10 +1604,232 @@ static int a64_tail_call(int index, const IRCall *c, size_t nstack) {
     return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* asm statements (IRAsm, src/ir.h)                                    */
+/* ------------------------------------------------------------------ */
+
+static int a64_nasm_ids = 0;
+
+/* a clobber's register: 0..31 for x/w, 32 + k for v/q/d/s/h/b k; -1 if none */
+static int a64_clobber_reg(const char *name) {
+    char *end;
+    long n;
+    if (!*name || !isdigit((unsigned char)name[1])) {
+        return strcmp(name, "lr") == 0 ? 30 : strcmp(name, "fp") == 0 ? 29 : -1;
+    }
+    n = strtol(name + 1, &end, 10);
+    if (*end || n < 0 || n > 31) {
+        return -1;
+    }
+    if (name[0] == 'x' || name[0] == 'w') {
+        return (int)n;
+    }
+    if (strchr("vqdshb", name[0])) {
+        return 32 + (int)n;
+    }
+    return -1;
+}
+
+static void a64_asm_operand(const IRAsm *as, const int *reg, int k, int mod, char *out, size_t cap) {
+    const IRAsmOp *o = &as->ops[k];
+    size_t n = strlen(out);
+    int r = reg[k];
+    if (o->kind == 'i') {
+        snprintf(out + n, cap - n, mod == 'c' || mod == 'n' ? "%ld" : "#%ld", mod == 'n' ? -o->imm : o->imm);
+    } else if (o->kind == 'm' || mod == 'a') {
+        snprintf(out + n, cap - n, "[x%d]", r);
+    } else if (o->fp) {
+        snprintf(out + n, cap - n, "%c%d", mod && strchr("vqdshb", mod) ? mod : 'v', r - 32);
+    } else {
+        snprintf(out + n, cap - n, "%c%d", mod == 'w' ? 'w' : 'x', r);
+    }
+}
+
+static void a64_asm_template(const IRAsm *as, const int *reg, const int *labels) {
+    const char *p = as->text;
+    char line[4096];
+    int id = ++a64_nasm_ids;
+    line[0] = '\0';
+    for (; *p; p++) {
+        size_t n = strlen(line);
+        if (n + 64 >= sizeof(line)) {
+            fatal("asm template line too long");
+        }
+        if (*p == '\n') {
+            fprintf(a64_cg_out, "\t%s\n", line);
+            line[0] = '\0';
+            continue;
+        }
+        if (as->basic || *p != '%') {
+            line[n] = *p;
+            line[n + 1] = '\0';
+            continue;
+        }
+        p++;
+        if (*p == '%') {
+            line[n] = '%';
+            line[n + 1] = '\0';
+            continue;
+        }
+        if (*p == '=') {
+            snprintf(line + n, sizeof(line) - n, "%d", id);
+            continue;
+        }
+        {
+            int mod = 0;
+            int k = -1;
+            if (isalpha((unsigned char)*p) && (isdigit((unsigned char)p[1]) || p[1] == '[')) {
+                mod = *p++;
+            }
+            if (*p == '[') {
+                const char *e = strchr(p, ']');
+                int j;
+                for (j = 0; e && j < as->nops; j++) {
+                    if (as->ops[j].name && strlen(as->ops[j].name) == (size_t)(e - p - 1)
+                            && strncmp(as->ops[j].name, p + 1, (size_t)(e - p - 1)) == 0) {
+                        k = j;
+                    }
+                }
+                p = e ? e : p + strlen(p) - 1;
+            } else if (isdigit((unsigned char)*p)) {
+                k = (int)strtol(p, (char **)&p, 10);
+                p--;
+            }
+            if (mod == 'l' && k >= as->nops && k < as->nops + as->nlabels) {
+                snprintf(line + n, sizeof(line) - n, "%s", a64_blabel(labels[k - as->nops]));
+            } else if (k >= 0 && k < as->nops) {
+                a64_asm_operand(as, reg, k, mod, line, sizeof(line));
+            } else {
+                fatal("asm template refers to an operand that does not exist");
+            }
+        }
+    }
+    if (line[0]) {
+        fprintf(a64_cg_out, "\t%s\n", line);
+    }
+}
+
+static void a64_select_asm(const IRInst *ins, const IRAsm *as) {
+    /* every caller-saved register is free: the allocator treats the asm as a call (x16 and x17 are the backend's) */
+    static const int pool[] = { 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+    static const int fpool[] = { 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+    int used[64];
+    int reg[64];
+    int saved[32];
+    int nsaved = 0;
+    int labels[64];
+    int k, j;
+    long save_bytes;
+    char buf[48];
+
+    memset(used, 0, sizeof(used));
+    if (as->nops > 64 || as->nlabels > 64) {
+        fatal("too many asm operands");
+    }
+    if (as->nlabels) {
+        const IRInst *br = ins + 1;
+        for (k = 0; k < as->nlabels; k++) {
+            labels[k] = a64_F->jt[a64_F->switches[br->imm].first + 1 + k];
+        }
+    }
+    for (k = 0; k < as->nclobbers; k++) {
+        int r = a64_clobber_reg(as->clobbers[k]);
+        if (r >= 0) {
+            used[r] = 1;
+            /* callee-saved: x19-x28, and the low halves of v8-v15 */
+            if ((r >= 19 && r <= 28) || (r >= 40 && r <= 47)) {
+                saved[nsaved++] = r;
+            }
+        }
+    }
+    for (k = 0; k < as->nops; k++) {
+        const IRAsmOp *o = &as->ops[k];
+        reg[k] = -1;
+        if (o->kind == 'i' || (o->match >= 0 && o->kind == 'r')) {
+            continue;
+        }
+        if (o->kind == 'r' && o->fp) {
+            for (j = 0; j < (int)(sizeof(fpool) / sizeof(fpool[0])) && used[32 + fpool[j]]; j++) {
+            }
+            if (j == (int)(sizeof(fpool) / sizeof(fpool[0]))) {
+                fatal("asm: no floating point register left for an operand");
+            }
+            reg[k] = 32 + fpool[j];
+        } else {
+            for (j = 0; j < (int)(sizeof(pool) / sizeof(pool[0])) && used[pool[j]]; j++) {
+            }
+            if (j == (int)(sizeof(pool) / sizeof(pool[0]))) {
+                fatal("asm: no register left for an operand");
+            }
+            reg[k] = pool[j];
+        }
+        used[reg[k]] = 1;
+    }
+    for (k = 0; k < as->nops; k++) {
+        if (as->ops[k].match >= 0) {
+            reg[k] = reg[as->ops[k].match];
+        }
+    }
+    peep_flush();
+    save_bytes = (nsaved * 8 + 15) & ~15L;
+    if (nsaved) {
+        fprintf(a64_cg_out, "\tsub sp, sp, #%ld\n", save_bytes);
+        sp_disp += save_bytes;
+        for (k = 0; k < nsaved; k++) {
+            fprintf(a64_cg_out, "\tstr %c%d, [sp, #%d]\n", saved[k] < 32 ? 'x' : 'd', saved[k] % 32, 8 * k);
+        }
+    }
+    for (k = 0; k < as->nops; k++) {
+        const IRAsmOp *o = &as->ops[k];
+        int r = reg[k];
+        if (o->kind == 'm' && o->match < 0) {
+            frame_operand(o->slot, 8, buf, sizeof(buf));
+            peep_flush();
+            fprintf(a64_cg_out, "\tldr x%d, [%s]\n", r, buf);
+        } else if (o->kind == 'r' && o->is_input) {
+            frame_operand(o->slot, o->size, buf, sizeof(buf));
+            peep_flush();
+            if (o->fp) {
+                fprintf(a64_cg_out, "\tldr %c%d, [%s]\n", o->size == 4 ? 's' : 'd', r - 32, buf);
+            } else {
+                fprintf(a64_cg_out, "\t%s %c%d, [%s]\n", o->size == 1 ? "ldrb" : o->size == 2 ? "ldrh" : "ldr",
+                        o->size == 8 ? 'x' : 'w', r, buf);
+            }
+        }
+    }
+    a64_asm_template(as, reg, labels);
+    for (k = 0; k < as->nops; k++) {
+        const IRAsmOp *o = &as->ops[k];
+        int r = reg[k];
+        if (!o->is_output || o->kind != 'r') {
+            continue;
+        }
+        frame_operand(o->slot, o->size, buf, sizeof(buf));
+        peep_flush();
+        if (o->fp) {
+            fprintf(a64_cg_out, "\tstr %c%d, [%s]\n", o->size == 4 ? 's' : 'd', r - 32, buf);
+        } else {
+            fprintf(a64_cg_out, "\t%s %c%d, [%s]\n", o->size == 1 ? "strb" : o->size == 2 ? "strh" : "str",
+                    o->size == 8 ? 'x' : 'w', r, buf);
+        }
+    }
+    if (nsaved) {
+        for (k = 0; k < nsaved; k++) {
+            fprintf(a64_cg_out, "\tldr %c%d, [sp, #%d]\n", saved[k] < 32 ? 'x' : 'd', saved[k] % 32, 8 * k);
+        }
+        fprintf(a64_cg_out, "\tadd sp, sp, #%ld\n", save_bytes);
+        sp_disp -= save_bytes;
+    }
+}
+
 /* a call; returns 1 when it was made a tail call, which took the return after it along */
 static int a64_select_call(int index) {
     const IRInst *ins = &a64_F->insts[index];
     const IRCall *c = &a64_F->calls[ins->imm];
+    if (c->asm_index) {
+        a64_select_asm(ins, &a64_F->asms[c->asm_index - 1]);
+        return 0;
+    }
     ArgLoc *locs = NULL;
     ArgAlloc alloc;
     size_t nstack;
@@ -1599,6 +1950,10 @@ static int a64_select_call(int index) {
         if (r != 16) {
             a64_emit("mov x16, x%d", r);
         }
+    }
+    if (c->chain_slot) {
+        char cbuf[48];
+        a64_emit("ldr x15, [%s]", frame_operand(c->chain_slot, 8, cbuf, sizeof(cbuf)));   /* a nested function's static chain */
     }
     if (c->name) {
         a64_emit("bl _%s", c->name);
@@ -1913,6 +2268,13 @@ static int a64_select_inst(int index, int next_block) {
             a64_def_done_x(i->dst, d);
             return 0;
 
+        case IR_LABEL_ADDR:
+            d = a64_def_reg(i->dst, 11);
+            a64_emit("adrp x%d, Ljcc_lbl%ld@PAGE", d, i->imm);
+            a64_emit("add x%d, x%d, Ljcc_lbl%ld@PAGEOFF", d, d, i->imm);
+            a64_def_done_x(i->dst, d);
+            return 0;
+
         case IR_MOV:
             if (a64_loc_reg(i->a) < 0 && a64_loc_reg(i->dst) < 0 && a64_F->vregs[i->a].offset == a64_F->vregs[i->dst].offset) {
                 return 0;   /* the two share a slot (src/regalloc.c merged them), or the destination is never read */
@@ -2219,6 +2581,41 @@ static int a64_select_inst(int index, int next_block) {
             a64_emit("brk #1");
             return 0;
 
+        case IR_ASMBR: {
+            int target = a64_F->jt[a64_F->switches[i->imm].first];
+            if (target != next_block) {
+                a64_emit("b %s", a64_blabel(target));
+            }
+            return 0;
+        }
+
+        case IR_IJMP:
+            a = a64_use_x(i->a, 9);
+            a64_emit("br x%d", a);
+            return 0;
+
+        case IR_NLGOTO:
+            if (i->imm == -1) {
+                a = a64_use_x(i->a, 9);
+                if (a == 10 || a == 16) {
+                    a64_emit("mov x9, x%d", a);
+                    a = 9;
+                }
+                a64_emit("ldr x10, [x%d, #8]", a);
+                a64_emit("ldr x16, [x%d, #16]", a);
+                a64_emit("ldr x29, [x%d]", a);
+                a64_emit("mov sp, x16");
+                a64_emit("br x10");
+                return 0;
+            }
+            a = a64_use_x(i->a, 9);
+            b = a64_use_x(i->b, a == 10 ? 11 : 10);
+            a64_emit("ldr x16, [x%d, #%ld]", a, i->imm);
+            a64_emit("mov sp, x16");
+            a64_emit("mov x29, x%d", a);
+            a64_emit("br x%d", b);
+            return 0;
+
         case IR_SWITCH: {
             /* a branch table: the index's entry is a b to its case */
             const IRSwitch *sw = &a64_F->switches[i->imm];
@@ -2270,8 +2667,11 @@ static void a64_prologue(void) {
     a64_emit(".text");
     if (a64_F->is_global) {
         a64_emit(".globl _%s", a64_F->name);
+        if (a64_F->is_global == 2) {
+            a64_emit(".weak_definition _%s", a64_F->name);
+        }
     }
-    a64_emit(".p2align 2");
+    a64_emit(".p2align %d", a64_F->align > 4 ? a64_log2_of(a64_F->align) : 2);
     peep_flush();
     fprintf(a64_cg_out, "_%s:\n", a64_F->name);
     a64_emit(".cfi_startproc");
@@ -2281,6 +2681,9 @@ static void a64_prologue(void) {
     }
     adjust_sp("sub", (size_t)a64_F->frame_size);
     a64_saved_regs(0);
+    if (a64_F->chain_off) {
+        a64_emit("str x15, [%s]", frame_operand(a64_F->chain_off, 8, buf, sizeof(buf)));    /* a nested function's static chain */
+    }
     if (a64_F->sret_off) {
         a64_emit("str x8, [%s]", frame_operand(a64_F->sret_off, 8, buf, sizeof(buf)));
     }
@@ -2386,6 +2789,11 @@ static void a64_cg_select(IRFunc *f) {
             a64_npreds[ir_succ(f, t, i)]++;
         }
     }
+    for (b = 0; b < f->nblocks; b++) {
+        if (f->blocks[b].addr_label) {
+            a64_npreds[b]++;    /* reached through its address, which is taken */
+        }
+    }
     {
         int next = -1;
         for (b = f->nblocks - 1; b >= 0; b--) {
@@ -2407,6 +2815,9 @@ static void a64_cg_select(IRFunc *f) {
         if (b != 0 || a64_npreds[b] > 0) {
             peep_flush();
             fprintf(a64_cg_out, "%s:\n", a64_blabel(b));
+            if (blk->addr_label) {
+                fprintf(a64_cg_out, "Ljcc_lbl%d:\n", blk->addr_label);
+            }
         }
         for (i = blk->start; i < blk->end; i++) {
             i += a64_select_inst(i, next_of[b]);
@@ -2471,6 +2882,8 @@ static const Backend a64_backend = {
     a64_cg_data_string_addr,
     a64_cg_data_bytes,
     a64_cg_data_zero,
+    a64_cg_data_label_addr,
+    a64_cg_data_label_diff,
     a64_cg_string,
     a64_cg_stack_param_offset,
     a64_cg_args_begin,
@@ -2478,7 +2891,9 @@ static const Backend a64_backend = {
     a64_cg_args_end,
     a64_cg_record_ret_regs,
     a64_cg_select,
-    a64_cg_alias
+    a64_cg_alias,
+    a64_cg_weak_ref,
+    a64_cg_atomic_helper
 };
 
 /* no TargetLink: a Mach-O link needs ld64, so from another host use -c */

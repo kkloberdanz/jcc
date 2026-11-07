@@ -2,55 +2,6 @@
 # tests/gcc-torture.x86_64-linux.xfail). The host's cc is gcc there, which accepts
 # GNU extensions clang rejects, so these tests apply only on such a host: on
 # macOS and FreeBSD clang skips them (or fails them too, for the gcc-only semantics).
-20000822-1 nested functions
-20010209-1 nested functions
-20010605-1 nested functions
-20020412-1 nested functions, typeof
-20030501-1 nested functions
-20040520-1 nested functions
-20090219-1 nested functions
-920612-2 nested functions
-921017-1 nested functions
-921215-1 nested functions
-931002-1 nested functions
-nestfunc-1 nested functions
-nestfunc-2 nested functions
-nestfunc-3 nested functions
-nestfunc-7 nested functions
-nest-stdar-1 nested functions
-pr103405 nested functions
-pr22061-3 nested functions, a VLA parameter's size with side effects
-pr22061-4 nested functions, a VLA parameter's size with side effects
-920415-1 local labels (__label__), nested functions
-920428-2 local labels (__label__), nested functions
-920501-7 local labels (__label__), nested functions
-920721-4 local labels (__label__)
-comp-goto-2 local labels (__label__), nested functions
-nestfunc-5 local labels (__label__), nested functions
-nestfunc-6 local labels (__label__), nested functions
-pr24135 local labels (__label__), nested functions
 pr51447 local labels (__label__), nested functions
-pr71494 label addresses (&&label)
-20040308-1 a variably modified struct member (GNU)
-20040423-1 a variably modified struct member (GNU)
-20041218-2 a variably modified struct member (GNU)
-20070919-1 a variably modified struct member (GNU)
-align-nest a variably modified struct member (GNU)
-pr41935 a variably modified struct member (GNU)
-pr82210 a variably modified struct member (GNU)
-20061220-1 extended asm
-990413-2 extended asm (x87)
-bitfld-5 basic asm in a function
-built-in-setjmp __builtin_setjmp/__builtin_longjmp
-pr60003 __builtin_setjmp/__builtin_longjmp
-pr64242 __builtin_setjmp/__builtin_longjmp
-pr84521 __builtin_setjmp/__builtin_longjmp
-pr47237 __builtin_apply
-va-arg-pack-1 __builtin_va_arg_pack
-pr80692 _Decimal64
-pr85331 vector types
-nest-align-1 nested functions
 20031003-1 expects gcc's saturating float to int conversion at compile time (clang fails it too)
-20230630-2 scalar_storage_order (clang fails it too)
-20230630-4 scalar_storage_order (clang fails it too)
 991014-1 a struct near the size of the address space (clang fails it too)

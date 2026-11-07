@@ -276,10 +276,27 @@ void ast_free(AST *ast) {
             free(ast->u.member.name);
             break;
 
+        case N_ASM_STMT:
+            free(ast->u.asmst.text);
+            ast_free(ast->u.asmst.tmpl);
+            ast_list_free(ast->u.asmst.outputs);
+            ast_list_free(ast->u.asmst.inputs);
+            ast_list_free(ast->u.asmst.clobbers);
+            ast_list_free(ast->u.asmst.labels);
+            break;
+
+        case N_ASM_OPERAND:
+            free(ast->u.asmop.name);
+            ast_free(ast->u.asmop.constraint);
+            ast_free(ast->u.asmop.expr);
+            break;
+
         case N_CAST:
         case N_SIZEOF_EXPR:
         case N_SIZEOF_TYPE:
         case N_ALIGNAS:
+        case N_TYPEOF:
+        case N_TYPES_COMPAT:
         case N_VA_ARG:
         case N_IMPLICIT_CAST:
         case N_COMPOUND_LIT:
@@ -296,6 +313,7 @@ void ast_free(AST *ast) {
         case N_WHILE:
         case N_DO:
         case N_GOTO:
+        case N_LABEL_ADDR:
         case N_RETURN:
         case N_STMT_EXPR:
             free(ast->u.stmt.name);
@@ -446,6 +464,7 @@ const char *qual_name(QualKind qual) {
         case QUAL_VOLATILE: return "volatile";
         case QUAL_RESTRICT: return "restrict";
         case QUAL_NULLABILITY: return "nullability";
+        case QUAL_ATOMIC: return "_Atomic";
     }
     return "?";
 }
@@ -467,7 +486,11 @@ const char *type_spec_name(TypeSpecKind type) {
         case TS_FLOAT16: return "_Float16";
         case TS_FLOAT64X: return "_Float64x";
         case TS_FLOAT128: return "_Float128";
+        case TS_DECIMAL32: return "_Decimal32";
+        case TS_DECIMAL64: return "_Decimal64";
+        case TS_DECIMAL128: return "_Decimal128";
         case TS_COMPLEX: return "_Complex";
+        case TS_AUTO_TYPE: return "__auto_type";
         case TS_UINT128: return "__uint128_t";
     }
     return "?";
@@ -542,7 +565,8 @@ static void dump_header(FILE *out, int depth, const char *label, const AST *ast)
             break;
         case N_LABEL:
         case N_GOTO:
-            fprintf(out, " %s", ast->u.stmt.name);
+        case N_LABEL_ADDR:
+            fprintf(out, " %s", ast->u.stmt.name ? ast->u.stmt.name : "*");
             break;
         case N_DECL_NAME:
             fprintf(out, " %s", ast->u.declarator.name);
@@ -620,7 +644,12 @@ static void dump_node(FILE *out, int depth, const char *label, const AST *ast) {
         case N_STRING:
         case N_ATTRIBUTE:
         case N_TYPEDEF_NAME:
+        case N_LABEL_ADDR:
         case N_GOTO:
+            if (ast->kind == N_GOTO && ast->u.stmt.expr) {
+                dump_node(out, d, NULL, ast->u.stmt.expr);
+            }
+            break;
         case N_CONTINUE:
         case N_BREAK:
         case N_STORAGE_CLASS:
@@ -668,6 +697,8 @@ static void dump_node(FILE *out, int depth, const char *label, const AST *ast) {
         case N_COMPOUND_LIT:
         case N_GENERIC_ASSOC:
         case N_ALIGNAS:
+        case N_TYPEOF:
+        case N_TYPES_COMPAT:
             dump_node(out, d, "type", ast->u.cast.type);
             dump_node(out, d, NULL, ast->u.cast.expr);
             break;
@@ -700,6 +731,19 @@ static void dump_node(FILE *out, int depth, const char *label, const AST *ast) {
 
         case N_STMT_EXPR:
             dump_node(out, d, NULL, ast->u.stmt.body);
+            break;
+
+        case N_ASM_STMT:
+            dump_node(out, d, "template", ast->u.asmst.tmpl);
+            dump_list(out, d, "outputs", ast->u.asmst.outputs);
+            dump_list(out, d, "inputs", ast->u.asmst.inputs);
+            dump_list(out, d, "clobbers", ast->u.asmst.clobbers);
+            dump_list(out, d, "labels", ast->u.asmst.labels);
+            break;
+
+        case N_ASM_OPERAND:
+            dump_node(out, d, "constraint", ast->u.asmop.constraint);
+            dump_node(out, d, NULL, ast->u.asmop.expr);
             break;
 
         case N_EXPR_STMT:

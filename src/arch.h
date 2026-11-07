@@ -58,7 +58,8 @@ typedef enum ArgKind {
     ARG_FLOAT,          /* a float or double */
     ARG_RECORD,         /* a struct or union, passed by value */
     ARG_RECORD_MEMORY,  /* one with a member off its natural alignment (packed): System V passes it in memory */
-    ARG_CX87            /* a _Complex long double where long double is x87: in memory, returned in st(0) and st(1) */
+    ARG_CX87,           /* a _Complex long double where long double is x87: in memory, returned in st(0) and st(1) */
+    ARG_F128            /* a _Float128 (x86_64): all 16 bytes in one SSE register (classes SSE and SSEUP), or in memory */
 } ArgKind;
 
 /*
@@ -102,6 +103,23 @@ typedef struct ArgAlloc {
 } ArgAlloc;
 
 /*
+ * The atomic operations are calls to small functions of the backend's,
+ * emitted into each unit that uses them as local symbols named
+ * __jcc_atomic_<op>_<size> (the op: load, store, xchg, cas, add, sub, and,
+ * or, xor, nand; the size: 1, 2, 4 or 8 bytes). Each takes the object's
+ * address, then the value (cas: the expected value, then the desired
+ * one) and returns the old value, zero extended; store returns nothing.
+ * All are sequentially consistent. Their machine code is fixed bytes, so
+ * neither assembler needs the instructions.
+ */
+typedef struct AtomicHelper {
+    const char *op;
+    int size;
+    const char *code;
+    size_t len;
+} AtomicHelper;
+
+/*
  * The primitives, one table per backend. The selected one is `cg`; see
  * src/target.c.
  */
@@ -110,13 +128,17 @@ typedef struct Backend {
     void (*begin)(FILE *out);
     void (*end)(void);
 
-    /* initialized and zero data; `name` is the C name, the backend decorates it; `tls`: one copy per thread */
+    /* initialized and zero data; `name` is the C name, the backend decorates it; `is_global` 2: weak; `tls`: one copy per thread */
     void (*data_begin)(const char *name, int is_global, size_t align, int zero, int tls);
     void (*data_int)(size_t size, long value);
     void (*data_addr)(const char *name, long addend);
     void (*data_string_addr)(int label, long addend);
     void (*data_bytes)(const char *bytes, size_t len);
     void (*data_zero)(size_t size);
+    /* the address of the block whose IRBlock.addr_label is `id` (GNU &&label in a static initializer) */
+    void (*data_label_addr)(int id);
+    /* the distance from label `b` to label `a`, 4 bytes (GNU &&a - &&b) */
+    void (*data_label_diff)(int a, int b);
     /* a string literal in read-only data; `len` includes the terminating NUL */
     void (*string)(int label, const char *bytes, size_t len);
 
@@ -137,7 +159,14 @@ typedef struct Backend {
 
     /* `name` as another name for `target`, which the unit defines (__attribute__((alias))); -1 when the object format has no aliases */
     int (*alias)(const char *name, const char *target, int is_global, int weak, int is_func);
+    /* `name`, which the unit does not define, is a weak reference: it may stay undefined */
+    void (*weak_ref)(const char *name);
+    /* the local function __jcc_atomic_<op>_<size> (see AtomicHelper) */
+    void (*atomic_helper)(const char *op, int size);
 } Backend;
+
+/* the unit has a trampoline on the stack (a GNU nested function's address is taken): the stack must be executable */
+extern int codegen_exec_stack;
 
 /* the selected target's type sizes and primitives; target_select sets them */
 extern const ArchInfo *arch_info;

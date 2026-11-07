@@ -53,8 +53,9 @@ Type *type_vla(Type *elem, struct AST *size) {
     return t;
 }
 
+/* sized at run time: a variable length array, or a struct or union with one in it (GNU) */
 int type_is_vla(const Type *t) {
-    return t->kind == TY_ARRAY && t->vla != NULL;
+    return (t->kind == TY_ARRAY && t->vla != NULL) || ((t->kind == TY_STRUCT || t->kind == TY_UNION) && t->record->vm);
 }
 
 int type_is_vm(const Type *t) {
@@ -64,7 +65,22 @@ int type_is_vm(const Type *t) {
         }
         t = t->base;
     }
-    return 0;
+    return type_is_vla(t);
+}
+
+/* a copy of a function type's parameters, for a copy of the type: each type owns (and frees) its own */
+static Param *copy_params(const Type *t) {
+    Param *p;
+    size_t i;
+    if (!t->params) {
+        return NULL;
+    }
+    p = xcalloc(t->nparams ? t->nparams : 1, sizeof(*p));
+    for (i = 0; i < t->nparams; i++) {
+        p[i].type = t->params[i].type;
+        p[i].name = t->params[i].name ? xstrdup(t->params[i].name) : NULL;
+    }
+    return p;
 }
 
 Type *type_func(Type *ret, Param *params, size_t nparams, int variadic, int has_proto) {
@@ -93,13 +109,14 @@ Type *type_qualify(Type *t, unsigned quals) {
     q->base = t->base;
     q->length = t->length;
     q->record = t->record;
-    q->params = t->params;
+    q->params = copy_params(t);
     q->nparams = t->nparams;
     q->variadic = t->variadic;
     q->has_proto = t->has_proto;
     q->vla = t->vla;
     q->align = t->align;
     q->bits = t->bits;
+    q->vector = t->vector;
     return q;
 }
 
@@ -113,14 +130,32 @@ Type *type_with_align(Type *t, size_t align) {
     q->base = t->base;
     q->length = t->length;
     q->record = t->record;
-    q->params = t->params;
+    q->params = copy_params(t);
     q->nparams = t->nparams;
     q->variadic = t->variadic;
     q->has_proto = t->has_proto;
     q->vla = t->vla;
     q->align = align;
     q->bits = t->bits;
+    q->vector = t->vector;
     return q;
+}
+
+Type *type_vector(Type *elem, size_t bytes) {
+    Type *t;
+    size_t n = type_size(elem);
+    if (!(type_is_integer(elem) || type_is_floating(elem)) || type_is_complex(elem) || elem->kind == TY_BOOL
+            || n == 0 || bytes % n != 0 || bytes < n || (bytes & (bytes - 1)) != 0) {
+        return NULL;
+    }
+    t = type_array(type_unqualified(elem), (long)(bytes / n));
+    t->vector = 1;
+    t->align = bytes;   /* as GCC aligns one */
+    return t;
+}
+
+int type_is_vector(const Type *t) {
+    return t->kind == TY_ARRAY && t->vector;
 }
 
 Type *type_bitfield(Type *t, int bits) {
@@ -141,13 +176,14 @@ Type *type_unqualified(Type *t) {
     q->base = t->base;
     q->length = t->length;
     q->record = t->record;
-    q->params = t->params;
+    q->params = copy_params(t);
     q->nparams = t->nparams;
     q->variadic = t->variadic;
     q->has_proto = t->has_proto;
     q->vla = t->vla;
     q->align = t->align;
     q->bits = t->bits;
+    q->vector = t->vector;
     return q;
 }
 
@@ -174,6 +210,8 @@ void record_add_member(Record *r, const char *name, Type *type, int bits, struct
     m->bit_offset = 0;
     m->unit = type ? type_size(type) : 0;
     m->decl = decl;
+    m->rt_slot = 0;
+    m->reverse = 0;
 }
 
 /* path[] gets the anonymous members traversed, outermost first; *depth how many */
@@ -416,8 +454,12 @@ int type_is_complex(const Type *t) {
     return t->kind == TY_CFLOAT || t->kind == TY_CDOUBLE || t->kind == TY_CLDOUBLE || t->kind == TY_CFLOAT128;
 }
 
+int type_is_decimal(const Type *t) {
+    return t->kind >= TY_DECIMAL32 && t->kind <= TY_DECIMAL128;
+}
+
 int type_is_arithmetic(const Type *t) {
-    return type_is_integer(t) || type_is_floating(t) || type_is_complex(t);
+    return type_is_integer(t) || type_is_floating(t) || type_is_complex(t) || type_is_decimal(t);
 }
 
 Type *type_complex_base(const Type *t) {
@@ -548,6 +590,12 @@ size_t type_size(const Type *t) {
             return arch_info->ldouble_size;
         case TY_FLOAT128:
             return 16;   /* IEEE binary128, as gcc's on x86_64 and arm64 */
+        case TY_DECIMAL32:
+            return 4;    /* IEEE decimal, in the BID encoding as gcc's on x86_64 */
+        case TY_DECIMAL64:
+            return 8;
+        case TY_DECIMAL128:
+            return 16;
         case TY_CFLOAT:
             return 2 * arch_info->float_size;
         case TY_CDOUBLE:
@@ -599,7 +647,7 @@ size_t type_align(const Type *t) {
         case TY_ENUM:
             return t->record->complete ? t->record->align : arch_info->int_size;
         case TY_ARRAY:
-            return type_align(t->base);
+            return t->vector ? t->align : type_align(t->base);
         case TY_FUNC:
             return 1;
         default:
@@ -678,6 +726,13 @@ Type *type_arith_common(Type *a, Type *b) {
                                     type_is_complex(b) ? type_complex_base(b) : b);
         return type_complex_of(type_is_floating(c) ? c : type_basic(TY_DOUBLE));
     }
+    if (type_is_decimal(a) || type_is_decimal(b)) {
+        /* the wider decimal type (an integer converts to it) */
+        if (type_is_decimal(a) && type_is_decimal(b)) {
+            return a->kind > b->kind ? a : b;
+        }
+        return type_is_decimal(a) ? a : b;
+    }
     if (a->kind == TY_FLOAT128 || b->kind == TY_FLOAT128) {
         return type_basic(TY_FLOAT128);
     }
@@ -722,7 +777,7 @@ Type *type_arith_common(Type *a, Type *b) {
 }
 
 Type *type_decay(Type *t) {
-    if (t->kind == TY_ARRAY) {
+    if (t->kind == TY_ARRAY && !t->vector) {
         return type_pointer(t->base);
     }
     if (t->kind == TY_FUNC) {
@@ -750,6 +805,9 @@ int type_compatible(const Type *a, const Type *b) {
             return type_compatible(a->base, b->base);
         case TY_ARRAY:
             if (a->length >= 0 && b->length >= 0 && a->length != b->length && !a->vla && !b->vla) {
+                return 0;
+            }
+            if (a->vector != b->vector) {
                 return 0;
             }
             return type_compatible(a->base, b->base);
@@ -851,6 +909,9 @@ static void buf_quals(StrBuf *b, unsigned quals) {
     if (quals & TQ_VOLATILE) {
         buf_add(b, "volatile ");
     }
+    if (quals & TQ_ATOMIC) {
+        buf_add(b, "_Atomic ");
+    }
 }
 
 /*
@@ -886,9 +947,11 @@ static void format_type(StrBuf *out, const Type *t, const char *inner) {
             return;
 
         case TY_ARRAY: {
-            char n[32];
+            char n[48];
             buf_add(&d, inner);
-            if (t->vla) {
+            if (t->vector) {
+                snprintf(n, sizeof(n), " __attribute__((vector_size(%lu)))", (unsigned long)type_size(t));
+            } else if (t->vla) {
                 strcpy(n, "[*]");
             } else if (t->length >= 0) {
                 snprintf(n, sizeof(n), "[%ld]", t->length);

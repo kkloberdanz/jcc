@@ -25,7 +25,11 @@ typedef enum TypeSpecKind {
     TS_FLOAT16,
     TS_FLOAT64X,    /* _Float64x: long double */
     TS_FLOAT128,
-    TS_COMPLEX
+    TS_DECIMAL32,
+    TS_DECIMAL64,
+    TS_DECIMAL128,
+    TS_COMPLEX,
+    TS_AUTO_TYPE        /* GNU __auto_type: the type of the initializer */
 } TypeSpecKind;
 
 /*
@@ -62,6 +66,9 @@ typedef enum TypeSpecKind {
     X(TY_CDOUBLE, "double _Complex") \
     X(TY_CLDOUBLE, "long double _Complex") \
     X(TY_CFLOAT128, "_Float128 _Complex") \
+    X(TY_DECIMAL32, "_Decimal32") \
+    X(TY_DECIMAL64, "_Decimal64") \
+    X(TY_DECIMAL128, "_Decimal128") \
     X(TY_VA_LIST, "__builtin_va_list") \
     X(TY_ENUM, "enum") \
     X(TY_STRUCT, "struct") \
@@ -80,6 +87,7 @@ typedef enum TypeKind {
 /* qualifier bits */
 #define TQ_CONST 1u
 #define TQ_VOLATILE 2u
+#define TQ_ATOMIC 4u    /* C11 _Atomic: reads, writes and compound assignments are atomic (src/lower.c) */
 
 typedef struct Type Type;
 typedef struct Record Record;
@@ -96,6 +104,10 @@ struct Member {
     unsigned bit_offset;/* bit-field: first bit within the unit at `offset` */
     size_t unit;        /* bit-field: bytes of the unit at `offset` that holds it */
     struct AST *decl;   /* the StructDeclarator */
+    int reverse;        /* GNU scalar_storage_order: the member's bytes are in the other order (a bit-field's unit
+                           too, the field counted from its most significant end) */
+    long rt_slot;       /* in a struct with a variable length member: the frame slot of its offset when that is only
+                           known at run time (a member after a variable length one), else 0 (src/lower.c) */
 };
 
 /* a struct, union or enum: the thing a tag names */
@@ -112,6 +124,9 @@ struct Record {
     int is_unsigned;    /* enum: no enumerator is negative, so the type is unsigned int */
     Type *underlying;   /* enum: the fixed underlying type (`enum : T`), NULL for the usual int */
     size_t aligned;     /* __attribute__((aligned(n))), 0 if none */
+    int vm;             /* GNU: a member is a variable length array (or such a struct): the size, and the offsets
+                           after one, are known at run time; `size` and the offsets count each such member as empty */
+    long size_slot;     /* and the frame slot of its size, set where the definition is reached (src/lower.c) */
     struct Symbol *sym; /* the tag symbol, NULL when anonymous */
     Record *next_alloc;
 };
@@ -147,6 +162,8 @@ struct Type {
     Vla *vla;           /* array: a variable length one, else NULL */
     size_t align;       /* __attribute__((aligned(n))) on a typedef, member or object: the
                            alignment in place of the natural one; 0 for the natural one */
+    int vector;         /* an array that is a GNU vector (__attribute__((vector_size(n)))): a value of its own, which does
+                           not decay, with arithmetic element by element (type_vector) */
     int bits;           /* an integer of fewer bits than its kind: the type gcc gives a bit-field
                            wider than an int (`unsigned long long:40`), whose arithmetic is done
                            at that width; 0 for every other type (type_bitfield) */
@@ -163,6 +180,10 @@ Type *type_func(Type *ret, Param *params, size_t nparams, int variadic, int has_
 Type *type_record(Record *record);
 /* a copy of `t` aligned to `align` bytes (a typedef's, member's or object's aligned attribute) */
 Type *type_with_align(Type *t, size_t align);
+/* a GNU vector of `bytes` bytes of `elem`: NULL if elem is not an arithmetic type that divides it */
+Type *type_vector(Type *elem, size_t bytes);
+int type_is_vector(const Type *t);
+int type_is_decimal(const Type *t);     /* _Decimal32, _Decimal64, _Decimal128 */
 /* the unqualified integer type `t` narrowed to `bits` bits (Type.bits) */
 Type *type_bitfield(Type *t, int bits);
 /* a copy of `t` with `quals` added; `t` itself when nothing changes */

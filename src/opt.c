@@ -663,6 +663,7 @@ static void opt_store(void) {
     for (k = 0; k < n; k++) {
         OptBlock *ob = &opt_B[order[k]];
         opt_F->blocks[k].start = ni;
+        opt_F->blocks[k].addr_label = 0;    /* (a function whose labels' addresses are taken is not optimized) */
         for (j = 0; j < ob->n; j++) {
             IRInst *i = &opt_I[ob->code[j]];
             if (i->op == IR_NOP) {
@@ -2452,6 +2453,7 @@ static int opt_removable(const IRInst *i) {
     switch (i->op) {
         case IR_STORE: case IR_STOREBITS: case IR_COPY: case IR_ZERO: case IR_CALL: case IR_VASTART: case IR_VAARG:
         case IR_FENCE: case IR_ALLOCA: case IR_SPRESTORE: case IR_BR: case IR_CONDBR: case IR_RET: case IR_UNREACHABLE: case IR_SWITCH:
+        case IR_IJMP: case IR_ASMBR: case IR_NLGOTO:
             return 0;
         case IR_LOAD:
         case IR_LOADBITS:
@@ -3847,7 +3849,10 @@ static IRFunc *opt_inlinable(const IRInst *call, int caller_size) {
         return NULL;    /* not defined here, or this function's own recursion */
     }
     ce = opt_unit_f[idx];
-    if (ce == opt_F || ce->noopt || ce->is_variadic || ce->sret_off || ce->nparams != c->nargs) {
+    if (ce->nasms || ce->chain_off || ce->apply_args_off) {
+        return NULL;    /* its asm statements' operands are in its own frame and its own table */
+    }
+    if (ce == opt_F || ce->noopt || ce->is_variadic || ce->sret_off || ce->nparams != c->nargs || ce->is_global == 2) {
         return NULL;
     }
     size = opt_inst_count(ce);
@@ -3867,7 +3872,7 @@ static IRFunc *opt_inlinable(const IRInst *call, int caller_size) {
     for (k = 0; k < ce->ninsts; k++) {
         const IRInst *i = &ce->insts[k];
         if (i->op == IR_VASTART || i->op == IR_ALLOCA || i->op == IR_SPSAVE || i->op == IR_SPRESTORE
-                || (i->op == IR_RET && (i->flags & IRF_RECORD))) {
+                || (i->op == IR_RET && (i->flags & (IRF_RECORD | IRF_APPLY)))) {
             return NULL;
         }
         if (i->op == IR_RET && call->dst >= 0 && i->a >= 0 && ce->vregs[i->a].type != opt_vtype(call->dst)) {

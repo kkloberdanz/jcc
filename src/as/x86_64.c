@@ -858,6 +858,8 @@ static const AsmRow x86_64_rows[] = {
     { "movswl", "ml", X_RM, 0x0fbf },
     { "movswl", "wl", X_RM, 0x0fbf },
     { "movswq", "mq", X_RM, REXW | 0x0fbf },
+    { "movups", "mx", X_RM, 0x0f10 },
+    { "movups", "xm", X_MR, 0x0f11 },
     { "movw", "wm", X_MR, P66 | 0x89 },
     { "movzbl", "bl", X_RM, 0x0fb6 },
     { "movzbl", "ml", X_RM, 0x0fb6 },

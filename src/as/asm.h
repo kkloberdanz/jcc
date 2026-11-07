@@ -194,7 +194,7 @@ typedef struct AsmSym {
     int is_obj;             /* .type @object */
     int is_tls;             /* .type @tls_object: ELF STT_TLS */
     int is_section;         /* ELF: the section symbol made when its section was first entered */
-    int weak;               /* .weak: global, with weak binding (ELF) */
+    int weak;               /* ELF .weak: global, with weak binding; Mach-O .weak_definition or .weak_reference */
     int alias_of;           /* `.set sym, target`: the symbol it is another name for, else -1 (ELF) */
     unsigned alias_line;
     size_t off;             /* in its section, once laid out */
@@ -218,6 +218,7 @@ typedef struct As {
     const char *name;       /* for diagnostics */
     unsigned line;          /* the current line, from 1 */
     int errors;
+    int exec_stack;         /* .note.GNU-stack has the "x" flag: the program needs an executable stack */
     AsmSection sec[SEC_COUNT];
     int cur;                /* the current section */
     int nused;              /* how many sections have been entered */

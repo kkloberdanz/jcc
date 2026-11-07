@@ -55,8 +55,9 @@
     X(TOK_INLINE) \
     X(TOK_RESTRICT) \
     X(TOK_ATTRIBUTE) \
-    X(TOK_ALIGNED_ATTR) /* stands for `aligned` before the tokens of an aligned attribute's argument expression */ \
+    X(TOK_ALIGNED_ATTR) /* `aligned` or `vector_size`, before the tokens of the attribute's argument expression */ \
     X(TOK_ASM) \
+    X(TOK_ASM_EXT) /* an extended asm statement's keyword and qualifiers; its parenthesised group follows as tokens */ \
     X(TOK_NULLABILITY) \
     X(TOK_INT128) \
     X(TOK_BOOL) \
@@ -74,6 +75,14 @@
     X(TOK_NORETURN) \
     X(TOK_PRAGMA) \
     X(TOK_COMPLEX) \
+    X(TOK_TYPEOF) \
+    X(TOK_DECIMAL32) \
+    X(TOK_DECIMAL64) \
+    X(TOK_DECIMAL128) \
+    X(TOK_TYPES_COMPAT) \
+    X(TOK_LOCAL_LABEL) \
+    X(TOK_ATOMIC) \
+    X(TOK_AUTO_TYPE) \
     X(TOK_REAL) \
     X(TOK_IMAG) \
     /* punctuators */ \

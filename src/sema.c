@@ -24,7 +24,10 @@
 
 static SymTab *cur_symtab = NULL;
 
-/* the function being checked */
+/* the function being checked, and (GNU nested functions) the ones it is defined in, innermost last */
+static Symbol *fn_stack[64];
+static Scope *fn_scope_stack[64];
+static int fn_depth = 0;
 static Type *cur_return = NULL;
 static ASTList *cur_gotos = NULL;
 static int loop_depth = 0;
@@ -53,6 +56,8 @@ typedef struct Specs {
     int packed;         /* __attribute__((packed)) seen */
     size_t aligned;     /* __attribute__((aligned(n))) or _Alignas seen */
     int has_alignas;    /* _Alignas, which a typedef may not have */
+    int sso;            /* scalar_storage_order: 1 big-endian, 2 little-endian, 0 none */
+    int auto_type;      /* __auto_type: `type` is a placeholder, the initializer gives the type */
     int only_tag;       /* the list is just `struct S` or `enum E` (with or without body) */
     int is_thread;      /* _Thread_local or __thread */
 } Specs;
@@ -64,11 +69,15 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out);
 static Type *sema_type_name(AST *tn);
 static void sema_declaration(AST *decl, int file_scope);
 static void sema_stmt(AST *stmt);
+static void sema_function(AST *fdef);
 static void sema_initializer(AST **slot, Type **ptype, int is_static);
 static int static_assertion(AST *decl);
 static int float_eval(AST *e, long double *out);
 static Type *builtin_type(const char *name);
-static Type *sema_atomic(AST *e, int is_store);
+static Type *sema_atomic(AST *e, const AtomicBuiltin *ab);
+static Type *sema_shuffle(AST *e);
+static int check_modifiable(AST *e, const char *what);
+static const char *find_attr(const char *text, const char *word);
 
 /* helpers */
 
@@ -342,9 +351,38 @@ static void float_suffix(const char *text, int *is_float, int *is_long, int *is_
     }
 }
 
+/* the _FloatN suffix of a floating literal (f32, f64, f128, f32x, f64x, and GNU q for __float128), as the type; NULL if none */
+static Type *floatn_suffix(const char *text) {
+    size_t n = strlen(text);
+    const char *p;
+    if (n && (text[n - 1] == 'q' || text[n - 1] == 'Q')) {
+        return type_basic(TY_FLOAT128);
+    }
+    for (p = text + n; p > text && (isdigit((unsigned char)p[-1]) || p[-1] == 'x' || p[-1] == 'X'); p--) {
+    }
+    if (p == text || (p[-1] != 'f' && p[-1] != 'F') || !isdigit((unsigned char)*p)) {
+        return NULL;
+    }
+    if (strcmp(p, "128") == 0) return type_basic(TY_FLOAT128);
+    if (strcmp(p, "64x") == 0 || strcmp(p, "64X") == 0) return type_basic(TY_LDOUBLE);
+    if (strcmp(p, "64") == 0 || strcmp(p, "32x") == 0 || strcmp(p, "32X") == 0) return type_basic(TY_DOUBLE);
+    if (strcmp(p, "32") == 0) return type_basic(TY_FLOAT);
+    return NULL;
+}
+
 static Type *float_literal_type(const char *text) {
     int is_float, is_long, is_imaginary;
     Type *t;
+    size_t n = strlen(text);
+    if (n > 2 && (text[n - 2] == 'd' || text[n - 2] == 'D')) {
+        char c = (char)tolower((unsigned char)text[n - 1]);
+        if (c == 'f' || c == 'd' || c == 'l') {
+            return type_basic(c == 'f' ? TY_DECIMAL32 : c == 'd' ? TY_DECIMAL64 : TY_DECIMAL128);
+        }
+    }
+    if ((t = floatn_suffix(text)) != NULL) {
+        return t;
+    }
     float_suffix(text, &is_float, &is_long, &is_imaginary);
     t = type_basic(is_float ? TY_FLOAT : is_long ? TY_LDOUBLE : TY_DOUBLE);
     return is_imaginary ? type_complex_of(t) : t;
@@ -743,6 +781,8 @@ static int is_address_constant(AST *e) {
         }
         case N_IDENT:
             return e->sym && e->sym->kind == SYM_FUNCTION;
+        case N_LABEL_ADDR:
+            return 1;
         case N_UNARY:
             return e->u.unary.op == OP_ADDR && is_static_object(e->u.unary.operand);
         case N_BINARY:
@@ -757,6 +797,140 @@ static int is_address_constant(AST *e) {
     }
 }
 
+void sema_asm_constraint(const char *text, AsmConstraint *c) {
+    int arm = strcmp(arch_info->name, "arm64") == 0;
+    const char *p;
+    memset(c, 0, sizeof(*c));
+    c->match = -1;
+    for (p = text; *p && *p != ','; p++) {
+        switch (*p) {
+            case '=': c->output = 1; break;
+            case '+': c->output = 1; c->inout = 1; break;
+            case '&': case '%': case '?': case '!': case ' ': break;
+            case '*': if (p[1]) p++; break;     /* the next letter is a register preference only */
+            case 'r': case 'l': case 'R': case 'U': case 'p': c->reg = 1; break;
+            case 'q': c->reg = 1; break;
+            case 'Q': if (arm) c->mem = 1; else c->reg = 1; break;
+            case 'a': case 'b': case 'c': case 'd': case 'S': case 'D':
+                if (arm) { c->unsupported = *p; } else { c->reg = 1; c->specific = *p; }
+                break;
+            case 'x': case 'Y': case 'v': c->reg = 1; c->fp = 1; break;
+            case 'w': if (arm) { c->reg = 1; c->fp = 1; } else { c->unsupported = *p; } break;
+            case 't': case 'u': if (arm) { c->unsupported = *p; } else { c->reg = 1; c->specific = *p; } break;
+            case 'm': case 'o': case 'V': case '<': case '>': c->mem = 1; break;
+            case 'i': case 'n': case 'I': case 'J': case 'K': case 'L': case 'M': case 'N': case 'O': case 'P':
+            case 'e': case 'Z': case 's': case 'E': case 'F': case 'G': case 'H':
+                c->imm = 1; break;
+            case 'g': case 'X': c->reg = 1; c->mem = 1; c->imm = 1; break;
+            case '[': {
+                const char *e = strchr(p, ']');
+                if (!e) {
+                    c->unsupported = '[';
+                    return;
+                }
+                c->match_name = p + 1;
+                c->match_len = (size_t)(e - p - 1);
+                p = e;
+                break;
+            }
+            default:
+                if (isdigit((unsigned char)*p)) {
+                    c->match = (int)strtol(p, NULL, 10);
+                    while (isdigit((unsigned char)p[1])) {
+                        p++;
+                    }
+                } else if (!c->unsupported) {
+                    c->unsupported = *p;
+                }
+                break;
+        }
+    }
+}
+
+/* an asm statement: its operands are checked as the constraints require */
+static void sema_asm(AST *s) {
+    ASTList *outs = s->u.asmst.outputs;
+    ASTList *ins = s->u.asmst.inputs;
+    size_t nouts = outs ? outs->len : 0;
+    size_t i;
+    for (i = 0; outs && i < outs->len; i++) {
+        AST *op = outs->items[i];
+        AsmConstraint c;
+        char *text = NULL;
+        sema_string_bytes(op->u.asmop.constraint->u.text, &text);
+        sema_asm_constraint(text, &c);
+        sema_expr(&op->u.asmop.expr);
+        if (!c.output) {
+            diag_error(op->loc, "asm output constraint '%s' must begin with '=' or '+'", text);
+        } else if (c.unsupported) {
+            diag_error(op->loc, "asm constraint '%s': '%c' is not supported", text, c.unsupported);
+        } else if (!c.reg && !c.mem) {
+            diag_error(op->loc, "asm output constraint '%s' allows neither a register nor memory", text);
+        } else if (!poisoned(op->u.asmop.expr)) {
+            check_modifiable(op->u.asmop.expr, "asm output to");
+        }
+        free(text);
+    }
+    for (i = 0; ins && i < ins->len; i++) {
+        AST *op = ins->items[i];
+        AsmConstraint c;
+        char *text = NULL;
+        long v;
+        sema_string_bytes(op->u.asmop.constraint->u.text, &text);
+        sema_asm_constraint(text, &c);
+        if (c.mem && !c.reg && !c.imm && c.match < 0 && !c.match_name) {
+            sema_expr(&op->u.asmop.expr);   /* the object itself */
+        } else {
+            sema_rvalue(&op->u.asmop.expr);
+        }
+        if (c.output) {
+            diag_error(op->loc, "asm input constraint '%s' cannot have '=' or '+'", text);
+        } else if (c.unsupported) {
+            diag_error(op->loc, "asm constraint '%s': '%c' is not supported", text, c.unsupported);
+        } else if (c.match >= 0 && (size_t)c.match >= nouts) {
+            diag_error(op->loc, "asm input constraint '%s' refers to output %d, which does not exist", text, c.match);
+        } else if (c.imm && !c.reg && !c.mem && c.match < 0
+                   && !(type_is_integer(op->u.asmop.expr->type) && sema_const_eval(op->u.asmop.expr, &v))
+                   && !is_address_constant(op->u.asmop.expr)) {
+            diag_error(op->loc, "asm operand with constraint '%s' must be a constant", text);
+        }
+        free(text);
+    }
+    for (i = 0; s->u.asmst.labels && i < s->u.asmst.labels->len; i++) {
+        cur_gotos = ast_list_push(cur_gotos, s->u.asmst.labels->items[i]);
+    }
+}
+
+/* `&&a - &&b` (under casts): GNU label arithmetic a static initializer may hold, as an offset in the code */
+int sema_label_diff(const AST *e, Symbol **a, Symbol **b) {
+    const AST *l, *r;
+    while (e->kind == N_IMPLICIT_CAST || e->kind == N_CAST) {
+        e = e->u.cast.expr;
+    }
+    if (e->kind != N_BINARY || e->u.binary.op != OP_SUB) {
+        return 0;
+    }
+    l = e->u.binary.left;
+    r = e->u.binary.right;
+    while (l->kind == N_IMPLICIT_CAST || l->kind == N_CAST) {
+        l = l->u.cast.expr;
+    }
+    while (r->kind == N_IMPLICIT_CAST || r->kind == N_CAST) {
+        r = r->u.cast.expr;
+    }
+    if (l->kind != N_LABEL_ADDR || r->kind != N_LABEL_ADDR) {
+        return 0;
+    }
+    if (a && (!l->sym || !r->sym)) {
+        return 0;   /* (checking a static initializer, the labels need not be resolved yet) */
+    }
+    if (a) {
+        *a = l->sym;
+        *b = r->sym;
+    }
+    return 1;
+}
+
 /* may `e` initialise an object with static storage duration? */
 static int is_constant_initializer(AST *e) {
     long v;
@@ -764,8 +938,23 @@ static int is_constant_initializer(AST *e) {
     if (!e->type) {
         return 1;   /* already diagnosed */
     }
+    if (type_is_vector(e->type)) {
+        while (e->kind == N_IMPLICIT_CAST || e->kind == N_CAST) {
+            e = e->u.cast.expr;
+        }
+        return e->kind == N_COMPOUND_LIT && e->sym;     /* a static compound literal's initializer is constant */
+    }
+    if (type_is_decimal(e->type)) {
+        /* a decimal literal (negated, perhaps), or an integer or floating constant converted */
+        while (e->kind == N_IMPLICIT_CAST || e->kind == N_CAST
+               || (e->kind == N_UNARY && (e->u.unary.op == OP_NEG || e->u.unary.op == OP_POS))) {
+            e = e->kind == N_UNARY ? e->u.unary.operand : e->u.cast.expr;
+        }
+        return (e->kind == N_FLOAT && type_is_decimal(e->type)) || (type_is_integer(e->type) && sema_const_eval(e, &v))
+            || (type_is_floating(e->type) && float_eval(e, &d));
+    }
     if (type_is_integer(e->type)) {
-        return sema_const_eval(e, &v);
+        return sema_const_eval(e, &v) || sema_label_diff(e, NULL, NULL);
     }
     if (type_is_floating(e->type)) {
         return float_eval(e, &d);
@@ -817,6 +1006,28 @@ static void scan_attribute(const char *text, int *packed, size_t *aligned) {
     }
 }
 
+/* the type a typeof node names: its type name's, or its expression's (which is not evaluated) */
+static Type *typeof_type(AST *n) {
+    if (!n->type) {     /* worked out once, though a declaration's specifiers may be read again */
+        if (n->u.cast.align) {
+            /* C11 _Atomic(type name) */
+            Type *t = sema_type_name(n->u.cast.type);
+            if (t->kind == TY_ARRAY || t->kind == TY_FUNC || t->quals) {
+                diag_error(n->loc, "_Atomic cannot be applied to %s", ts(t));
+            }
+            n->type = type_qualify(t, TQ_ATOMIC);
+        } else if (n->u.cast.type) {
+            n->type = sema_type_name(n->u.cast.type);
+        } else {
+            n->type = sema_expr(&n->u.cast.expr);
+            if (sema_is_bitfield(n->u.cast.expr)) {
+                diag_error(n->loc, "'typeof' applied to a bit-field");
+            }
+        }
+    }
+    return n->type;
+}
+
 /* the alignment an Alignas node asks for (_Alignas, or an aligned attribute's expression); 0 for none or an error */
 static size_t alignas_value(AST *a) {
     long v;
@@ -837,12 +1048,70 @@ static size_t alignas_value(AST *a) {
     return (size_t)v;
 }
 
-/* raise *aligned to what the Alignas node `a` asks for */
+/* raise *aligned to what the Alignas node `a` asks for (not a vector_size one's) */
 static void scan_alignas(AST *a, size_t *aligned) {
-    size_t n = alignas_value(a);
+    size_t n;
+    if (a->u.cast.align == 2) {
+        return;
+    }
+    n = alignas_value(a);
     if (n > *aligned) {
         *aligned = n;
     }
+}
+
+/* the type __attribute__((mode(m))) makes of the integer or floating type t (keeping its signedness) */
+static Type *apply_mode(Type *t, const char *m, Loc loc) {
+    int u = type_is_unsigned(t);
+    char name[16];
+    size_t n = 0;
+    while (*m == '_') {
+        m++;
+    }
+    while ((isalnum((unsigned char)*m)) && n + 1 < sizeof(name)) {
+        name[n++] = *m++;
+    }
+    name[n] = '\0';
+    if (strcmp(name, "QI") == 0 || strcmp(name, "byte") == 0) return type_basic(u ? TY_UCHAR : TY_SCHAR);
+    if (strcmp(name, "HI") == 0) return type_basic(u ? TY_USHORT : TY_SHORT);
+    if (strcmp(name, "SI") == 0) return type_basic(u ? TY_UINT : TY_INT);
+    if (strcmp(name, "DI") == 0 || strcmp(name, "word") == 0 || strcmp(name, "pointer") == 0) return type_basic(u ? TY_ULONG : TY_LONG);
+    if (strcmp(name, "TI") == 0) return type_basic(u ? TY_UINT128 : TY_INT128);
+    if (strcmp(name, "SF") == 0) return type_basic(TY_FLOAT);
+    if (strcmp(name, "DF") == 0) return type_basic(TY_DOUBLE);
+    if (strcmp(name, "XF") == 0) return type_basic(TY_LDOUBLE);
+    if (strcmp(name, "TF") == 0) return type_basic(TY_FLOAT128);
+    diag_error(loc, "unknown machine mode '%s'", name);
+    return t;
+}
+
+/* the GNU type attributes mode(m) and vector_size(n) in `attrs`, applied to the base type t of a declaration */
+static Type *mode_and_vector(Type *t, const ASTList *attrs, Loc loc) {
+    size_t i;
+    for (i = 0; attrs && i < attrs->len; i++) {
+        AST *a = attrs->items[i];
+        const char *m;
+        if (a->kind == N_ATTRIBUTE && strncmp(a->u.text, "__attribute", 11) == 0 && (m = find_attr(a->u.text, "mode")) != NULL) {
+            while (*m == ' ' || *m == '(') {
+                m++;
+            }
+            t = type_qualify(apply_mode(t, m, a->loc), t->quals);
+        }
+    }
+    for (i = 0; attrs && i < attrs->len; i++) {
+        AST *a = attrs->items[i];
+        if (a->kind == N_ALIGNAS && a->u.cast.align == 2) {
+            size_t bytes = alignas_value(a);
+            Type *v = bytes ? type_vector(t, bytes) : NULL;
+            if (!v) {
+                diag_error(a->loc, "invalid vector type: %lu bytes of %s", (unsigned long)bytes, ts(t));
+            } else {
+                t = type_qualify(v, t->quals);
+            }
+        }
+    }
+    (void)loc;
+    return t;
 }
 
 /* the alignment __attribute__((aligned)) asks for in a declarator's attributes or its
@@ -870,7 +1139,7 @@ static size_t decl_aligned(AST *d, const Specs *sp) {
 /* the type a declaration's aligned attribute gives what it declares: a typedef takes the
    alignment as asked (gcc lets it lower one too), a member or an object only ever gains */
 static Type *apply_aligned(Type *t, size_t aligned, int is_typedef) {
-    if (!aligned || t->kind == TY_FUNC || (aligned & (aligned - 1)) != 0) {
+    if (!aligned || (aligned & (aligned - 1)) != 0) {
         return t;
     }
     if (is_typedef || aligned > type_align(t)) {
@@ -1012,9 +1281,11 @@ static void sema_struct_spec(AST *spec, Type *type, const Specs *attrs) {
                 }
                 bits = (int)w;
             }
-            if (type_is_vm(mt)) {
+            if (type_is_vm(mt) && (bits >= 0 || !cur_return)) {
                 diag_error(sd->loc, "field '%s' has a variably modified type", name ? name : "");
                 mt = int_type();
+            } else if (type_is_vla(mt)) {
+                r->vm = 1;      /* GNU, in a function: laid out when the definition is reached */
             }
             if (bits < 0) {
                 if (mt->kind == TY_FUNC) {
@@ -1049,17 +1320,31 @@ static void sema_struct_spec(AST *spec, Type *type, const Specs *attrs) {
     r->packed = attrs->packed;
     r->aligned = attrs->aligned;
     r->pack = (size_t)spec->u.record.pack;
-    if (spec->u.record.attrs) {
-        for (i = 0; i < spec->u.record.attrs->len; i++) {
-            AST *a = spec->u.record.attrs->items[i];
-            if (a->kind == N_ALIGNAS) {
-                scan_alignas(a, &r->aligned);
-            } else {
-                scan_attribute(a->u.text, &r->packed, &r->aligned);
+    {
+        int sso = attrs->sso;
+        if (spec->u.record.attrs) {
+            for (i = 0; i < spec->u.record.attrs->len; i++) {
+                AST *a = spec->u.record.attrs->items[i];
+                if (a->kind == N_ALIGNAS) {
+                    scan_alignas(a, &r->aligned);
+                } else {
+                    scan_attribute(a->u.text, &r->packed, &r->aligned);
+                    if (find_attr(a->u.text, "scalar_storage_order")) {
+                        sso = strstr(a->u.text, "big") ? 1 : 2;
+                    }
+                }
             }
         }
+        record_layout(r);
+        /* both targets are little-endian: big-endian is the reversed order, for each scalar member */
+        for (i = 0; sso == 1 && i < r->nmembers; i++) {
+            const Type *mt = r->members[i].type;
+            while (mt->kind == TY_ARRAY) {
+                mt = mt->base;
+            }
+            r->members[i].reverse = type_is_scalar(mt) && !type_is_complex(mt);
+        }
     }
-    record_layout(r);
 }
 
 /* the type a StructSpec or EnumSpec node denotes; creates the record on first sight */
@@ -1095,6 +1380,7 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
     int n_void = 0, n_char = 0, n_short = 0, n_int = 0, n_long = 0;
     int n_float = 0, n_double = 0, n_signed = 0, n_unsigned = 0;
     int n_va_list = 0, n_int128 = 0, n_uint128 = 0, n_bool = 0, n_float16 = 0, n_float128 = 0, n_complex = 0;
+    int n_decimal = 0, n_other_decimal = 0;
     int n_other = 0;        /* struct, union, enum, typedef name */
     AST *other = NULL;
     unsigned quals = 0;
@@ -1140,11 +1426,16 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
                     quals |= TQ_CONST;
                 } else if (s->u.qual == QUAL_VOLATILE) {
                     quals |= TQ_VOLATILE;
+                } else if (s->u.qual == QUAL_ATOMIC) {
+                    quals |= TQ_ATOMIC;
                 }
                 break;
 
             case N_ATTRIBUTE:
                 scan_attribute(s->u.text, &out->packed, &out->aligned);
+                if (find_attr(s->u.text, "scalar_storage_order")) {
+                    out->sso = strstr(s->u.text, "big") ? 1 : 2;
+                }
                 break;
 
             case N_ALIGNAS:
@@ -1172,13 +1463,18 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
                     case TS_FLOAT16: n_float16++; break;
                     case TS_FLOAT64X: n_long++; n_double++; break;
                     case TS_FLOAT128: n_float128++; break;
+                    case TS_DECIMAL32: n_decimal = 32; n_other_decimal++; break;
+                    case TS_DECIMAL64: n_decimal = 64; n_other_decimal++; break;
+                    case TS_DECIMAL128: n_decimal = 128; n_other_decimal++; break;
                     case TS_COMPLEX: n_complex++; break;
+                    case TS_AUTO_TYPE: n_other++; other = s; break;
                 }
                 break;
 
             case N_STRUCT_SPEC:
             case N_ENUM_SPEC:
             case N_TYPEDEF_NAME:
+            case N_TYPEOF:
                 n_other++;
                 other = s;
                 break;
@@ -1189,12 +1485,21 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
     }
 
     if (n_other > 1 || (n_other && (n_void + n_char + n_short + n_int + n_long + n_float
-            + n_double + n_signed + n_unsigned + n_va_list + n_int128 + n_uint128 + n_bool + n_float16 + n_float128 + n_complex))) {
+            + n_double + n_signed + n_unsigned + n_va_list + n_int128 + n_uint128 + n_bool + n_float16 + n_float128 + n_complex
+            + n_other_decimal))) {
         diag_error(loc, "invalid combination of type specifiers");
         n_other = 0;
     }
     if (n_other) {
-        if (other->kind == N_TYPEDEF_NAME) {
+        if (other->kind == N_TYPE_SPEC) {
+            /* __auto_type: the declaration takes the initializer's type (sema_declaration) */
+            t = int_type();
+            out->auto_type = 1;
+            out->only_tag = 0;
+        } else if (other->kind == N_TYPEOF) {
+            t = typeof_type(other);
+            out->only_tag = 0;
+        } else if (other->kind == N_TYPEDEF_NAME) {
             Symbol *sym = other->sym;
             if (!sym || sym->kind != SYM_TYPEDEF || !sym->type) {
                 diag_error(other->loc, "unknown type name '%s'", other->u.name);
@@ -1221,8 +1526,14 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
         t = type_basic(TY_VA_LIST);
     } else if (n_float16) {
         t = type_basic(TY_FLOAT16);   /* declared by the macOS SDK's math.h; values are not supported */
+    } else if (n_other_decimal) {
+        t = type_basic(n_decimal == 32 ? TY_DECIMAL32 : n_decimal == 64 ? TY_DECIMAL64 : TY_DECIMAL128);
+        if (n_other_decimal > 1 || n_char || n_short || n_int || n_long || n_float || n_double || n_signed || n_unsigned
+                || n_float128 || n_complex) {
+            diag_error(loc, "invalid combination of type specifiers");
+        }
     } else if (n_float128) {
-        t = type_basic(TY_FLOAT128);  /* declared by glibc's math.h and stdlib.h; values are not supported */
+        t = type_basic(TY_FLOAT128);  /* x86_64 only: Apple's arm64 has none */
         if (n_float128 > 1 || n_char || n_short || n_int || n_long || n_float || n_double || n_signed || n_unsigned) {
             diag_error(loc, "invalid combination of type specifiers");
         }
@@ -1294,6 +1605,7 @@ static void sema_specs(ASTList *specs, Specs *out, int allow_storage, Loc loc) {
     if (out->has_alignas && out->is_typedef) {
         diag_error(loc, "a typedef cannot have '_Alignas'");
     }
+    t = mode_and_vector(t, specs, loc);
     out->type = type_qualify(t, quals);
 }
 
@@ -1311,6 +1623,8 @@ static unsigned quals_of(ASTList *list) {
                 q |= TQ_CONST;
             } else if (s->u.qual == QUAL_VOLATILE) {
                 q |= TQ_VOLATILE;
+            } else if (s->u.qual == QUAL_ATOMIC) {
+                q |= TQ_ATOMIC;
             }
         }
     }
@@ -1343,7 +1657,7 @@ static unsigned array_param_quals(AST *d) {
 
 /* a parameter's type after the array and function adjustments */
 static Type *adjust_param(Type *t) {
-    if (t->kind == TY_ARRAY) {
+    if (t->kind == TY_ARRAY && !t->vector) {
         return type_qualify(type_pointer(t->base), t->quals);
     }
     if (t->kind == TY_FUNC) {
@@ -1368,6 +1682,11 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
     AST *node = d;
 
     *name_out = NULL;
+    /* mode and vector_size after a declarator change the declaration's base type */
+    for (node = d; node; node = node->kind == N_DECL_NAME ? NULL : node->u.declarator.inner) {
+        t = mode_and_vector(t, node->u.declarator.attrs, node->loc);
+    }
+    node = d;
     while (node) {
         switch (node->kind) {
             case N_DECL_NAME:
@@ -1427,6 +1746,13 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
                         vla = 1;
                     }
                 }
+                if (!vla && node->u.declarator.size) {
+                    /* `int a[2][n]`: an array of a variable length one is sized at run time too */
+                    Type *e;
+                    for (e = t; e->kind == TY_ARRAY && !e->vla; e = e->base) {
+                    }
+                    vla = type_is_vla(e);
+                }
                 t = vla ? type_vla(t, node->u.declarator.size) : type_array(t, length);
                 node->type = t;
                 node = node->u.declarator.inner;
@@ -1448,7 +1774,7 @@ static Type *sema_declarator(AST *d, Type *base, const char **name_out) {
                 if (t->kind == TY_FUNC) {
                     diag_error(node->loc, "function cannot return a function");
                     t = type_pointer(t);
-                } else if (t->kind == TY_ARRAY) {
+                } else if (t->kind == TY_ARRAY && !t->vector) {
                     diag_error(node->loc, "function cannot return an array");
                     t = type_pointer(t->base);
                 }
@@ -1567,6 +1893,15 @@ static void convert_assign(AST **slot, Type *to, const char *what) {
     if (type_is_record(to)) {
         if (!type_compatible_unqual(to, from)) {
             diag_error(loc, "%s %s from incompatible type %s", what, ts(to), ts(from));
+        }
+        return;
+    }
+    if (type_is_vector(to) || type_is_vector(from)) {
+        /* a vector from one of the same size (GCC's lax vector conversions: the bits as they are) */
+        if (!type_is_vector(to) || !type_is_vector(from) || type_size(to) != type_size(from)) {
+            diag_error(loc, "%s %s from incompatible type %s", what, ts(to), ts(from));
+        } else if (!type_compatible_unqual(to, from)) {
+            ast_implicit_cast(slot, to);
         }
         return;
     }
@@ -1718,7 +2053,7 @@ static int check_modifiable(AST *e, const char *what) {
         diag_error(e->loc, "%s requires a modifiable lvalue", what);
         return 0;
     }
-    if (e->type->kind == TY_ARRAY) {
+    if (e->type->kind == TY_ARRAY && !e->type->vector) {
         diag_error(e->loc, "%s an array is not allowed", what);
         return 0;
     }
@@ -1764,6 +2099,20 @@ static Type *sema_ident(AST *e) {
             if (!sym->type) {
                 /* declaration failed earlier, or a K&R parameter used in its own declaration */
                 return error_type(e);
+            }
+            if (fn_depth > 1 && sym->scope->kind != SCOPE_FILE && sym->storage != STORAGE_STATIC && sym->storage != STORAGE_EXTERN) {
+                /* a local of an enclosing function, which a nested one uses: reached through the static chain */
+                Scope *s = sym->scope;
+                int k;
+                while (s && s->kind != SCOPE_FUNCTION) {
+                    s = s->parent;
+                }
+                for (k = fn_depth - 2; k >= 0 && s != fn_scope_stack[k]; k--) {
+                }
+                if (s != fn_scope_stack[fn_depth - 1] && k >= 0) {
+                    sym->captured = 1;
+                    sym->owner_fn = fn_stack[k];
+                }
             }
             e->type = sym->type;
             e->lvalue = 1;
@@ -1839,6 +2188,11 @@ static Type *sema_unary(AST *e) {
         case OP_POS:
         case OP_NEG:
             t = sema_rvalue(operand);
+            if (type_is_vector(t)) {
+                e->type = t;
+                e->lvalue = 0;
+                return e->type;
+            }
             if (!type_is_arithmetic(t)) {
                 diag_error(e->loc, "invalid operand of type %s to unary '%s'", ts(t), op_name(e->u.unary.op));
                 return error_type(e);
@@ -1849,6 +2203,11 @@ static Type *sema_unary(AST *e) {
 
         case OP_BITNOT:
             t = sema_rvalue(operand);
+            if (type_is_vector(t) && type_is_integer(t->base)) {
+                e->type = t;
+                e->lvalue = 0;
+                return e->type;
+            }
             if (type_is_complex(t)) {
                 e->type = t;    /* GNU: the complex conjugate */
                 e->lvalue = 0;
@@ -1927,6 +2286,99 @@ static int pointer_arith_ok(AST *e, Type *p) {
     return 1;
 }
 
+/*
+ * __builtin_shuffle(a, mask) and (a, b, mask): a vector of a's elements,
+ * as many as the integer vector mask has, each the one of a (or of a
+ * followed by b) that mask's element picks, modulo their number.
+ */
+static Type *sema_shuffle(AST *e) {
+    AST **f = &e->u.call.func;
+    ASTList *args = e->u.call.args;
+    Symbol *sym;
+    Type *a, *m;
+    size_t i;
+    sym = symtab_declare(cur_symtab, NS_ORDINARY, SYM_FUNCTION, (*f)->u.name, NULL, (*f)->loc);
+    if (!sym->type) {
+        sym->type = type_func(int_type(), NULL, 0, 0, 0);
+    }
+    (*f)->sym = sym;
+    sema_rvalue(f);
+    for (i = 0; i < args->len; i++) {
+        sema_rvalue(&args->items[i]);
+    }
+    e->lvalue = 0;
+    if (args->len != 2 && args->len != 3) {
+        diag_error(e->loc, "'__builtin_shuffle' takes two or three arguments");
+        return error_type(e);
+    }
+    a = args->items[0]->type;
+    m = args->items[args->len - 1]->type;
+    if (!type_is_vector(a) || !type_is_vector(m) || !type_is_integer(m->base)
+            || (args->len == 3 && !type_compatible_unqual(a, args->items[1]->type))) {
+        diag_error(e->loc, "'__builtin_shuffle' takes vectors of one type and an integer vector mask");
+        return error_type(e);
+    }
+    e->type = type_vector(a->base, (size_t)m->length * type_size(a->base));
+    if (!e->type) {
+        diag_error(e->loc, "'__builtin_shuffle': no vector of %ld %s", m->length, ts(a->base));
+        return error_type(e);
+    }
+    return e->type;
+}
+
+/* the signed integer type of `size` bytes: a vector comparison's elements */
+static Type *signed_of_size(size_t size) {
+    return type_basic(size == 1 ? TY_SCHAR : size == 2 ? TY_SHORT : size == 4 ? TY_INT : size == 8 ? TY_LLONG : TY_INT128);
+}
+
+/*
+ * GNU vector arithmetic: element by element on two vectors of one type,
+ * or a vector and a scalar (converted to the element type, and used for
+ * every element). A comparison gives a vector of signed integers of the
+ * elements' size, each -1 (true) or 0.
+ */
+static Type *sema_vector_binary(AST *e, OpKind op, AST **l, AST **r, Type *lt, Type *rt) {
+    Type *v = type_is_vector(lt) ? lt : rt;
+    Type *elem = v->base;
+    int shift = op == OP_SHL || op == OP_SHR;
+    if (type_is_vector(lt) && type_is_vector(rt)) {
+        if (type_size(lt) != type_size(rt) || type_size(lt->base) != type_size(rt->base)
+                || type_is_floating(lt->base) != type_is_floating(rt->base)) {
+            diag_error(e->loc, "invalid operands to binary %s (%s and %s)", op_name(op), ts(lt), ts(rt));
+            return error_type(e);
+        }
+        if (!shift && !type_compatible_unqual(lt, rt)) {
+            ast_implicit_cast(r, lt);
+        }
+    } else {
+        AST **s = type_is_vector(lt) ? r : l;
+        Type *st = type_is_vector(lt) ? rt : lt;
+        if (!type_is_arithmetic(st) || type_is_complex(st)) {
+            diag_error(e->loc, "invalid operands to binary %s (%s and %s)", op_name(op), ts(lt), ts(rt));
+            return error_type(e);
+        }
+        coerce(s, elem);
+    }
+    switch (op) {
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
+            e->type = type_unqualified(v);
+            return e->type;
+        case OP_MOD: case OP_BITAND: case OP_BITOR: case OP_BITXOR: case OP_SHL: case OP_SHR:
+            if (!type_is_integer(elem)) {
+                diag_error(e->loc, "invalid operands to binary %s (%s and %s)", op_name(op), ts(lt), ts(rt));
+                return error_type(e);
+            }
+            e->type = type_unqualified(v);
+            return e->type;
+        case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+            e->type = type_vector(signed_of_size(type_size(elem)), type_size(v));
+            return e->type;
+        default:
+            diag_error(e->loc, "invalid operands to binary %s (%s and %s)", op_name(op), ts(lt), ts(rt));
+            return error_type(e);
+    }
+}
+
 static Type *sema_binary(AST *e) {
     AST **l = &e->u.binary.left;
     AST **r = &e->u.binary.right;
@@ -1948,6 +2400,9 @@ static Type *sema_binary(AST *e) {
     }
     if (bitfield_value_bits(*r) >= 0) {
         rt = promote_bitfield(r);
+    }
+    if (type_is_vector(lt) || type_is_vector(rt)) {
+        return sema_vector_binary(e, op, l, r, lt, rt);
     }
 
     switch (op) {
@@ -2114,6 +2569,19 @@ static Type *sema_assign(AST *e) {
         convert_assign(r, result, "assigning");
         return result;
     }
+    if (type_is_vector(lt)) {
+        /* v op= x: as v = v op x, the result a vector of v's type */
+        if (type_is_vector(rt) ? type_size(rt) != type_size(lt) : !type_is_arithmetic(rt)) {
+            diag_error(e->loc, "invalid operands to '%s' (%s and %s)", op_name(op), ts(lt), ts(rt));
+            return error_type(e);
+        }
+        if (!type_is_vector(rt)) {
+            coerce(r, lt->base);
+        } else if (!type_compatible_unqual(lt, rt) && op != OP_SHL_ASSIGN && op != OP_SHR_ASSIGN) {
+            ast_implicit_cast(r, result);
+        }
+        return result;
+    }
     if ((op == OP_ADD_ASSIGN || op == OP_SUB_ASSIGN) && lt->kind == TY_POINTER && type_is_integer(rt)) {
         if (!pointer_arith_ok(e, lt)) {
             return error_type(e);
@@ -2167,7 +2635,7 @@ static Type *sema_cond(AST *e) {
         e->type = common;
         return common;
     }
-    if (type_is_record(at) && type_is_record(bt) && type_compatible_unqual(at, bt)) {
+    if ((type_is_record(at) || type_is_vector(at)) && type_compatible_unqual(at, bt)) {
         e->type = type_unqualified(at);
         return e->type;
     }
@@ -2225,11 +2693,12 @@ static Type *sema_call(AST *e) {
 
     e->lvalue = 0;
     if ((*f)->kind == N_IDENT && !(*f)->sym) {
-        if (strcmp((*f)->u.name, "__atomic_load_n") == 0) {
-            return sema_atomic(e, 0);
+        const AtomicBuiltin *ab = sema_atomic_builtin((*f)->u.name);
+        if (ab) {
+            return sema_atomic(e, ab);
         }
-        if (strcmp((*f)->u.name, "__atomic_store_n") == 0) {
-            return sema_atomic(e, 1);
+        if (strcmp((*f)->u.name, "__builtin_shuffle") == 0) {
+            return sema_shuffle(e);
         }
     }
     if ((*f)->kind == N_IDENT && !(*f)->sym && !builtin_type((*f)->u.name)) {
@@ -2300,6 +2769,16 @@ static Type *sema_index(AST *e) {
     Type *it = sema_rvalue(i);
     Type *p;
 
+    if (type_is_vector(at)) {
+        /* an element of a vector: an lvalue when the vector is one */
+        if (!type_is_integer(it)) {
+            diag_error(e->loc, "vector subscript of type %s is not an integer", ts(it));
+            return error_type(e);
+        }
+        e->type = at->base;
+        e->lvalue = (*a)->lvalue > 0;
+        return e->type;
+    }
     if (at->kind == TY_POINTER && type_is_integer(it)) {
         p = at;
     } else if (it->kind == TY_POINTER && type_is_integer(at)) {
@@ -2392,6 +2871,15 @@ static Type *sema_cast(AST *e) {
     if (type_is_record(to) && type_compatible_unqual(from, to)) {
         return e->type;     /* record_cast: sema_expr drops the cast */
     }
+    if (type_is_vector(to) || type_is_vector(from)) {
+        /* between vectors, or a vector and an integer, of one size: the bits as they are */
+        if (type_size(to) != type_size(from) || !(type_is_vector(to) || type_is_integer(to) || to->kind == TY_POINTER)
+                || !(type_is_vector(from) || type_is_integer(from) || from->kind == TY_POINTER)) {
+            diag_error(e->loc, "cannot cast %s to %s", ts(from), ts(to));
+            return error_type(e);
+        }
+        return e->type;
+    }
     if (!type_is_scalar(to)) {
         diag_error(e->loc, "cast to non-scalar type %s", ts(to));
         return error_type(e);
@@ -2424,8 +2912,10 @@ static Type *sema_sizeof(AST *e) {
         }
     }
     if (t->kind == TY_FUNC) {
-        /* a GNU extension: the size is 1 */
-        diag_warning(e->loc, "invalid application of '%s' to a function type", op);
+        /* a GNU extension: the size is 1 (and the alignment the function's) */
+        if (!e->u.cast.align) {
+            diag_warning(e->loc, "invalid application of '%s' to a function type", op);
+        }
     } else if (!type_is_complete(t) && t->kind != TY_VOID) {
         diag_error(e->loc, "invalid application of '%s' to incomplete type %s", op, ts(t));
     }
@@ -2615,6 +3105,18 @@ static Type *sema_expr(AST **slot) {
         case N_COMPOUND_LIT:
             return sema_compound_lit(e);
 
+        case N_TYPES_COMPAT: {
+            /* GNU: 1 when the two types are compatible, their top-level qualifiers aside; an integer constant */
+            Type *a = type_unqualified(sema_type_name(e->u.cast.type));
+            Type *b = type_unqualified(sema_type_name(e->u.cast.expr));
+            int same = type_compatible(a, b);
+            ast_free(e->u.cast.type);
+            ast_free(e->u.cast.expr);
+            e->kind = N_INT;
+            e->u.text = strdup(same ? "1" : "0");
+            return sema_expr(slot);
+        }
+
         case N_GENERIC:
             return sema_generic(slot);
 
@@ -2634,8 +3136,12 @@ static Type *sema_expr(AST **slot) {
             unsigned long off = 0;
             size_t k;
             char text[32];
+            int dynamic = 0;    /* a run time index, or sizes: lowering works it out */
             for (k = 0; k < e->u.desig.path->len; k++) {
                 AST *d = e->u.desig.path->items[k];
+                if (type_is_record(t) && t->record->vm) {
+                    dynamic = 1;
+                }
                 if (d->kind == N_DESIG_MEMBER) {
                     Member *m;
                     Member *path[RECORD_PATH_MAX];
@@ -2662,13 +3168,25 @@ static Type *sema_expr(AST **slot) {
                         return error_type(e);
                     }
                     sema_rvalue(&d->u.cast.expr);
-                    if (!sema_const_eval(d->u.cast.expr, &idx)) {
-                        diag_error(d->loc, "offsetof index is not a constant expression");
+                    if (!type_is_integer(d->u.cast.expr->type)) {
+                        diag_error(d->loc, "offsetof index is not an integer");
                         return error_type(e);
+                    }
+                    if (!sema_const_eval(d->u.cast.expr, &idx) || type_is_vla(t->base) || type_is_vla(t)) {
+                        dynamic = 1;    /* GNU: as &((T *)0)->path at run time */
+                        idx = 0;
                     }
                     off += (unsigned long)idx * type_size(t->base);
                     t = t->base;
                 }
+                if (type_is_record(t) && t->record->vm) {
+                    dynamic = 1;
+                }
+            }
+            if (dynamic) {
+                e->type = type_size_t();
+                e->lvalue = 0;
+                return e->type;
             }
             snprintf(text, sizeof(text), "%luUL", off);
             *slot = ast_text(N_INT, e->loc, xstrdup(text));
@@ -2676,11 +3194,25 @@ static Type *sema_expr(AST **slot) {
             return sema_expr(slot);
         }
 
+        case N_LABEL_ADDR:
+            /* GNU &&label: resolved with the gotos at the end of the function */
+            e->type = type_pointer(type_basic(TY_VOID));
+            e->lvalue = 0;
+            if (!cur_return) {
+                diag_error(e->loc, "label address outside a function");
+            } else {
+                cur_gotos = ast_list_push(cur_gotos, e);
+            }
+            return e->type;
+
         case N_STMT_EXPR: {
             ASTList *items = e->u.stmt.body->u.block.items;
             AST *last = items->len ? items->items[items->len - 1] : NULL;
             sema_stmt(e->u.stmt.body);
             e->lvalue = 0;
+            while (last && last->kind == N_LABEL) {
+                last = last->u.stmt.body;   /* `({ ...; done: v; })`: a labeled last statement still gives the value */
+            }
             if (last && last->kind == N_EXPR_STMT && last->u.stmt.expr) {
                 e->type = type_unqualified(last->u.stmt.expr->type);
             } else {
@@ -2708,7 +3240,7 @@ static Type *sema_rvalue(AST **slot) {
     Type *t = sema_expr(slot);
     Type *d;
 
-    if (t->kind == TY_ARRAY || t->kind == TY_FUNC || (t->kind == TY_VA_LIST && arch_info->va_list_is_array)) {
+    if ((t->kind == TY_ARRAY && !t->vector) || t->kind == TY_FUNC || (t->kind == TY_VA_LIST && arch_info->va_list_is_array)) {
         d = type_decay(t);
         ast_implicit_cast(slot, d);
         return d;
@@ -2916,9 +3448,17 @@ static void init_elem(Type *t, Cursor *c, int is_static) {
     }
     if (t->kind == TY_ARRAY || type_is_record(t)) {
         /* brace elision: the aggregate takes as many items as it needs */
-        if (type_is_record(t) && (*slot)->kind != N_STRING) {
+        if ((type_is_record(t) || type_is_vector(t)) && (*slot)->kind != N_STRING) {
             /* a struct expression initialises the whole member (a string literal cannot be one: it starts an elided char array) */
             Type *et = sema_rvalue(slot);
+            if (type_is_vector(t) && type_is_vector(et) && type_size(et) == type_size(t)) {
+                convert_assign(slot, t, "initializing");
+                cur_advance(c);
+                if (is_static && !is_constant_initializer(*slot)) {
+                    diag_error((*slot)->loc, "initializer element is not a compile-time constant");
+                }
+                return;
+            }
             if (type_is_record(et) && type_compatible_unqual(et, t)) {
                 cur_advance(c);
                 if (is_static && !((*slot)->kind == N_COMPOUND_LIT && (*slot)->sym)) {
@@ -3062,6 +3602,14 @@ static void sema_initializer_in(AST **slot, Type **pt, int is_static) {
     if (init_char_array_from_string(pt, slot)) {
         return;
     }
+    if (type_is_vector(t)) {
+        sema_rvalue(slot);
+        convert_assign(slot, t, "initializing");
+        if (is_static && !is_constant_initializer(*slot)) {
+            diag_error(init->loc, "initializer element is not a compile-time constant");
+        }
+        return;
+    }
     if (t->kind == TY_ARRAY) {
         diag_error(init->loc, "array initializer must be an initializer list or string literal");
         sema_rvalue(slot);
@@ -3142,7 +3690,7 @@ static const char *find_attr(const char *text, const char *word) {
     return NULL;
 }
 
-/* alias("target") and weak in a list of attributes: Symbol.alias and Symbol.weak */
+/* alias("target") and weak in a list of attributes: Symbol.alias and Symbol.weak (once weak, a symbol stays so) */
 static void scan_alias_list(Symbol *sym, const ASTList *attrs, Loc loc) {
     size_t i;
     for (i = 0; attrs && i < attrs->len; i++) {
@@ -3188,6 +3736,29 @@ static void scan_alias_attrs(Symbol *sym, const ASTList *specs, AST *d, Loc loc)
     }
 }
 
+/* an asm label, `int f(void) __asm__("g")`: the symbol's assembler name (Symbol.asm_name) */
+static void scan_asm_label(Symbol *sym, AST *d) {
+    size_t i;
+    for (; d; d = d->kind == N_DECL_NAME ? NULL : d->u.declarator.inner) {
+        for (i = 0; d->u.declarator.attrs && i < d->u.declarator.attrs->len; i++) {
+            AST *a = d->u.declarator.attrs->items[i];
+            char *name;
+            if (a->kind != N_ATTRIBUTE || strncmp(a->u.text, "__attribute", 11) == 0 || (a->u.text[0] != 'a' && a->u.text[0] != '_')) {
+                continue;
+            }
+            name = sema_asm_text(a->u.text, a->loc);
+            if (!name) {
+                continue;
+            }
+            if (sym->asm_name && strcmp(sym->asm_name, name) != 0) {
+                diag_error(a->loc, "conflicting asm labels for '%s'", sym->name);
+            }
+            free(sym->asm_name);
+            sym->asm_name = name;
+        }
+    }
+}
+
 static void sema_declaration(AST *decl, int file_scope) {
     Specs sp;
     size_t i;
@@ -3218,13 +3789,31 @@ static void sema_declaration(AST *decl, int file_scope) {
         Symbol *sym = id->sym;
         AST *saved_top = array_param_top;
         Type *t;
+        Type *base;
         int is_static;
         StorageKind prev;   /* a redeclaration's linkage comes from the earlier one */
 
         if (sym && sym->kind == SYM_PARAM) {
             array_param_top = declarator_top(id->u.init_decl.declarator);    /* a K&R parameter's */
         }
-        t = sema_declarator(id->u.init_decl.declarator, sp.type, &name);
+        base = sp.type;
+        if (sp.auto_type) {
+            /* __auto_type: the initializer's type, as an rvalue's; it is analysed once, here */
+            if (!*init || (*init)->kind == N_INIT_LIST || id->u.init_decl.declarator->kind != N_DECL_NAME || sp.is_typedef) {
+                diag_error(id->loc, "'__auto_type' needs a plain name and an initializer that is an expression");
+            } else {
+                Type *it = sema_rvalue(init);
+                if (it->kind == TY_VOID) {
+                    diag_error(id->loc, "variable has incomplete type void");
+                } else {
+                    base = type_qualify(type_unqualified(it), sp.type->quals);
+                    if ((*init)->kind != N_IMPLICIT_CAST) {
+                        ast_implicit_cast(init, it);    /* marks it analysed */
+                    }
+                }
+            }
+        }
+        t = sema_declarator(id->u.init_decl.declarator, base, &name);
         t = apply_aligned(t, decl_aligned(id->u.init_decl.declarator, &sp), sp.is_typedef);
         array_param_top = saved_top;
 
@@ -3237,6 +3826,9 @@ static void sema_declaration(AST *decl, int file_scope) {
         sym->storage = sp.storage;
         if (file_scope && !sp.is_typedef) {
             scan_alias_attrs(sym, decl->u.decl.specs, id->u.init_decl.declarator, id->loc);
+        }
+        if (!sp.is_typedef && (file_scope || sp.storage == STORAGE_EXTERN || t->kind == TY_FUNC || sp.storage == STORAGE_STATIC)) {
+            scan_asm_label(sym, id->u.init_decl.declarator);
         }
         if (type_is_vm(t) && t->kind != TY_FUNC) {
             /* C99 6.7.5.2: variably modified types only for names with no linkage at block scope, VLAs only for automatic objects */
@@ -3538,7 +4130,33 @@ static void sema_stmt(AST *s) {
             sema_stmt(s->u.stmt.body);
             break;
 
+        case N_ASM_STMT:
+            sema_asm(s);
+            break;
+
+        case N_FUNCTION_DEF: {
+            /* a GNU nested function: checked as a function of its own, then this one goes on */
+            Type *saved_return = cur_return;
+            ASTList *saved_gotos = cur_gotos;
+            int saved_loops = loop_depth;
+            SwitchCtx *saved_switch = switch_ctx;
+            sema_function(s);
+            cur_return = saved_return;
+            cur_gotos = saved_gotos;
+            loop_depth = saved_loops;
+            switch_ctx = saved_switch;
+            break;
+        }
+
         case N_GOTO:
+            if (s->u.stmt.expr) {
+                /* GNU `goto *p` */
+                Type *t = sema_rvalue(&s->u.stmt.expr);
+                if (t->kind != TY_POINTER && !poisoned(s->u.stmt.expr)) {
+                    diag_error(s->loc, "'goto *' needs a pointer, not %s", ts(t));
+                }
+                break;
+            }
             cur_gotos = ast_list_push(cur_gotos, s);
             break;
 
@@ -3587,6 +4205,15 @@ static void sema_function(AST *fdef) {
     size_t i;
 
     sema_specs(fdef->u.func.specs, &sp, 1, fdef->loc);
+    if (sym) {
+        scan_alias_attrs(sym, fdef->u.func.specs, fdef->u.func.declarator, fdef->loc);
+        scan_asm_label(sym, fdef->u.func.declarator);
+        if (sym->alias) {
+            diag_error(fdef->loc, "a function definition cannot be an alias");
+            free(sym->alias);
+            sym->alias = NULL;
+        }
+    }
     if (sp.storage != STORAGE_NONE && sp.storage != STORAGE_STATIC && sp.storage != STORAGE_EXTERN) {
         diag_error(fdef->loc, "invalid storage class for a function definition");
         sp.storage = STORAGE_NONE;
@@ -3601,11 +4228,20 @@ static void sema_function(AST *fdef) {
          */
         sp.storage = STORAGE_STATIC;
     }
+    /* this function from here, its parameters' types included (a nested one's may use the enclosing ones' locals) */
+    if (fn_depth == (int)(sizeof(fn_stack) / sizeof(fn_stack[0]))) {
+        diag_error(fdef->loc, "functions nested too deeply");
+        return;
+    }
+    fn_stack[fn_depth] = sym;
+    fn_scope_stack[fn_depth] = fdef->u.func.scope;
+    fn_depth++;
     defining_fn = fn;
     t = sema_declarator(declarator, sp.type, &name);
     defining_fn = NULL;
     if (t->kind != TY_FUNC || !fn || fn->kind != N_DECL_FUNC) {
         diag_error(fdef->loc, "'%s' is not a function declarator", name ? name : "");
+        fn_depth--;
         return;
     }
     fdef->type = t;
@@ -3680,23 +4316,51 @@ static void sema_function(AST *fdef) {
         } else {
             sym->storage = sp.storage;
         }
+        {
+            /* an aligned attribute on an earlier declaration, or on this one, stays */
+            size_t al = decl_aligned(declarator, &sp);
+            if (sym->type && sym->type->align > al) {
+                al = sym->type->align;
+            }
+            t = apply_aligned(t, al, 0);
+        }
         sym->type = t;
         fdef->type = t;
     }
 
+    if (fn_depth > 1 && sym) {
+        /* a GNU nested function: no linkage, and its parent's frame for a static chain */
+        sym->parent_fn = fn_stack[fn_depth - 2];
+        sym->storage = STORAGE_STATIC;
+    }
     cur_return = t->base;
     cur_gotos = NULL;
     loop_depth = 0;
     switch_ctx = NULL;
     sema_stmt(fdef->u.func.body);
+    fn_depth--;
 
     /* labels may be used before they are defined, so gotos resolve last */
     if (cur_gotos) {
         for (i = 0; i < cur_gotos->len; i++) {
             AST *g = cur_gotos->items[i];
             Symbol *label = scope_lookup(fdef->u.func.scope, NS_LABEL, g->u.stmt.name);
+            int k;
+            for (k = fn_depth - 1; !label && k >= 0; k--) {
+                /* a label of an enclosing function (GNU nested functions): a jump out to its frame */
+                label = scope_lookup(fn_scope_stack[k], NS_LABEL, g->u.stmt.name);
+                if (label) {
+                    label->owner_fn = fn_stack[k];
+                    label->addr_taken = 1;
+                    if (fn_stack[k]) {
+                        fn_stack[k]->nonlocal_target = 1;
+                    }
+                }
+            }
             if (!label) {
                 diag_error(g->loc, "use of undeclared label '%s'", g->u.stmt.name);
+            } else if (g->kind == N_LABEL_ADDR) {
+                label->addr_taken = 1;
             }
             g->sym = label;
         }
@@ -3842,6 +4506,13 @@ static const struct BuiltinFn {
     { "__builtin_ctzl", "i(U)" },
     { "__builtin_ctzll", "i(q)" },
     { "__sync_synchronize", "v(v)" },
+    { "__builtin_setjmp", "i(p)" },
+    { "__builtin_va_arg_pack", "i(v)" },
+    { "__builtin_apply_args", "p(v)" },
+    { "__builtin_apply", "p(.)" },
+    { "__builtin_return", "v(p)" },
+    { "__builtin_va_arg_pack_len", "i(v)" },
+    { "__builtin_longjmp", "v(pi)" },
     /* the libc functions GCC knows as builtins (codegen calls the real ones) and prefetch, a no-op */
     { "__builtin_memchr", "p(Piz)" },
     { "__builtin_strncmp", "i(SSz)" },
@@ -3885,17 +4556,109 @@ static const struct BuiltinFn {
     { NULL, NULL }
 };
 
+static const AtomicBuiltin atomic_builtins[] = {
+    { "__atomic_load_n", AK_LOAD_N, "load", 0, 2, 0 },
+    { "__atomic_load", AK_LOAD, "load", 0, 3, 0 },
+    { "__atomic_store_n", AK_STORE_N, "store", 0, 3, 0 },
+    { "__atomic_store", AK_STORE, "store", 0, 3, 0 },
+    { "__atomic_exchange_n", AK_XCHG_N, "xchg", 0, 3, 0 },
+    { "__atomic_exchange", AK_XCHG, "xchg", 0, 4, 0 },
+    { "__atomic_compare_exchange_n", AK_CAS_N, "cas", 0, 6, 0 },
+    { "__atomic_compare_exchange", AK_CAS, "cas", 0, 6, 0 },
+    { "__atomic_fetch_add", AK_FETCH, "add", 0, 3, 0 },
+    { "__atomic_fetch_sub", AK_FETCH, "sub", 0, 3, 0 },
+    { "__atomic_fetch_and", AK_FETCH, "and", 0, 3, 0 },
+    { "__atomic_fetch_or", AK_FETCH, "or", 0, 3, 0 },
+    { "__atomic_fetch_xor", AK_FETCH, "xor", 0, 3, 0 },
+    { "__atomic_fetch_nand", AK_FETCH, "nand", 0, 3, 0 },
+    { "__atomic_add_fetch", AK_FETCH, "add", 1, 3, 0 },
+    { "__atomic_sub_fetch", AK_FETCH, "sub", 1, 3, 0 },
+    { "__atomic_and_fetch", AK_FETCH, "and", 1, 3, 0 },
+    { "__atomic_or_fetch", AK_FETCH, "or", 1, 3, 0 },
+    { "__atomic_xor_fetch", AK_FETCH, "xor", 1, 3, 0 },
+    { "__atomic_nand_fetch", AK_FETCH, "nand", 1, 3, 0 },
+    { "__atomic_test_and_set", AK_TAS, "xchg", 0, 2, 0 },
+    { "__atomic_clear", AK_CLEAR, "store", 0, 2, 0 },
+    { "__atomic_thread_fence", AK_FENCE, NULL, 0, 1, 0 },
+    { "__atomic_signal_fence", AK_FENCE, NULL, 0, 1, 0 },
+    { "__atomic_is_lock_free", AK_LOCK_FREE, NULL, 0, 2, 0 },
+    { "__atomic_always_lock_free", AK_LOCK_FREE, NULL, 0, 2, 0 },
+    { "__sync_fetch_and_add", AK_FETCH, "add", 0, 2, 0 },
+    { "__sync_fetch_and_sub", AK_FETCH, "sub", 0, 2, 0 },
+    { "__sync_fetch_and_and", AK_FETCH, "and", 0, 2, 0 },
+    { "__sync_fetch_and_or", AK_FETCH, "or", 0, 2, 0 },
+    { "__sync_fetch_and_xor", AK_FETCH, "xor", 0, 2, 0 },
+    { "__sync_fetch_and_nand", AK_FETCH, "nand", 0, 2, 0 },
+    { "__sync_add_and_fetch", AK_FETCH, "add", 1, 2, 0 },
+    { "__sync_sub_and_fetch", AK_FETCH, "sub", 1, 2, 0 },
+    { "__sync_and_and_fetch", AK_FETCH, "and", 1, 2, 0 },
+    { "__sync_or_and_fetch", AK_FETCH, "or", 1, 2, 0 },
+    { "__sync_xor_and_fetch", AK_FETCH, "xor", 1, 2, 0 },
+    { "__sync_nand_and_fetch", AK_FETCH, "nand", 1, 2, 0 },
+    { "__sync_bool_compare_and_swap", AK_SYNC_BOOL_CAS, "cas", 0, 3, 0 },
+    { "__sync_val_compare_and_swap", AK_SYNC_VAL_CAS, "cas", 0, 3, 0 },
+    { "__sync_lock_test_and_set", AK_XCHG_N, "xchg", 0, 2, 0 },
+    { "__sync_lock_release", AK_RELEASE, "store", 0, 1, 0 },
+    { "__c11_atomic_init", AK_INIT, NULL, 0, 2, 0 },
+    { "__c11_atomic_load", AK_LOAD_N, "load", 0, 2, 0 },
+    { "__c11_atomic_store", AK_STORE_N, "store", 0, 3, 0 },
+    { "__c11_atomic_exchange", AK_XCHG_N, "xchg", 0, 3, 0 },
+    { "__c11_atomic_compare_exchange_strong", AK_CAS_N, "cas", 0, 5, 0 },
+    { "__c11_atomic_compare_exchange_weak", AK_CAS_N, "cas", 0, 5, 0 },
+    { "__c11_atomic_fetch_add", AK_FETCH, "add", 0, 3, 1 },
+    { "__c11_atomic_fetch_sub", AK_FETCH, "sub", 0, 3, 1 },
+    { "__c11_atomic_fetch_and", AK_FETCH, "and", 0, 3, 0 },
+    { "__c11_atomic_fetch_or", AK_FETCH, "or", 0, 3, 0 },
+    { "__c11_atomic_fetch_xor", AK_FETCH, "xor", 0, 3, 0 },
+    { "__c11_atomic_fetch_nand", AK_FETCH, "nand", 0, 3, 0 },
+    { "__c11_atomic_thread_fence", AK_FENCE, NULL, 0, 1, 0 },
+    { "__c11_atomic_signal_fence", AK_FENCE, NULL, 0, 1, 0 },
+    { "__c11_atomic_is_lock_free", AK_LOCK_FREE, NULL, 0, 1, 0 },
+    { NULL, AK_FENCE, NULL, 0, 0, 0 }
+};
+
+const AtomicBuiltin *sema_atomic_builtin(const char *name) {
+    const AtomicBuiltin *b;
+    if (strncmp(name, "__atomic_", 9) != 0 && strncmp(name, "__sync_", 7) != 0 && strncmp(name, "__c11_atomic_", 13) != 0) {
+        return NULL;
+    }
+    for (b = atomic_builtins; b->name; b++) {
+        if (strcmp(b->name, name) == 0) {
+            return b;
+        }
+    }
+    return NULL;
+}
+
+/* an operand of an atomic builtin that points to an object of `size` bytes (any when 0); the pointee, NULL after an error */
+static Type *atomic_pointer(AST *e, AST *arg, const char *name, size_t size) {
+    Type *pt = arg->type;
+    size_t n;
+    if (pt->kind != TY_POINTER || pt->base->kind == TY_FUNC || pt->base->kind == TY_VOID || !type_is_complete(pt->base)) {
+        diag_error(arg->loc, "'%s' needs a pointer to a complete object, not %s", name, ts(pt));
+        return NULL;
+    }
+    n = type_size(pt->base);
+    if (size ? n != size : (n != 1 && n != 2 && n != 4 && n != 8)) {
+        diag_error(size ? arg->loc : e->loc, size ? "'%s': the objects are not all the same size"
+                   : "'%s' of a %lu byte object: only 1, 2, 4 and 8 byte objects are supported", name, (unsigned long)n);
+        return NULL;
+    }
+    return pt->base;
+}
+
 /*
- * `__atomic_load_n(p, order)` and `__atomic_store_n(p, v, order)` are
- * generic in the pointee type, so they are not in the table: the call
- * is checked here and the function symbol only exists to be called.
+ * The atomic builtins (sema_atomic_builtin) are generic in the pointee
+ * type, so they are not in the table: the call is checked here, and the
+ * function symbol only exists to be called.
  */
-static Type *sema_atomic(AST *e, int is_store) {
+static Type *sema_atomic(AST *e, const AtomicBuiltin *ab) {
     AST **f = &e->u.call.func;
     ASTList *args = e->u.call.args;
+    const char *name = ab->name;
     Symbol *sym;
-    Type *pt;
-    Type *pointee;
+    Type *obj = NULL;
+    Type *t = NULL;
     size_t i;
 
     sym = symtab_declare(cur_symtab, NS_ORDINARY, SYM_FUNCTION, (*f)->u.name, NULL, (*f)->loc);
@@ -3908,21 +4671,74 @@ static Type *sema_atomic(AST *e, int is_store) {
         sema_rvalue(&args->items[i]);
     }
     e->lvalue = 0;
-    if (args->len != (is_store ? 3u : 2u)) {
-        diag_error(e->loc, "'%s' takes %d arguments", sym->name, is_store ? 3 : 2);
+    e->type = type_basic(TY_VOID);
+    if (args->len < (size_t)ab->nargs || (args->len > (size_t)ab->nargs && strncmp(name, "__sync_", 7) != 0
+            && !(ab->kind == AK_LOCK_FREE && args->len == 2))) {
+        diag_error(e->loc, "'%s' takes %d arguments", name, ab->nargs);
         return error_type(e);
     }
-    pt = args->items[0]->type;
-    if (pt->kind != TY_POINTER || !type_is_scalar(pt->base)) {
-        diag_error(args->items[0]->loc, "'%s' needs a pointer to a scalar, not %s", sym->name, ts(pt));
+    if (ab->kind == AK_FENCE) {
+        return e->type;
+    }
+    if (ab->kind == AK_LOCK_FREE) {
+        if (!type_is_integer(args->items[0]->type)) {
+            diag_error(args->items[0]->loc, "'%s' needs the size of the object", name);
+        }
+        e->type = type_basic(TY_BOOL);
+        return e->type;
+    }
+    obj = atomic_pointer(e, args->items[0], name, 0);
+    if (!obj) {
         return error_type(e);
     }
-    pointee = type_unqualified(pt->base);
-    if (is_store) {
-        convert_assign(&args->items[1], pointee, "storing a value of type");
-        e->type = type_basic(TY_VOID);
-    } else {
-        e->type = pointee;
+    t = type_unqualified(obj);
+    switch (ab->kind) {
+        case AK_LOAD_N:
+            e->type = t;
+            break;
+        case AK_STORE_N:
+        case AK_INIT:
+        case AK_XCHG_N:
+            convert_assign(&args->items[1], t, "storing a value of type");
+            e->type = ab->kind == AK_XCHG_N ? t : type_basic(TY_VOID);
+            break;
+        case AK_FETCH:
+            if (!type_is_integer(t) && t->kind != TY_POINTER) {
+                diag_error(e->loc, "'%s' needs a pointer to an integer or a pointer, not %s", name, ts(args->items[0]->type));
+                return error_type(e);
+            }
+            convert_assign(&args->items[1], t->kind == TY_POINTER ? type_ptrdiff_t() : t, "passing a value of type");
+            e->type = t;
+            break;
+        case AK_SYNC_BOOL_CAS:
+        case AK_SYNC_VAL_CAS:
+            convert_assign(&args->items[1], t, "passing a value of type");
+            convert_assign(&args->items[2], t, "passing a value of type");
+            e->type = ab->kind == AK_SYNC_BOOL_CAS ? type_basic(TY_BOOL) : t;
+            break;
+        case AK_CAS_N:
+            if (!atomic_pointer(e, args->items[1], name, type_size(obj))) {
+                return error_type(e);
+            }
+            convert_assign(&args->items[2], t, "passing a value of type");
+            e->type = type_basic(TY_BOOL);
+            break;
+        case AK_CAS:
+        case AK_XCHG:
+        case AK_LOAD:
+        case AK_STORE:
+            for (i = 1; i < (ab->kind == AK_LOAD || ab->kind == AK_STORE ? 2u : 3u); i++) {
+                if (!atomic_pointer(e, args->items[i], name, type_size(obj))) {
+                    return error_type(e);
+                }
+            }
+            e->type = ab->kind == AK_CAS ? type_basic(TY_BOOL) : type_basic(TY_VOID);
+            break;
+        case AK_TAS:
+            e->type = type_basic(TY_BOOL);
+            break;
+        default:
+            break;
     }
     return e->type;
 }
@@ -3999,16 +4815,16 @@ int sema_const_eval_float(AST *expr, long double *value) {
 }
 
 char *sema_file_asm(const AST *item) {
-    const char *p = item->u.text;
+    return sema_asm_text(item->u.text, item->loc);
+}
+
+char *sema_asm_text(const char *p, Loc loc) {
     char *lits = xmalloc(strlen(p) + 1);
     size_t n = 0;
     char *text;
 
-    /* the keyword, then ( "..." "..." ): the literals are gathered space-separated, as decode_literal reads them */
-    while (*p == '_' || isalpha((unsigned char)*p)) {
-        p++;
-    }
-    while (isspace((unsigned char)*p)) {
+    /* the keyword and any qualifiers, then ( "..." "..." ): the literals are gathered space-separated, as decode_literal reads them */
+    while (*p && *p != '(') {
         p++;
     }
     if (*p++ != '(') {
@@ -4048,7 +4864,7 @@ char *sema_file_asm(const AST *item) {
     return text;
 bad:
     free(lits);
-    diag_error(item->loc, "a file-scope asm takes one string literal");
+    diag_error(loc, "a basic asm takes one string literal");
     return NULL;
 }
 

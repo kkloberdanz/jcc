@@ -447,7 +447,7 @@ static void homes(void) {
     }
     for (i = 0; i < RF->ninsts; i++) {
         const IRInst *ins = &RF->insts[i];
-        if (ins->op == IR_RET && !(ins->flags & IRF_RECORD) && ins->a >= 0 && !is_param[find(ins->a)]
+        if (ins->op == IR_RET && !(ins->flags & (IRF_RECORD | IRF_APPLY)) && ins->a >= 0 && !is_param[find(ins->a)]
                 && class_of((IRType)RF->vregs[ins->a].type) >= 0) {
             const RegClass *c = class_of((IRType)RF->vregs[ins->a].type) ? &T->floats : &T->ints;
             if (c->ret >= 0) {
@@ -686,6 +686,16 @@ void regalloc(IRFunc *f, const RegTarget *t) {
         RF->nsaved_ints = RF->nsaved_floats = 0;
     } else {
         scan();
+    }
+    if (RF->save_all) {
+        int r;
+        RF->nsaved_ints = RF->nsaved_floats = 0;
+        for (r = T->ints.ncaller; r < T->ints.n && RF->nsaved_ints < 32; r++) {
+            RF->saved_ints[RF->nsaved_ints++] = r;
+        }
+        for (r = T->floats.ncaller; r < T->floats.n && RF->nsaved_floats < 32; r++) {
+            RF->saved_floats[RF->nsaved_floats++] = r;
+        }
     }
     frame();
     RF = NULL;

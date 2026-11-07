@@ -14,6 +14,8 @@
  * object extends, a conversion to a narrow type is a sext or zext of the
  * low bits, and arithmetic happens at the width of the promoted type.
  */
+#include <ctype.h>
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +32,25 @@
 #include "util.h"
 
 static IRFunc *F = NULL;            /* the function being lowered */
+static Symbol *cur_fsym = NULL;     /* and its symbol */
+
+/* GNU __builtin_va_arg_pack: the function being inlined at its call, see inline_call */
+typedef struct InlineCtx {
+    int *pack_vals;
+    int *pack_by_addr;
+    Type **pack_types;
+    int npack;
+    Type *ret;
+    int result;         /* a value's register, or a record's slot address; -1 for void */
+    int end;            /* the block after the body */
+    struct InlineCtx *outer;
+} InlineCtx;
+
+static InlineCtx *inline_ctx = NULL;
+static const char *calls_prefix = "__builtin_va_arg_pack";     /* what calls_pack looks for */
+static int calls_named(const AST *n, const char *prefix);
+static void alloc_local(Symbol *s);
+static int nested_call_seen = 0;    /* it calls a GNU nested function, or defines one: the optimizer leaves it alone */
 static long frame_off = 0;          /* lowest frame slot allocated so far */
 static int break_block = -1;
 static int continue_block = -1;
@@ -65,12 +86,13 @@ static void unsupported(Loc loc, const char *what) {
 /* ------------------------------------------------------------------ */
 
 static int by_address(const Type *t) {
-    return type_is_record(t) || type_is_complex(t);
+    return type_is_record(t) || type_is_complex(t) || t->kind == TY_FLOAT128 || type_is_vector(t) || type_is_decimal(t);
 }
 
 /* types whose values live in registers: scalars but complex ones, and a va_list that is a plain pointer */
 static int is_value_type(const Type *t) {
-    return (type_is_scalar(t) && !type_is_complex(t)) || (t->kind == TY_VA_LIST && !arch_info->va_list_is_array);
+    return (type_is_scalar(t) && !type_is_complex(t) && t->kind != TY_FLOAT128 && !type_is_decimal(t))
+        || (t->kind == TY_VA_LIST && !arch_info->va_list_is_array);
 }
 
 /* the IR type a value of C type `t` has in a register; records, arrays and functions are addresses */
@@ -96,8 +118,8 @@ int lower_check_value_type(Loc loc, const Type *t) {
         unsupported(loc, "_Float16");
         return 0;
     }
-    if (t->kind == TY_FLOAT128) {
-        unsupported(loc, "_Float128");
+    if ((t->kind == TY_FLOAT128 || type_is_decimal(t)) && strcmp(arch_info->name, "x86_64") != 0) {
+        unsupported(loc, t->kind == TY_FLOAT128 ? "_Float128" : "a decimal floating type");     /* (Apple's arm64 has none) */
         return 0;
     }
     if (type_is_complex(t)) {
@@ -192,6 +214,26 @@ static void copy_bytes(int dst_addr, int src_addr, size_t size) {
     i->imm = (long)size;
 }
 
+static int size_of(Type *t);
+static int emit_call(const char *name, int target, int nargs, const int *args, Type **types, int *by_addr,
+                     size_t nfixed, int variadic, Type *ret, int sret_addr, int result_addr);
+
+/* a copy of an object of type t: of a size known at run time (a struct with a variable length member), through memcpy */
+static void copy_object(int dst_addr, int src_addr, Type *t) {
+    if (type_is_vla(t)) {
+        int args[3];
+        Type *types[3];
+        args[0] = dst_addr;
+        args[1] = src_addr;
+        args[2] = size_of(t);
+        types[0] = types[1] = type_pointer(type_basic(TY_VOID));
+        types[2] = type_size_t();
+        emit_call("memcpy", -1, 3, args, types, NULL, 3, 0, types[0], -1, -1);
+        return;
+    }
+    copy_bytes(dst_addr, src_addr, type_size(t));
+}
+
 static void zero_bytes(int addr_v, size_t size) {
     IRInst *i = ir_inst(F, ir_emit(F, IR_ZERO, IR_VOID, -1, addr_v, -1));
     i->imm = (long)size;
@@ -216,6 +258,9 @@ static void zero_bytes(int addr_v, size_t size) {
 
 /* sizeof(t), an i64 */
 static int size_of(Type *t) {
+    if (type_is_record(t) && t->record->vm) {
+        return ir_load(F, IR_I64, addr_local(t->record->size_slot), 8, 0);
+    }
     if (type_is_vla(t)) {
         return ir_load(F, IR_I64, addr_local(t->vla->slot), 8, 0);
     }
@@ -237,6 +282,7 @@ static void assign_temps(AST *e);
 static long alloc_slot(size_t size, size_t align);
 static int temp_addr(const AST *e);
 static int convert(int v, Type *from, Type *to);
+static int label_block(Symbol *s);
 
 /* a frame slot for the size of each VLA a declarator chain makes (the parameters of a function declarator in it are not its own) */
 static void vla_slots(AST *d) {
@@ -329,6 +375,153 @@ static void ldouble_encode(long double v, unsigned long *mant_out, unsigned *se_
 }
 
 /* the 16 bytes of an x87 long double, little endian, for static data */
+/*
+ * The IEEE binary128 encoding of `v` (_Float128), little endian: a sign,
+ * a 15 bit exponent biased by 16383 and 112 fraction bits. Every value
+ * of the host's long double (x87, or a double on Apple arm64) has one.
+ */
+void lower_f128_bytes(long double v, unsigned char out[16]) {
+    unsigned long hi = 0, lo = 0;
+    int i;
+    if (v != v) {
+        hi = 0x7fff800000000000ul;                          /* a quiet NaN */
+    } else {
+        int neg = signbit(v) != 0;
+        long double a = neg ? -v : v;
+        if (a == 0) {
+            hi = 0;
+        } else if (a > LDBL_MAX) {
+            hi = 0x7fff000000000000ul;                      /* infinity */
+        } else {
+            int e;
+            long double m = frexpl(a, &e);                  /* a = m * 2^e, m in [0.5, 1) */
+            long biased = (long)e - 1 + 16383;
+            long double f;
+            if (biased <= 0) {
+                /* subnormal: no implicit bit, the fraction scaled down */
+                f = ldexpl(m, (int)biased);
+                biased = 0;
+                f = ldexpl(f, 1);
+            } else {
+                f = 2 * m - 1;                              /* the fraction, below the implicit 1 */
+            }
+            f = ldexpl(f, 48);
+            hi = (unsigned long)f;
+            f = ldexpl(f - (long double)hi, 64);
+            lo = (unsigned long)f;
+            hi |= (unsigned long)biased << 48;
+        }
+        if (neg) {
+            hi |= 1ul << 63;
+        }
+    }
+    for (i = 0; i < 8; i++) {
+        out[i] = (unsigned char)(lo >> (8 * i));
+        out[8 + i] = (unsigned char)(hi >> (8 * i));
+    }
+}
+
+/*
+ * The BID encoding (IEEE 754 decimal, binary integer significand, as
+ * GCC's on x86_64) of the decimal floating constant `text` (digits, a
+ * point, an exponent; a suffix after is ignored) in the decimal type
+ * `kind`, little endian, size bytes: the significand rounded half to even
+ * to the type's 7, 16 or 34 digits.
+ */
+void lower_bid_bytes(const char *text, int neg, int kind, unsigned char out[16]) {
+    int maxd = kind == TY_DECIMAL32 ? 7 : kind == TY_DECIMAL64 ? 16 : 34;
+    int bias = kind == TY_DECIMAL32 ? 101 : kind == TY_DECIMAL64 ? 398 : 6176;
+    int emax = kind == TY_DECIMAL32 ? 191 : kind == TY_DECIMAL64 ? 767 : 12287;   /* biased exponent's largest */
+    unsigned int w[4] = { 0, 0, 0, 0 };     /* the significand, 32 bits a word, least significant first */
+    int ndig = 0, exp10 = 0, seen_point = 0, round_digit = -1, sticky = 0;
+    const char *p = text;
+    long e;
+    int k;
+    for (; *p && (isdigit((unsigned char)*p) || *p == '.'); p++) {
+        if (*p == '.') {
+            seen_point = 1;
+            continue;
+        }
+        if (ndig == 0 && *p == '0') {
+            if (seen_point) {
+                exp10--;
+            }
+            continue;
+        }
+        if (ndig < maxd) {
+            /* w = w * 10 + digit */
+            unsigned long long carry = (unsigned long long)(*p - '0');
+            for (k = 0; k < 4; k++) {
+                unsigned long long x = (unsigned long long)w[k] * 10 + carry;
+                w[k] = (unsigned int)x;
+                carry = x >> 32;
+            }
+            ndig++;
+            if (seen_point) {
+                exp10--;
+            }
+        } else {
+            /* past the type's digits: kept for the rounding */
+            if (round_digit < 0) {
+                round_digit = *p - '0';
+            } else if (*p != '0') {
+                sticky = 1;
+            }
+            if (!seen_point) {
+                exp10++;
+            }
+        }
+    }
+    if (*p == 'e' || *p == 'E') {
+        e = strtol(p + 1, NULL, 10);
+        exp10 += (int)e;
+    }
+    if (round_digit > 5 || (round_digit == 5 && (sticky || (w[0] & 1)))) {
+        for (k = 0; k < 4 && ++w[k] == 0; k++) {
+        }
+        /* 10^maxd after rounding up: one digit fewer, the exponent one more (w is then exactly 10^maxd) */
+    }
+    e = exp10 + bias;
+    if (e < 0) {
+        e = 0;
+    }
+    if (e > emax) {
+        e = emax;
+    }
+    memset(out, 0, 16);
+    if (kind == TY_DECIMAL128) {
+        unsigned long lo = (unsigned long)w[0] | (unsigned long)w[1] << 32;
+        unsigned long hi = (unsigned long)w[2] | (unsigned long)w[3] << 32;
+        hi |= (unsigned long)e << 49;
+        if (neg) {
+            hi |= 1ul << 63;
+        }
+        for (k = 0; k < 8; k++) {
+            out[k] = (unsigned char)(lo >> (8 * k));
+            out[8 + k] = (unsigned char)(hi >> (8 * k));
+        }
+    } else if (kind == TY_DECIMAL64) {
+        unsigned long c = (unsigned long)w[0] | (unsigned long)w[1] << 32;
+        unsigned long v = c < (1ul << 53) ? (unsigned long)e << 53 | c
+                                            : 3ul << 61 | (unsigned long)e << 51 | (c & ((1ul << 51) - 1));
+        if (neg) {
+            v |= 1ul << 63;
+        }
+        for (k = 0; k < 8; k++) {
+            out[k] = (unsigned char)(v >> (8 * k));
+        }
+    } else {
+        unsigned long c = w[0];
+        unsigned long v = c < (1ul << 23) ? (unsigned long)e << 23 | c : 3ul << 29 | (unsigned long)e << 21 | (c & ((1ul << 21) - 1));
+        if (neg) {
+            v |= 1ul << 31;
+        }
+        for (k = 0; k < 4; k++) {
+            out[k] = (unsigned char)(v >> (8 * k));
+        }
+    }
+}
+
 void lower_ldouble_bytes(long double v, unsigned char out[16]) {
     unsigned long mant;
     unsigned se;
@@ -363,8 +556,16 @@ static int float_const(long double v, const Type *t) {
 /* ------------------------------------------------------------------ */
 
 /* the value in `v` of scalar type `t`, as an i32 that is 0 or 1 */
+static int is_soft(const Type *t);
+static int soft_arith(OpKind op, Type *st, int a, int b);
+static int soft_zero(Type *st);
+
 static int truth(int v, const Type *t) {
-    IRType it = ty(t);
+    IRType it;
+    if (is_soft(t)) {
+        return soft_arith(OP_NE, (Type *)t, v, soft_zero((Type *)t));
+    }
+    it = ty(t);
     if (ir_type_is_float(it)) {
         int zero = float_const(0, t);
         int dst = ir_vreg(F, IR_I32);
@@ -488,10 +689,64 @@ static void mark_volatile(const Type *t) {
     }
 }
 
+static int atomic_call(const char *op, size_t size, int p, int v, int w);
+static int atomic_to_bits(int v, Type *t);
+static int atomic_from_bits(int v, Type *t);
+static Type *atomic_bits_type(size_t size);
+
+/* an _Atomic scalar that the atomic helpers can read and write: 1, 2, 4 or 8 bytes */
+static int atomic_object(const Type *t) {
+    size_t n;
+    if (!(t->quals & TQ_ATOMIC) || !is_value_type(t) || type_is_complex(t)) {
+        return 0;
+    }
+    n = type_size(t);
+    return n == 1 || n == 2 || n == 4 || n == 8;
+}
+
+/*
+ * Read-modify-write of an _Atomic object: the old value is read, the new
+ * one computed from it and stored with a compare and exchange, again from
+ * what was found there if another thread changed it in between. The right
+ * operand is evaluated once, before.
+ */
+typedef struct AtomicLoop {
+    int addr;
+    Type *t;
+    size_t size;
+    int cur;        /* the value the object is believed to hold */
+    int top;        /* the loop's block */
+} AtomicLoop;
+
+static void atomic_loop_begin(AtomicLoop *lp, int a, Type *t) {
+    lp->addr = a;
+    lp->t = t;
+    lp->size = type_size(t);
+    lp->cur = ir_vreg(F, ty(t));
+    ir_mov(F, lp->cur, atomic_from_bits(atomic_call("load", lp->size, a, -1, -1), t));
+    lp->top = ir_block(F);
+    ir_br(F, lp->top);
+    ir_place(F, lp->top);
+}
+
+/* `nw`, computed from lp->cur, is the value to store: loop until it is */
+static void atomic_loop_end(AtomicLoop *lp, int nw) {
+    int expected = atomic_to_bits(lp->cur, lp->t);
+    int got = atomic_call("cas", lp->size, lp->addr, expected, atomic_to_bits(nw, lp->t));
+    int ok = ir_icmp(F, IR_EQ, ty(atomic_bits_type(lp->size)), got, expected);
+    int done = ir_block(F);
+    ir_mov(F, lp->cur, atomic_from_bits(got, lp->t));
+    ir_condbr(F, ok, done, lp->top);
+    ir_place(F, done);
+}
+
 static int load_value(Loc loc, Type *t, int a) {
     int v;
     if (!is_value_type(t) || !lower_check_value_type(loc, t)) {
         return a;       /* a record or array: its address is the value */
+    }
+    if (atomic_object(t)) {
+        return atomic_from_bits(atomic_call("load", type_size(t), a, -1, -1), t);
     }
     v = ir_load(F, ty(t), a, type_size(t), type_is_integer(t) && !type_is_unsigned(t));
     mark_volatile(t);
@@ -499,13 +754,103 @@ static int load_value(Loc loc, Type *t, int a) {
 }
 
 static void store_value(Type *t, int a, int v) {
+    if (atomic_object(t)) {
+        atomic_call("store", type_size(t), a, atomic_to_bits(v, t), -1);
+        return;
+    }
     ir_store(F, ty(t), a, v, type_size(t));
     mark_volatile(t);
 }
 
 /* `t` is the lvalue's type, which carries the qualifiers of the record it is a member of */
+/* the `size` bytes at a in reverse order (scalar_storage_order), as an integer of IR type it, zero extended */
+static int load_swapped_word(int a, size_t size, IRType it) {
+    int v = ir_load(F, it, a, size, 0);
+    IRInst *i;
+    int dst;
+    if (size == 1) {
+        return v;
+    }
+    dst = ir_vreg(F, it);
+    i = ir_inst(F, ir_emit(F, IR_BSWAP, it, dst, v, -1));
+    i->size = (unsigned char)size;
+    return dst;
+}
+
+static void store_swapped_word(int a, size_t size, IRType it, int v) {
+    if (size > 1) {
+        int dst = ir_vreg(F, it);
+        IRInst *i = ir_inst(F, ir_emit(F, IR_BSWAP, it, dst, v, -1));
+        i->size = (unsigned char)size;
+        v = dst;
+    }
+    ir_store(F, it, a, v, size);
+}
+
+/* a bit-field of a reversed struct: its unit byte swapped, the field counted from the unit's top */
+static int bits_swapped(Member *m, int a, int v, int store) {
+    IRType ut = m->unit > 4 ? IR_I64 : IR_I32;
+    int w = (int)(m->unit * 8);
+    int sh = w - (int)m->bit_offset - m->bits;
+    unsigned long mask = m->bits >= 64 ? ~0ul : (1ul << m->bits) - 1;
+    int u = load_swapped_word(a, m->unit, ut);
+    IRType ft = ty(m->type);
+    int field;
+    if (store) {
+        int nv = ft == ut ? v : ut == IR_I64 ? extend(IR_ZEXT, IR_I64, v, 4) : trunc_to(IR_I32, v);
+        nv = ir_binop_imm(F, IR_SHL, ut, ir_binop(F, IR_AND, ut, nv, iconst(ut, (long)mask)), sh);
+        u = ir_binop(F, IR_OR, ut, ir_binop(F, IR_AND, ut, u, iconst(ut, (long)~(mask << sh))), nv);
+        store_swapped_word(a, m->unit, ut, u);
+    }
+    field = ir_binop(F, IR_AND, ut, ir_binop_imm(F, IR_LSHR, ut, u, sh), iconst(ut, (long)mask));
+    if (!type_is_unsigned(m->type) && m->bits < w) {
+        int up = (ut == IR_I64 ? 64 : 32) - m->bits;
+        field = ir_binop_imm(F, IR_ASHR, ut, ir_binop_imm(F, IR_SHL, ut, field, up), up);
+    }
+    if (ft != ut) {
+        field = ft == IR_I64 ? (type_is_unsigned(m->type) ? extend(IR_ZEXT, IR_I64, field, 4) : extend(IR_SEXT, IR_I64, field, 4))
+                             : trunc_to(IR_I32, field);
+    }
+    return field;
+}
+
+/* a scalar member of a reversed struct */
+static int load_reversed(Type *t, int a) {
+    size_t n = type_size(t);
+    IRType it = n > 4 ? IR_I64 : IR_I32;
+    int v = load_swapped_word(a, n, it);
+    if (type_is_floating(t)) {
+        int dst = ir_vreg(F, ty(t));
+        IRInst *i = ir_inst(F, ir_emit(F, IR_BITCAST, ty(t), dst, v, -1));
+        i->t2 = (unsigned char)it;
+        return dst;
+    }
+    if (n < 4 && !type_is_unsigned(t)) {
+        v = extend(IR_SEXT, IR_I32, v, n);
+    }
+    return v;
+}
+
+static void store_reversed(Type *t, int a, int v) {
+    size_t n = type_size(t);
+    IRType it = n > 4 ? IR_I64 : IR_I32;
+    if (type_is_floating(t)) {
+        int dst = ir_vreg(F, it);
+        IRInst *i = ir_inst(F, ir_emit(F, IR_BITCAST, it, dst, v, -1));
+        i->t2 = (unsigned char)ty(t);
+        v = dst;
+    }
+    store_swapped_word(a, n, it, v);
+}
+
+int lower_init_reverse = 0;    /* the initializer walker is in a member of a reversed struct (src/codegen.c) */
+
 static int load_bits(Member *m, const Type *t, int a) {
-    int dst = ir_vreg(F, ty(m->type));
+    int dst;
+    if (m->reverse) {
+        return bits_swapped(m, a, -1, 0);
+    }
+    dst = ir_vreg(F, ty(m->type));
     IRInst *i = ir_inst(F, ir_emit(F, IR_LOADBITS, ty(m->type), dst, a, -1));
     i->size = (unsigned char)m->unit;
     i->imm = (long)m->bit_offset | ((long)m->bits << 8);
@@ -518,7 +863,11 @@ static int load_bits(Member *m, const Type *t, int a) {
 
 /* store `v` into the bit-field; returns the field's value as stored, extended */
 static int store_bits(Member *m, const Type *t, int a, int v) {
-    int dst = ir_vreg(F, ty(m->type));
+    int dst;
+    if (m->reverse) {
+        return bits_swapped(m, a, v, 1);
+    }
+    dst = ir_vreg(F, ty(m->type));
     IRInst *i = ir_inst(F, ir_emit(F, IR_STOREBITS, ty(m->type), dst, a, v));
     i->size = (unsigned char)m->unit;
     i->imm = (long)m->bit_offset | ((long)m->bits << 8);
@@ -527,6 +876,26 @@ static int store_bits(Member *m, const Type *t, int a, int v) {
     }
     mark_volatile(t);
     return dst;
+}
+
+/*
+ * GNU nested functions. A nested function's static chain is its parent's
+ * frame pointer, which it keeps in a slot of its own (chain_off); the
+ * frame of a function further out is reached through each one's slot in
+ * turn. A local of an enclosing function is at its frame offset there.
+ */
+static int frame_of(Symbol *fn) {
+    Symbol *f = cur_fsym;
+    int fp = addr_local(0);
+    while (f && f != fn) {
+        if (!f->parent_fn) {
+            fatal("internal error: a nested function's frame not found");
+            return fp;
+        }
+        fp = ir_load(F, IR_I64, f == cur_fsym ? addr_local(f->chain_off) : ir_binop_imm(F, IR_ADD, IR_I64, fp, f->chain_off), 8, 0);
+        f = f->parent_fn;
+    }
+    return fp;
 }
 
 /* an lvalue's address, or -1 for a local that lives in a register */
@@ -538,12 +907,27 @@ static int lvalue_addr(AST *l) {
 }
 
 /* the value of the lvalue `l`, whose address is `a` (-1: a register local) */
+/* is l (a member, or an element of an array member) in the reversed byte order of scalar_storage_order? */
+static int reversed_lvalue(const AST *l) {
+    while (l->kind == N_INDEX && l->u.index.array->kind == N_IMPLICIT_CAST
+           && l->u.index.array->u.cast.expr->type->kind == TY_ARRAY) {
+        l = l->u.index.array->u.cast.expr;
+    }
+    while (l->kind == N_INDEX && l->u.index.array->type->kind == TY_ARRAY) {
+        l = l->u.index.array;
+    }
+    return l->kind == N_MEMBER && l->u.member.member && l->u.member.member->reverse && type_size(l->type) > 1;
+}
+
 static int lvalue_load(AST *l, int a) {
     if (a < 0) {
         return local_vreg(l->sym);
     }
     if (sema_is_bitfield(l)) {
         return load_bits(l->u.member.member, l->type, a);
+    }
+    if (reversed_lvalue(l) && is_value_type(l->type)) {
+        return load_reversed(type_unqualified(l->type), a);
     }
     return load_value(l->loc, l->type, a);
 }
@@ -556,6 +940,10 @@ static int lvalue_store(AST *l, int a, int v) {
     }
     if (sema_is_bitfield(l)) {
         return store_bits(l->u.member.member, l->type, a, v);
+    }
+    if (reversed_lvalue(l) && is_value_type(l->type)) {
+        store_reversed(type_unqualified(l->type), a, v);
+        return v;
     }
     store_value(l->type, a, v);
     return v;
@@ -582,7 +970,7 @@ static int index_addr(AST *e) {
     long v;
     int p;
 
-    if (!type_is_pointer(a->type)) {
+    if (!type_is_pointer(a->type) && !type_is_vector(a->type)) {
         AST *t = a;
         a = i;
         i = t;
@@ -650,11 +1038,23 @@ static int addr(AST *e) {
                     diag_error(e->loc, "internal error: the address of a register local");
                     return iconst(IR_I64, 0);
                 }
-                a = addr_local(s->offset);
+                if (s->captured && s->owner_fn && s->owner_fn != cur_fsym) {
+                    a = ir_binop_imm(F, IR_ADD, IR_I64, frame_of(s->owner_fn), s->offset);
+                } else {
+                    a = addr_local(s->offset);
+                }
                 if (s->by_ref) {
                     a = ir_load(F, IR_I64, a, 8, 0);
                 }
                 return a;
+            }
+            if (s->kind == SYM_FUNCTION && s->parent_fn) {
+                /* a nested function's address: its trampoline's, in its parent's frame */
+                if (!s->tramp_off) {
+                    diag_error(e->loc, "the address of the nested function '%s' cannot be taken on this target", s->name);
+                    return iconst(IR_I64, 0);
+                }
+                return ir_binop_imm(F, IR_ADD, IR_I64, frame_of(s->parent_fn), s->tramp_off);
             }
             return addr_global(s);
         }
@@ -678,7 +1078,10 @@ static int addr(AST *e) {
         case N_MEMBER: {
             /* a struct valued expression evaluates to its address either way */
             int a = expr(e->u.member.object);
-            if (e->u.member.member && e->u.member.member->offset) {
+            if (e->u.member.member && e->u.member.member->rt_slot) {
+                /* after a variable length member: an offset of the run time layout */
+                a = ir_binop(F, IR_ADD, IR_I64, a, ir_load(F, IR_I64, addr_local(e->u.member.member->rt_slot), 8, 0));
+            } else if (e->u.member.member && e->u.member.member->offset) {
                 a = ir_binop_imm(F, IR_ADD, IR_I64, a, (long)e->u.member.member->offset);
             }
             return a;
@@ -777,7 +1180,9 @@ static void branch(AST *e, int bt, int bf) {
             e = e->u.cast.expr;     /* the truth test is the same */
         } else if (e->kind == N_CALL && e->u.call.args->len == 2 && direct_callee(e->u.call.func)
                 && strcmp(direct_callee(e->u.call.func)->name, "__builtin_expect") == 0) {
-            e = e->u.call.args->items[0];   /* the expected value is advice this compiler does not take */
+            /* the expected value is advice this compiler does not take, though it is still evaluated */
+            expr(e->u.call.args->items[1]);
+            e = e->u.call.args->items[0];
         } else {
             break;
         }
@@ -892,6 +1297,326 @@ static int complex_binary(AST *e);
 static int complex_compound(AST *e);
 static int complex_const(AST *e);
 
+static int emit_call(const char *name, int target, int nargs, const int *args, Type **types, int *by_addr,
+                     size_t nfixed, int variadic, Type *ret, int sret_addr, int result_addr);
+
+static Loc no_loc_vec(void) {
+    Loc l;
+    memset(&l, 0, sizeof(l));
+    return l;
+}
+
+/* ------------------------------------------------------------------ */
+/* _Float128 and the decimal types (x86_64): values in memory, the      */
+/* arithmetic the compiler runtime's                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A value of one of these is the address of its bytes (as a record's
+ * is): each result goes to a fresh frame slot, and every operation is a
+ * call to libgcc: its IEEE binary128 routines (__addtf3, ...) or its
+ * BID decimal ones (__bid_adddd3, ...), whose names follow one pattern.
+ */
+static int is_soft(const Type *t) {
+    return t->kind == TY_FLOAT128 || type_is_decimal(t);
+}
+
+/* the mode letters of the routines' names: tf, sd, dd, td */
+static const char *soft_mode(const Type *t) {
+    switch (t->kind) {
+        case TY_DECIMAL32: return "sd";
+        case TY_DECIMAL64: return "dd";
+        case TY_DECIMAL128: return "td";
+        default: return "tf";
+    }
+}
+
+static const char *soft_prefix(const Type *t) {
+    return type_is_decimal(t) ? "__bid_" : "__";
+}
+
+static int soft_temp(const Type *t) {
+    return addr_local(alloc_slot(type_size(t), type_size(t) > 8 ? 16 : 8));
+}
+
+/* name(args), a result of the soft type st in a new slot: its address */
+static int soft_call_to(const char *name, int n, int *vals, Type **types, Type *st) {
+    int by_addr[2];
+    int k;
+    int res = soft_temp(st);
+    for (k = 0; k < n; k++) {
+        by_addr[k] = is_soft(types[k]);
+    }
+    emit_call(ir_name(F, name), -1, n, vals, types, by_addr, (size_t)n, 0, st, -1, res);
+    return res;
+}
+
+/* name(args) with a scalar result of type ret */
+static int soft_call_from(const char *name, int n, int *vals, Type **types, Type *ret) {
+    int by_addr[2];
+    int k;
+    for (k = 0; k < n; k++) {
+        by_addr[k] = is_soft(types[k]);
+    }
+    return emit_call(ir_name(F, name), -1, n, vals, types, by_addr, (size_t)n, 0, ret, -1, -1);
+}
+
+/* the routine converting between a binary float of kind `bin` and the decimal type d (to_dec: into d) */
+static const char *dec_float_name(const Type *d, TypeKind bin, int to_dec) {
+    static const char *const names[3][3][2] = {
+        /* sf, df, xf; each [to decimal, from decimal] */
+        { { "__bid_extendsfsd", "__bid_truncsdsf" }, { "__bid_truncdfsd", "__bid_extendsddf" }, { "__bid_truncxfsd", "__bid_extendsdxf" } },
+        { { "__bid_extendsfdd", "__bid_truncddsf" }, { "__bid_extenddfdd", "__bid_truncdddf" }, { "__bid_truncxfdd", "__bid_extendddxf" } },
+        { { "__bid_extendsftd", "__bid_trunctdsf" }, { "__bid_extenddftd", "__bid_trunctddf" }, { "__bid_extendxftd", "__bid_trunctdxf" } }
+    };
+    int di = d->kind == TY_DECIMAL32 ? 0 : d->kind == TY_DECIMAL64 ? 1 : 2;
+    int bi = bin == TY_FLOAT ? 0 : bin == TY_DOUBLE ? 1 : 2;
+    return names[di][bi][to_dec ? 0 : 1];
+}
+
+/* the scalar (or other soft value) v of type `from` as a value of the soft type st */
+static int soft_from(int v, Type *from, Type *st) {
+    char name[48];
+    Type *t = from;
+    const char *m = soft_mode(st);
+    const char *pre = soft_prefix(st);
+    if (from->kind == st->kind) {
+        return v;
+    }
+    if (is_soft(from)) {
+        if (from->kind == TY_FLOAT128 || st->kind == TY_FLOAT128) {
+            diag_error(no_loc_vec(), "conversion between _Float128 and a decimal type is not supported");
+            return soft_temp(st);
+        }
+        /* between decimal types */
+        snprintf(name, sizeof(name), "__bid_%s%s%s2", from->kind < st->kind ? "extend" : "trunc", soft_mode(from), m);
+        return soft_call_to(name, 1, &v, &t, st);
+    }
+    if (type_is_floating(from)) {
+        TypeKind bin = from->kind == TY_FLOAT ? TY_FLOAT
+                       : from->kind == TY_DOUBLE || type_size(from) == 8 ? TY_DOUBLE : TY_LDOUBLE;
+        if (bin == TY_DOUBLE && from->kind != TY_DOUBLE) {
+            t = type_basic(TY_DOUBLE);
+            v = convert(v, from, t);
+        }
+        if (st->kind == TY_FLOAT128) {
+            snprintf(name, sizeof(name), "__extend%stf2", bin == TY_FLOAT ? "sf" : bin == TY_DOUBLE ? "df" : "xf");
+        } else {
+            snprintf(name, sizeof(name), "%s", dec_float_name(st, bin, 1));
+        }
+        return soft_call_to(name, 1, &v, &t, st);
+    }
+    /* integers: an int's or unsigned int's (every narrower one's value is one), a 64 bit or a 128 bit one's */
+    {
+        int u = type_is_unsigned(from) || from->kind == TY_POINTER;
+        const char *im;
+        if (type_is_wide(from)) {
+            im = "ti";
+        } else if (type_size(from) == 8 || from->kind == TY_POINTER) {
+            im = "di";
+            t = type_basic(u ? TY_ULONG : TY_LONG);
+            v = convert(v, from, t);
+        } else {
+            u = from->kind == TY_UINT;
+            im = "si";
+            t = type_basic(u ? TY_UINT : TY_INT);
+            v = convert(v, from, t);
+        }
+        snprintf(name, sizeof(name), "%sfloat%s%s%s", pre, u ? (st->kind == TY_FLOAT128 ? "un" : "uns") : "", im, m);
+        return soft_call_to(name, 1, &v, &t, st);
+    }
+}
+
+/* the soft value at a, of type st, as a value of type `to` */
+static int soft_to(int a, Type *st, Type *to) {
+    char name[48];
+    Type *t;
+    const char *m = soft_mode(st);
+    const char *pre = soft_prefix(st);
+    if (to->kind == st->kind) {
+        return a;
+    }
+    if (is_soft(to)) {
+        return soft_from(a, st, to);
+    }
+    if (to->kind == TY_BOOL) {
+        return truth(a, st);
+    }
+    if (type_is_floating(to)) {
+        TypeKind bin = to->kind == TY_FLOAT ? TY_FLOAT : to->kind == TY_DOUBLE || type_size(to) == 8 ? TY_DOUBLE : TY_LDOUBLE;
+        Type *rt = type_basic(bin);
+        if (st->kind == TY_FLOAT128) {
+            snprintf(name, sizeof(name), "__trunctf%s2", bin == TY_FLOAT ? "sf" : bin == TY_DOUBLE ? "df" : "xf");
+        } else {
+            snprintf(name, sizeof(name), "%s", dec_float_name(st, bin, 0));
+        }
+        return convert(soft_call_from(name, 1, &a, &st, rt), rt, to);
+    }
+    {
+        int u = type_is_unsigned(to) || to->kind == TY_POINTER;
+        const char *im;
+        if (type_is_wide(to)) {
+            im = "ti";
+            t = to;
+        } else if (type_size(to) == 8 || to->kind == TY_POINTER) {
+            im = "di";
+            t = type_basic(u ? TY_ULONG : TY_LONG);
+        } else {
+            im = "si";
+            t = type_basic(u ? TY_UINT : TY_INT);
+        }
+        snprintf(name, sizeof(name), st->kind == TY_FLOAT128 ? "%sfix%s%s%s" : "%sfix%s%s%s", pre, u ? "uns" : "",
+                 st->kind == TY_FLOAT128 ? m : m, im);
+        return convert(soft_call_from(name, 1, &a, &st, t), t, to);
+    }
+}
+
+/* a op b, both of the soft type st: the result's address, or for a comparison the int */
+static int soft_arith(OpKind op, Type *st, int a, int b) {
+    char name[48];
+    int vals[2];
+    Type *types[2];
+    const char *m = soft_mode(st);
+    const char *pre = soft_prefix(st);
+    const char *what;
+    IRCond cc;
+    int r;
+    vals[0] = a;
+    vals[1] = b;
+    types[0] = types[1] = st;
+    switch (op) {
+        case OP_ADD: case OP_ADD_ASSIGN: what = "add"; break;
+        case OP_SUB: case OP_SUB_ASSIGN: what = "sub"; break;
+        case OP_MUL: case OP_MUL_ASSIGN: what = "mul"; break;
+        case OP_DIV: case OP_DIV_ASSIGN: what = "div"; break;
+        case OP_EQ: what = "eq"; cc = IR_EQ; break;
+        case OP_NE: what = "ne"; cc = IR_NE; break;
+        case OP_LT: what = "lt"; cc = IR_LT; break;
+        case OP_LE: what = "le"; cc = IR_LE; break;
+        case OP_GT: what = "gt"; cc = IR_GT; break;
+        case OP_GE: what = "ge"; cc = IR_GE; break;
+        default:
+            fatal("internal error: an operator %s does not have", type_kind_name(st->kind));
+            return iconst(IR_I32, 0);
+    }
+    if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV || op == OP_ADD_ASSIGN || op == OP_SUB_ASSIGN
+            || op == OP_MUL_ASSIGN || op == OP_DIV_ASSIGN) {
+        snprintf(name, sizeof(name), "%s%s%s3", pre, what, m);
+        return soft_call_to(name, 2, vals, types, st);
+    }
+    /* each returns an int that compares with 0 as the operands do (a NaN makes it false) */
+    snprintf(name, sizeof(name), "%s%s%s2", pre, what, m);
+    r = soft_call_from(name, 2, vals, types, type_basic(TY_INT));
+    return ir_icmp_imm(F, cc, IR_I32, r, 0);
+}
+
+/* the value at a negated: the sign bit (its top one, in every one of these encodings) flipped in a copy */
+static int soft_neg(int a, Type *st) {
+    size_t n = type_size(st);
+    int res = soft_temp(st);
+    int hi;
+    IRType it = n == 4 ? IR_I32 : IR_I64;
+    copy_bytes(res, a, n);
+    hi = n == 16 ? ir_binop_imm(F, IR_ADD, IR_I64, res, 8) : res;
+    ir_store(F, it, hi, ir_binop(F, IR_XOR, it, ir_load(F, it, hi, it == IR_I32 ? 4 : 8, 0),
+                                 iconst(it, it == IR_I32 ? (long)0x80000000ul : (long)(1ul << 63))), it == IR_I32 ? 4 : 8);
+    return res;
+}
+
+static int soft_zero(Type *st) {
+    int z = soft_temp(st);
+    zero_bytes(z, type_size(st));
+    return z;
+}
+
+/* ------------------------------------------------------------------ */
+/* GNU vectors: values in memory, the operations element by element    */
+/* ------------------------------------------------------------------ */
+
+static int vec_temp(const Type *v) {
+    return addr_local(alloc_slot(type_size(v), type_align(v) > 16 ? 16 : type_align(v)));
+}
+
+/* element k of the operand: of a vector at address a, or the scalar a itself (the same for every element) */
+static int vec_elem(int a, Type *t, long k) {
+    Type *et;
+    if (!type_is_vector(t)) {
+        return a;
+    }
+    et = t->base;
+    return load_value(no_loc_vec(), et, k ? ir_binop_imm(F, IR_ADD, IR_I64, a, k * (long)type_size(et)) : a);
+}
+
+/* l op r for vectors (or a vector and a scalar) into a new slot of type vt: its address */
+static int vec_arith(OpKind op, Type *vt, int la, Type *lt, int ra, Type *rt) {
+    Type *ot = type_is_vector(lt) ? lt->base : rt->base;   /* the operands' element type */
+    Type *et = vt->base;
+    Type *pt = type_promote(ot);
+    int res = vec_temp(vt);
+    long k;
+    OpKind base = op;
+    switch (op) {
+        case OP_ADD_ASSIGN: base = OP_ADD; break;
+        case OP_SUB_ASSIGN: base = OP_SUB; break;
+        case OP_MUL_ASSIGN: base = OP_MUL; break;
+        case OP_DIV_ASSIGN: base = OP_DIV; break;
+        case OP_MOD_ASSIGN: base = OP_MOD; break;
+        case OP_AND_ASSIGN: base = OP_BITAND; break;
+        case OP_OR_ASSIGN: base = OP_BITOR; break;
+        case OP_XOR_ASSIGN: base = OP_BITXOR; break;
+        case OP_SHL_ASSIGN: base = OP_SHL; break;
+        case OP_SHR_ASSIGN: base = OP_SHR; break;
+        default: break;
+    }
+    for (k = 0; k < vt->length; k++) {
+        Type *lte = type_is_vector(lt) ? lt->base : lt;
+        Type *rte = type_is_vector(rt) ? rt->base : rt;
+        int lv = convert(vec_elem(la, lt, k), lte, pt);
+        int rv = convert(vec_elem(ra, rt, k), rte, (base == OP_SHL || base == OP_SHR) ? pt : pt);
+        int v = arith(base, pt, lv, rv);
+        if (is_comparison(base)) {
+            v = convert(ir_unop(F, IR_NEG, IR_I32, v), type_basic(TY_INT), et);     /* true is all ones */
+        } else {
+            v = convert(canon(v, pt), pt, et);
+        }
+        store_value(et, k ? ir_binop_imm(F, IR_ADD, IR_I64, res, k * (long)type_size(et)) : res, v);
+    }
+    return res;
+}
+
+static int vec_unary(OpKind op, Type *vt, int a) {
+    Type *et = vt->base;
+    Type *pt = type_promote(et);
+    int res = vec_temp(vt);
+    long k;
+    for (k = 0; k < vt->length; k++) {
+        int v = convert(vec_elem(a, vt, k), et, pt);
+        if (op == OP_NEG) {
+            v = type_is_floating(pt) ? ir_unop(F, IR_FNEG, ty(pt), v) : ir_unop(F, IR_NEG, ty(pt), v);
+        } else if (op == OP_BITNOT) {
+            v = ir_unop(F, IR_NOT, ty(pt), v);
+        }
+        store_value(et, k ? ir_binop_imm(F, IR_ADD, IR_I64, res, k * (long)type_size(et)) : res, convert(canon(v, pt), pt, et));
+    }
+    return res;
+}
+
+/* a cast to or from a vector: the bits as they are, between it and another vector or an integer of its size */
+static int vec_cast(int v, Type *from, Type *to) {
+    int res;
+    if (type_is_vector(from) && type_is_vector(to)) {
+        res = vec_temp(to);
+        copy_bytes(res, v, type_size(to));
+        return res;
+    }
+    if (type_is_vector(from)) {
+        return load_value(no_loc_vec(), type_unqualified(to), v);
+    }
+    res = vec_temp(to);
+    store_value(type_unqualified(from), res, v);
+    return res;
+}
+
 static int cast(AST *e) {
     Type *to = e->type;
     AST *x = e->u.cast.expr;
@@ -905,11 +1630,26 @@ static int cast(AST *e) {
         expr(x);
         return -1;
     }
+    if (type_is_vector(to) || type_is_vector(from)) {
+        return vec_cast(expr(x), from, to);
+    }
     if (from->kind == TY_ARRAY || from->kind == TY_FUNC || (from->kind == TY_VA_LIST && to->kind == TY_POINTER)) {
         return addr(x);
     }
+    if (type_is_record(to) && type_is_record(from)) {
+        return expr(x);     /* the wrapper __auto_type puts on its initializer: the same record */
+    }
     if (type_is_complex(to) || type_is_complex(from)) {
         return complex_cast(e);
+    }
+    if (type_is_vector(to) || type_is_vector(from)) {
+        return vec_cast(expr(x), from, to);
+    }
+    if (is_soft(to) || is_soft(from)) {
+        if (!lower_check_value_type(e->loc, to) || !lower_check_value_type(x->loc, from)) {
+            return iconst(IR_I64, 0);
+        }
+        return is_soft(to) ? soft_from(expr(x), from, to) : soft_to(expr(x), from, to);
     }
     if (!lower_check_value_type(e->loc, to) || !lower_check_value_type(x->loc, from)) {
         return iconst(ty(to), 0);
@@ -917,23 +1657,9 @@ static int cast(AST *e) {
     return convert(expr(x), from, to);
 }
 
-/* ++ and --: the object is updated in place, `post` leaves the old value */
-static int incdec(AST *e, int sign, int post) {
-    AST *o = e->u.unary.operand;
-    Type *t = o->type;
-    long delta = 1;
-    int a;
-    int old;
+/* old + 1 or - 1, in the object's type (delta: a pointer's element size) */
+static int incdec_value(Type *t, int old, int sign, long delta) {
     int nw;
-
-    if (!lower_check_value_type(e->loc, t)) {
-        return iconst(IR_I32, 0);
-    }
-    if (t->kind == TY_POINTER) {
-        delta = (long)type_size(t->base);
-    }
-    a = lvalue_addr(o);
-    old = lvalue_load(o, a);
     if (t->kind == TY_POINTER && type_is_vla(t->base)) {
         nw = ir_binop(F, sign > 0 ? IR_ADD : IR_SUB, IR_I64, old, size_of(t->base));
     } else if (type_is_floating(t)) {
@@ -951,6 +1677,48 @@ static int incdec(AST *e, int sign, int post) {
         }
         nw = canon(nw, t);
     }
+    return nw;
+}
+
+/* ++ and --: the object is updated in place, `post` leaves the old value */
+static int incdec(AST *e, int sign, int post) {
+    AST *o = e->u.unary.operand;
+    Type *t = o->type;
+    long delta = 1;
+    int a;
+    int old;
+    int nw;
+
+    if (!lower_check_value_type(e->loc, t)) {
+        return iconst(IR_I32, 0);
+    }
+    if (t->kind == TY_POINTER) {
+        delta = (long)type_size(t->base);
+    }
+    if (is_soft(t)) {
+        Type *st = type_unqualified(t);
+        int one = soft_from(iconst(IR_I32, 1), type_basic(TY_INT), st);
+        int res, oldc = -1;
+        a = lvalue_addr(o);
+        if (post) {
+            oldc = soft_temp(st);
+            copy_bytes(oldc, a, type_size(st));
+        }
+        res = soft_arith(sign > 0 ? OP_ADD : OP_SUB, st, a, one);
+        copy_bytes(a, res, type_size(st));
+        return post ? oldc : a;
+    }
+    a = lvalue_addr(o);
+    if (a >= 0 && atomic_object(t) && !sema_is_bitfield(o)) {
+        AtomicLoop lp;
+        atomic_loop_begin(&lp, a, t);
+        nw = incdec_value(t, lp.cur, sign, delta);
+        atomic_loop_end(&lp, nw);
+        /* lp.cur is now the value replaced, the old one */
+        return post ? lp.cur : nw;
+    }
+    old = lvalue_load(o, a);
+    nw = incdec_value(t, old, sign, delta);
     if (a < 0 && post) {
         /* the register is about to change: keep the old value */
         int keep = ir_vreg(F, ty(t));
@@ -998,6 +1766,12 @@ static int unary(AST *e) {
             if (type_is_complex(e->type)) {
                 return complex_unary(e);
             }
+            if (is_soft(e->type)) {
+                return soft_neg(expr(o), e->type);
+            }
+            if (type_is_vector(e->type)) {
+                return vec_unary(OP_NEG, e->type, expr(o));
+            }
             v = expr(o);
             if (!lower_check_value_type(e->loc, e->type)) {
                 return v;
@@ -1010,6 +1784,9 @@ static int unary(AST *e) {
         case OP_BITNOT:
             if (type_is_complex(e->type)) {
                 return complex_unary(e);
+            }
+            if (type_is_vector(e->type)) {
+                return vec_unary(OP_BITNOT, e->type, expr(o));
             }
             v = expr(o);
             return canon(ir_unop(F, IR_NOT, ty(e->type), v), e->type);
@@ -1056,6 +1833,14 @@ static int binary(AST *e) {
     }
     if (type_is_complex(l->type)) {
         return complex_binary(e);
+    }
+    if (is_soft(l->type) && is_soft(r->type)) {
+        int la = expr(l);
+        return soft_arith(op, type_unqualified(l->type), la, expr(r));
+    }
+    if (type_is_vector(e->type) || type_is_vector(l->type) || type_is_vector(r->type)) {
+        int la = expr(l);
+        return vec_arith(op, e->type, la, l->type, expr(r), r->type);
     }
     if (!lower_check_value_type(l->loc, l->type) || !lower_check_value_type(r->loc, r->type)) {
         return iconst(ty(e->type), 0);
@@ -1115,6 +1900,31 @@ static int binary(AST *e) {
     return rv;
 }
 
+static int atomic_compound(AST *e, int a, Type *common) {
+    OpKind op = e->u.binary.op;
+    AST *r = e->u.binary.right;
+    Type *t = e->u.binary.left->type;
+    AtomicLoop lp;
+    int rv, nw;
+    if (t->kind == TY_POINTER) {
+        rv = type_is_vla(t->base) ? scale_by(scaled_index(expr(r), r->type, 1), t->base)
+             : scaled_index(expr(r), r->type, type_size(t->base));
+    } else {
+        rv = expr(r);
+        if (type_is_wide(common) && (op == OP_SHL_ASSIGN || op == OP_SHR_ASSIGN)) {
+            rv = convert(rv, r->type, type_basic(TY_LONG));
+        }
+    }
+    atomic_loop_begin(&lp, a, t);
+    if (t->kind == TY_POINTER) {
+        nw = ir_binop(F, op == OP_ADD_ASSIGN ? IR_ADD : IR_SUB, IR_I64, lp.cur, rv);
+    } else {
+        nw = convert(arith(op, common, convert(lp.cur, t, common), rv), common, t);
+    }
+    atomic_loop_end(&lp, nw);
+    return nw;
+}
+
 static int assign(AST *e) {
     OpKind op = e->u.binary.op;
     AST *l = e->u.binary.left;
@@ -1130,7 +1940,7 @@ static int assign(AST *e) {
         if (by_address(t)) {
             a = addr(l);
             rv = expr(r);
-            copy_bytes(a, rv, type_size(t));
+            copy_object(a, rv, t);
             return a;
         }
         if (!lower_check_value_type(e->loc, t)) {
@@ -1142,6 +1952,25 @@ static int assign(AST *e) {
     }
     if (type_is_complex(t)) {
         return complex_compound(e);
+    }
+    if (type_is_vector(t) && op != OP_ASSIGN) {
+        int rv2 = expr(r);
+        int la = addr(l);
+        copy_bytes(la, vec_arith(op, type_unqualified(t), la, t, rv2, r->type), type_size(t));
+        return la;
+    }
+    if ((is_soft(t) || is_soft(r->type)) && op != OP_ASSIGN) {
+        /* in the soft type (sema converted the right operand to it), then back to the object's type */
+        Type *st = is_soft(r->type) ? type_unqualified(r->type) : type_unqualified(t);
+        int rv2 = expr(r);
+        int la = lvalue_addr(l);
+        int res = soft_arith(op, st, soft_from(lvalue_load(l, la), t, st), soft_from(rv2, r->type, st));
+        if (is_soft(t)) {
+            res = soft_from(res, st, type_unqualified(t));
+            copy_bytes(la, res, type_size(t));
+            return la;
+        }
+        return lvalue_store(l, la, soft_to(res, st, t));
     }
     if (type_is_complex(r->type)) {
         unsupported(e->loc, "compound assignment of a complex value to a real object");
@@ -1163,6 +1992,9 @@ static int assign(AST *e) {
         common = r->type;
     }
     a = lvalue_addr(l);
+    if (a >= 0 && atomic_object(t) && !sema_is_bitfield(l)) {
+        return atomic_compound(e, a, common);
+    }
     if (t->kind == TY_POINTER) {
         size_t size = type_size(t->base);
         lv = lvalue_load(l, a);
@@ -1262,6 +2094,9 @@ static int va_arg_expr(AST *e) {
     i = ir_inst(F, ir_emit(F, IR_VAARG, IR_I64, dst, ap, -1));
     i->aux = ir_add_argtype(F, &at);
     i->imm = by_address(t) ? e->temp : 0;
+    if (type_is_record(t) && t->record->vm) {
+        return ir_load(F, IR_I64, dst, 8, 0);      /* passed by a copy's address */
+    }
     if (by_address(t)) {
         return dst;
     }
@@ -1301,6 +2136,186 @@ static int emit_call(const char *name, int target, int nargs, const int *args, T
     i = ir_inst(F, ir_emit(F, IR_CALL, dst >= 0 ? ty(ret) : IR_VOID, dst, -1, -1));
     i->imm = ir_add_call(F, &c);
     return dst;
+}
+
+/* ------------------------------------------------------------------ */
+/* atomics: calls to the backend's helpers (AtomicHelper, src/arch.h)    */
+/* ------------------------------------------------------------------ */
+
+/* the unsigned integer type of `size` bytes, which the helpers take and return */
+static Type *atomic_bits_type(size_t size) {
+    return type_basic(size == 1 ? TY_UCHAR : size == 2 ? TY_USHORT : size == 4 ? TY_UINT : TY_ULONG);
+}
+
+/* __jcc_atomic_<op>_<size>(p, v, w): the old value, of atomic_bits_type(size) (-1 for store) */
+static int atomic_call(const char *op, size_t size, int p, int v, int w) {
+    char name[64];
+    int vals[3];
+    Type *types[3];
+    int n = 0;
+    Type *bt = atomic_bits_type(size);
+    snprintf(name, sizeof(name), "__jcc_atomic_%s_%lu", op, (unsigned long)size);
+    codegen_use_atomic(op, (int)size);
+    vals[n] = p;
+    types[n++] = type_pointer(type_basic(TY_VOID));
+    if (v >= 0) {
+        vals[n] = v;
+        types[n++] = bt;
+    }
+    if (w >= 0) {
+        vals[n] = w;
+        types[n++] = bt;
+    }
+    return emit_call(ir_name(F, name), -1, n, vals, types, NULL, (size_t)n, 0,
+                     strcmp(op, "store") == 0 ? type_basic(TY_VOID) : bt, -1, -1);
+}
+
+/* a scalar value of type t as the bits the helpers take, and back */
+static int atomic_to_bits(int v, Type *t) {
+    size_t n = type_size(t);
+    if (type_is_floating(t)) {
+        int dst = ir_vreg(F, n == 4 ? IR_I32 : IR_I64);
+        IRInst *i = ir_inst(F, ir_emit(F, IR_BITCAST, n == 4 ? IR_I32 : IR_I64, dst, v, -1));
+        i->t2 = (unsigned char)ty(t);
+        return dst;
+    }
+    return convert(v, t, atomic_bits_type(n));
+}
+
+static int atomic_from_bits(int v, Type *t) {
+    size_t n = type_size(t);
+    if (type_is_floating(t)) {
+        int dst = ir_vreg(F, ty(t));
+        IRInst *i = ir_inst(F, ir_emit(F, IR_BITCAST, ty(t), dst, v, -1));
+        i->t2 = (unsigned char)(n == 4 ? IR_I32 : IR_I64);
+        return dst;
+    }
+    return convert(v, atomic_bits_type(n), t);
+}
+
+/* old op v, as the _fetch forms return it */
+static int atomic_apply(const char *op, Type *t, int old, int v) {
+    IRType it = ty(t);
+    int r;
+    if (strcmp(op, "nand") == 0) {
+        return canon(ir_unop(F, IR_NOT, it, ir_binop(F, IR_AND, it, old, v)), t);
+    }
+    r = ir_binop(F, strcmp(op, "add") == 0 ? IR_ADD : strcmp(op, "sub") == 0 ? IR_SUB : strcmp(op, "and") == 0 ? IR_AND
+                 : strcmp(op, "or") == 0 ? IR_OR : IR_XOR, it, old, v);
+    return canon(r, t);
+}
+
+static int atomic_builtin(AST *e, const AtomicBuiltin *ab) {
+    ASTList *args = e->u.call.args;
+    Type *obj;
+    size_t n;
+    int p, v, w, old, ok;
+    Type *bt;
+    size_t i;
+
+    if (ab->kind == AK_FENCE) {
+        for (i = 0; i < args->len; i++) {
+            expr(args->items[i]);
+        }
+        ir_emit(F, IR_FENCE, IR_VOID, -1, -1, -1);
+        return -1;
+    }
+    if (ab->kind == AK_LOCK_FREE) {
+        long size = 0;
+        for (i = 1; i < args->len; i++) {
+            expr(args->items[i]);
+        }
+        if (!sema_const_eval(args->items[0], &size)) {
+            int s = expr(args->items[0]);
+            s = convert(s, args->items[0]->type, type_basic(TY_ULONG));
+            /* 1, 2, 4 or 8: a power of two below 16 */
+            return ir_binop(F, IR_AND, IR_I32, ir_icmp_imm(F, IR_ULT, IR_I64, s, 9),
+                            ir_icmp_imm(F, IR_EQ, IR_I64, ir_binop(F, IR_AND, IR_I64, s, ir_binop_imm(F, IR_SUB, IR_I64, s, 1)), 0));
+        }
+        return iconst(IR_I32, size == 1 || size == 2 || size == 4 || size == 8);
+    }
+    obj = type_unqualified(args->items[0]->type->base);
+    n = type_size(obj);
+    bt = atomic_bits_type(n);
+    p = expr(args->items[0]);
+    switch (ab->kind) {
+        case AK_LOAD_N:
+            old = atomic_call("load", n, p, -1, -1);
+            for (i = 1; i < args->len; i++) {
+                expr(args->items[i]);
+            }
+            return atomic_from_bits(old, obj);
+        case AK_LOAD:
+            w = expr(args->items[1]);
+            old = atomic_call("load", n, p, -1, -1);
+            store_value(bt, w, old);
+            return -1;
+        case AK_INIT:
+            store_value(obj, p, expr(args->items[1]));
+            return -1;
+        case AK_STORE_N:
+            atomic_call("store", n, p, atomic_to_bits(expr(args->items[1]), obj), -1);
+            return -1;
+        case AK_STORE:
+            atomic_call("store", n, p, load_value(e->loc, bt, expr(args->items[1])), -1);
+            return -1;
+        case AK_RELEASE:
+        case AK_CLEAR:
+            atomic_call("store", n, p, iconst(ty(bt), 0), -1);
+            return -1;
+        case AK_TAS:
+            old = atomic_call("xchg", n, p, iconst(ty(bt), 1), -1);
+            return ir_icmp_imm(F, IR_NE, ty(bt), old, 0);
+        case AK_XCHG_N:
+            old = atomic_call("xchg", n, p, atomic_to_bits(expr(args->items[1]), obj), -1);
+            return atomic_from_bits(old, obj);
+        case AK_XCHG:
+            v = load_value(e->loc, bt, expr(args->items[1]));
+            w = expr(args->items[2]);
+            old = atomic_call("xchg", n, p, v, -1);
+            store_value(bt, w, old);
+            return -1;
+        case AK_SYNC_BOOL_CAS:
+        case AK_SYNC_VAL_CAS:
+            v = atomic_to_bits(expr(args->items[1]), obj);
+            w = atomic_to_bits(expr(args->items[2]), obj);
+            old = atomic_call("cas", n, p, v, w);
+            if (ab->kind == AK_SYNC_BOOL_CAS) {
+                return ir_icmp(F, IR_EQ, ty(bt), old, v);
+            }
+            return atomic_from_bits(old, obj);
+        case AK_CAS_N:
+        case AK_CAS: {
+            /* the old value goes to *expected whatever happens: on success it is what was there */
+            int ep = expr(args->items[1]);
+            int expected = load_value(e->loc, bt, ep);
+            w = ab->kind == AK_CAS ? load_value(e->loc, bt, expr(args->items[2])) : atomic_to_bits(expr(args->items[2]), obj);
+            for (i = 3; i < args->len; i++) {
+                expr(args->items[i]);
+            }
+            old = atomic_call("cas", n, p, expected, w);
+            ok = ir_icmp(F, IR_EQ, ty(bt), old, expected);
+            store_value(bt, ep, old);
+            return ok;
+        }
+        case AK_FETCH: {
+            Type *t = obj->kind == TY_POINTER ? type_basic(TY_ULONG) : obj;
+            v = convert(expr(args->items[1]), args->items[1]->type, t);
+            if (ab->scaled && obj->kind == TY_POINTER && type_size(obj->base) > 1) {
+                v = ir_binop_imm(F, IR_MUL, IR_I64, v, (long)type_size(obj->base));
+            }
+            for (i = 2; i < args->len; i++) {
+                expr(args->items[i]);
+            }
+            old = atomic_from_bits(atomic_call(ab->op, n, p, atomic_to_bits(v, t), -1), t);
+            if (ab->new_value) {
+                old = atomic_apply(ab->op, t, old, v);
+            }
+            return obj->kind == TY_POINTER ? convert(old, t, obj) : old;
+        }
+        default:
+            return -1;
+    }
 }
 
 static int is_overflow_builtin(const char *name) {
@@ -1530,31 +2545,126 @@ static int builtin(AST *e, const char *name, const char **target, int *result) {
         ir_emit(F, IR_FENCE, IR_VOID, -1, -1, -1);
         return 1;
     }
-    if (strcmp(name, "__atomic_load_n") == 0) {
-        /* a plain load; anything stronger than relaxed gets a full barrier after it */
-        long order = 0;
-        if (args->len == 2) {
-            *result = load_value(e->loc, e->type, expr(args->items[0]));
-            sema_const_eval(args->items[1], &order);
-            if (order != 0) {
-                ir_emit(F, IR_FENCE, IR_VOID, -1, -1, -1);
-            }
+    if (strcmp(name, "__builtin_shuffle") == 0 && (args->len == 2 || args->len == 3)) {
+        Type *vt = args->items[0]->type;
+        Type *mt = args->items[args->len - 1]->type;
+        Type *et = vt->base;
+        long n = vt->length;
+        long total = args->len == 3 ? 2 * n : n;
+        size_t es = type_size(et);
+        int src = vec_temp(type_vector(et, (size_t)total * es) ? type_vector(et, (size_t)total * es) : vt);
+        int res = vec_temp(e->type);
+        int m;
+        long k;
+        /* the operands side by side, then each picked element */
+        copy_bytes(src, expr(args->items[0]), type_size(vt));
+        if (args->len == 3) {
+            copy_bytes(ir_binop_imm(F, IR_ADD, IR_I64, src, (long)type_size(vt)), expr(args->items[1]), type_size(vt));
         }
+        m = expr(args->items[args->len - 1]);
+        for (k = 0; k < mt->length; k++) {
+            int idx = convert(vec_elem(m, mt, k), mt->base, type_basic(TY_ULONG));
+            int at;
+            idx = ir_binop_imm(F, IR_UREM, IR_I64, idx, total);
+            at = ir_binop(F, IR_ADD, IR_I64, src, ir_binop_imm(F, IR_MUL, IR_I64, idx, (long)es));
+            store_value(et, ir_binop_imm(F, IR_ADD, IR_I64, res, k * (long)es), load_value(e->loc, et, at));
+        }
+        *result = res;
         return 1;
     }
-    if (strcmp(name, "__atomic_store_n") == 0) {
-        long order = 0;
-        if (args->len == 3) {
-            Type *t = type_unqualified(args->items[0]->type->base);
-            int a = expr(args->items[0]);
-            int v = expr(args->items[1]);
-            sema_const_eval(args->items[2], &order);
-            if (order != 0) {
-                ir_emit(F, IR_FENCE, IR_VOID, -1, -1, -1);
-            }
-            store_value(t, a, v);
+    if (strcmp(name, "__builtin_apply_args") == 0) {
+        if (!F->apply_args_off) {
+            diag_error(e->loc, "__builtin_apply_args is not supported on this target");
+            *result = iconst(IR_I64, 0);
+            return 1;
         }
+        *result = addr_local(F->apply_args_off);
         return 1;
+    }
+    if (strcmp(name, "__builtin_apply") == 0 && args->len == 3) {
+        /* the helper calls fn with the saved registers and `size` bytes of the stack arguments; the results' block */
+        int vals[4];
+        Type *types[4];
+        int res = addr_local(alloc_slot(48, 16));
+        if (strcmp(arch_info->name, "x86_64") != 0) {
+            diag_error(e->loc, "__builtin_apply is not supported on this target");
+            *result = iconst(IR_I64, 0);
+            return 1;
+        }
+        vals[0] = convert(expr(args->items[0]), args->items[0]->type, type_pointer(type_basic(TY_VOID)));
+        vals[1] = expr(args->items[1]);
+        vals[2] = convert(expr(args->items[2]), args->items[2]->type, type_basic(TY_ULONG));
+        vals[3] = res;
+        types[0] = types[1] = types[3] = type_pointer(type_basic(TY_VOID));
+        types[2] = type_basic(TY_ULONG);
+        codegen_use_atomic("apply", 0);
+        emit_call(ir_name(F, "__jcc_atomic_apply_0"), -1, 4, vals, types, NULL, 4, 0, type_basic(TY_VOID), -1, -1);
+        *result = res;
+        return 1;
+    }
+    if (strcmp(name, "__builtin_return") == 0 && args->len == 1) {
+        IRInst *i;
+        if (strcmp(arch_info->name, "x86_64") != 0) {
+            diag_error(e->loc, "__builtin_return is not supported on this target");
+            return 1;
+        }
+        i = ir_inst(F, ir_emit(F, IR_RET, IR_I64, -1, expr(args->items[0]), -1));
+        i->flags |= IRF_APPLY;
+        return 1;
+    }
+    if (strcmp(name, "__builtin_va_arg_pack_len") == 0) {
+        if (!inline_ctx) {
+            diag_error(e->loc, "__builtin_va_arg_pack_len used outside a function inlined at its call");
+        }
+        *result = iconst(IR_I32, inline_ctx ? inline_ctx->npack : 0);
+        return 1;
+    }
+    if (strcmp(name, "__builtin_setjmp") == 0 && args->len == 1) {
+        /*
+         * buf[0] the frame pointer, buf[1] where __builtin_longjmp resumes (this
+         * call's value is 1 there, 0 now), buf[2] the stack pointer. The function
+         * keeps its locals in memory and saves every callee-saved register.
+         */
+        int b = expr(args->items[0]);
+        int recv = ir_block(F);
+        int join = ir_block(F);
+        int id = codegen_new_label_id();
+        int r = ir_vreg(F, IR_I32);
+        int la = ir_vreg(F, IR_I64);
+        int sp = ir_vreg(F, IR_I64);
+        IRInst *i;
+        F->blocks[recv].addr_label = id;
+        F->save_all = 1;
+        nested_call_seen = 1;
+        ir_store(F, IR_I64, b, addr_local(0), 8);
+        i = ir_inst(F, ir_emit(F, IR_LABEL_ADDR, IR_I64, la, -1, -1));
+        i->imm = id;
+        ir_store(F, IR_I64, ir_binop_imm(F, IR_ADD, IR_I64, b, 8), la, 8);
+        ir_emit(F, IR_SPSAVE, IR_I64, sp, -1, -1);
+        ir_store(F, IR_I64, ir_binop_imm(F, IR_ADD, IR_I64, b, 16), sp, 8);
+        ir_mov(F, r, iconst(IR_I32, 0));
+        ir_br(F, join);
+        ir_place(F, recv);
+        ir_mov(F, r, iconst(IR_I32, 1));
+        ir_place(F, join);
+        *result = r;
+        return 1;
+    }
+    if (strcmp(name, "__builtin_longjmp") == 0 && args->len == 2) {
+        int b = expr(args->items[0]);
+        IRInst *i;
+        expr(args->items[1]);   /* 1, as GCC requires */
+        i = ir_inst(F, ir_emit(F, IR_NLGOTO, IR_VOID, -1, b, -1));
+        i->imm = -1;
+        nested_call_seen = 1;
+        return 1;
+    }
+    {
+        const AtomicBuiltin *ab = sema_atomic_builtin(name);
+        if (ab) {
+            *result = atomic_builtin(e, ab);
+            return 1;
+        }
     }
     if (strncmp(name, "__builtin_", 10) != 0) {
         return 0;
@@ -1607,9 +2717,14 @@ static int builtin(AST *e, const char *name, const char **target, int *result) {
         *result = iconst(ty(e->type), (kind & 2) ? 0 : -1);
         return 1;
     }
-    if (strcmp(b, "expect") == 0) {
-        if (args->len == 2) {
+    if (strcmp(b, "expect") == 0 || strcmp(b, "expect_with_probability") == 0) {
+        /* a hint: the value is the first operand's, though the others are still evaluated */
+        size_t k;
+        if (args->len >= 1) {
             *result = expr(args->items[0]);
+        }
+        for (k = 1; k < args->len; k++) {
+            expr(args->items[k]);
         }
         return 1;
     }
@@ -1743,6 +2858,188 @@ static int math_intrinsic(AST *e, const char *name) {
     return -1;
 }
 
+/* ------------------------------------------------------------------ */
+/* GNU __builtin_va_arg_pack: functions inlined at their calls          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A function that passes its extra arguments on with __builtin_va_arg_pack
+ * (always_inline, as GCC requires) is lowered as part of each caller: its
+ * parameters are the caller's locals, a return stores the result and goes
+ * to the end, and the pack is the call's own extra arguments, evaluated
+ * at the call.
+ */
+
+
+static void mark_memory(AST *n);
+
+static int is_va_arg_pack(const AST *a) {
+    Symbol *c;
+    if (a->kind != N_CALL) {
+        return 0;
+    }
+    c = direct_callee(a->u.call.func);
+    return c && strcmp(c->name, "__builtin_va_arg_pack") == 0;
+}
+
+static int calls_pack(const AST *n);
+
+/* does the tree call a function whose name begins with `prefix`? */
+static int calls_named(const AST *n, const char *prefix) {
+    const char *saved = calls_prefix;
+    int r;
+    calls_prefix = prefix;
+    r = calls_pack(n);
+    calls_prefix = saved;
+    return r;
+}
+
+/* does the tree call __builtin_va_arg_pack (or __builtin_va_arg_pack_len), or what calls_prefix names? */
+static int calls_pack(const AST *n) {
+    size_t i;
+    if (!n) {
+        return 0;
+    }
+    switch (n->kind) {
+        case N_CALL: {
+            Symbol *c = direct_callee(n->u.call.func);
+            if (c && strncmp(c->name, calls_prefix, strlen(calls_prefix)) == 0) {
+                return 1;
+            }
+            for (i = 0; i < n->u.call.args->len; i++) {
+                if (calls_pack(n->u.call.args->items[i])) {
+                    return 1;
+                }
+            }
+            return calls_pack(n->u.call.func);
+        }
+        case N_UNARY:
+            return calls_pack(n->u.unary.operand);
+        case N_BINARY:
+        case N_ASSIGN:
+            return calls_pack(n->u.binary.left) || calls_pack(n->u.binary.right);
+        case N_COND:
+        case N_IF:
+            return calls_pack(n->u.cond.cond) || calls_pack(n->u.cond.then) || calls_pack(n->u.cond.otherwise);
+        case N_INDEX:
+            return calls_pack(n->u.index.array) || calls_pack(n->u.index.index);
+        case N_MEMBER:
+            return calls_pack(n->u.member.object);
+        case N_CAST:
+        case N_IMPLICIT_CAST:
+            return calls_pack(n->u.cast.expr);
+        case N_COMPOUND:
+            for (i = 0; i < n->u.block.items->len; i++) {
+                if (calls_pack(n->u.block.items->items[i])) {
+                    return 1;
+                }
+            }
+            return 0;
+        case N_DECLARATION:
+            for (i = 0; i < n->u.decl.declarators->len; i++) {
+                if (calls_pack(n->u.decl.declarators->items[i]->u.init_decl.init)) {
+                    return 1;
+                }
+            }
+            return 0;
+        case N_STMT_EXPR:
+            return calls_pack(n->u.stmt.body);
+        case N_LABEL: case N_CASE: case N_DEFAULT: case N_EXPR_STMT: case N_SWITCH: case N_WHILE: case N_DO: case N_RETURN:
+            return calls_pack(n->u.stmt.expr) || calls_pack(n->u.stmt.body);
+        case N_FOR:
+            return calls_pack(n->u.loop.init) || calls_pack(n->u.loop.cond) || calls_pack(n->u.loop.step)
+                || calls_pack(n->u.loop.body);
+        default:
+            return 0;
+    }
+}
+
+int lower_uses_va_arg_pack(AST *fdef) {
+    return fdef && fdef->kind == N_FUNCTION_DEF && calls_pack(fdef->u.func.body);
+}
+
+static void return_stmt(AST *s);
+
+static int inline_call(AST *e, Symbol *callee) {
+    AST *fdef = callee->def;
+    AST *fn = ast_declarator_innermost(fdef->u.func.declarator);
+    ASTList *params = fn ? fn->u.declarator.params : NULL;
+    ASTList *args = e->u.call.args;
+    size_t nparams = params && fn->u.declarator.kr == 0 ? params->len : 0;
+    InlineCtx ctx;
+    int *vals;
+    size_t i;
+    int saved_break = break_block, saved_continue = continue_block;
+    SwitchGen *saved_switch = cur_switch;
+    Symbol *s;
+
+    if (nparams == 1 && params->items[0]->u.typed.declarator == NULL && type_is_void(params->items[0]->type)) {
+        nparams = 0;    /* (void) */
+    }
+    for (s = fdef->u.func.scope ? fdef->u.func.scope->first : NULL; s; s = s->next) {
+        if (s->ns == NS_LABEL) {
+            s->label = 0;   /* its blocks are new in each caller */
+        }
+    }
+    /* the arguments, each once, in order; a record's copied, as a call's would be */
+    vals = xrealloc(NULL, (args->len + 1) * sizeof(int));
+    for (i = 0; i < args->len; i++) {
+        AST *a = args->items[i];
+        vals[i] = expr(a);
+        if (by_address(a->type)) {
+            int copy = addr_local(alloc_slot(type_size(a->type), type_align(a->type) > 16 ? 16 : type_align(a->type)));
+            copy_object(copy, vals[i], a->type);
+            vals[i] = copy;
+        }
+    }
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.outer = inline_ctx;
+    ctx.ret = e->type;
+    ctx.result = -1;
+    ctx.npack = args->len > nparams ? (int)(args->len - nparams) : 0;
+    ctx.pack_vals = vals + nparams;
+    ctx.pack_by_addr = xrealloc(NULL, ((size_t)ctx.npack + 1) * sizeof(int));
+    ctx.pack_types = xrealloc(NULL, ((size_t)ctx.npack + 1) * sizeof(Type *));
+    for (i = nparams; i < args->len; i++) {
+        ctx.pack_by_addr[i - nparams] = by_address(args->items[i]->type);
+        ctx.pack_types[i - nparams] = args->items[i]->type;
+    }
+    if (!type_is_void(e->type)) {
+        ctx.result = by_address(e->type) ? addr_local(alloc_slot(type_size(e->type), 16)) : ir_vreg(F, ty(e->type));
+    }
+    /* the parameters: locals of this function now (in memory, simply) */
+    mark_memory(fdef->u.func.body);
+    for (i = 0; i < nparams && i < args->len; i++) {
+        AST *pd = params->items[i];
+        Symbol *p = pd->sym;
+        if (!p || !p->type) {
+            continue;
+        }
+        p->vreg = 0;
+        p->by_ref = 0;
+        alloc_local(p);
+        if (by_address(p->type)) {
+            copy_object(addr_local(p->offset), vals[i], p->type);
+        } else {
+            store_value(p->type, addr_local(p->offset), convert(vals[i], args->items[i]->type, p->type));
+        }
+    }
+    assign_locals(fdef->u.func.body);
+    ctx.end = ir_block(F);
+    inline_ctx = &ctx;
+    break_block = continue_block = -1;
+    stmt(fdef->u.func.body);
+    inline_ctx = ctx.outer;
+    break_block = saved_break;
+    continue_block = saved_continue;
+    cur_switch = saved_switch;
+    ir_place(F, ctx.end);
+    free(vals);
+    free(ctx.pack_by_addr);
+    free(ctx.pack_types);
+    return ctx.result;
+}
+
 static int call(AST *e) {
     AST *f = e->u.call.func;
     Type *fn = f->type->base;
@@ -1751,6 +3048,7 @@ static int call(AST *e) {
     const char *name = callee ? callee->name : NULL;
     size_t nfixed;
     size_t i;
+    int nvals = 0;
     int *vals = NULL;
     int *by_addr = NULL;
     Type **types = NULL;
@@ -1772,7 +3070,7 @@ static int call(AST *e) {
         name = "__builtin_alloca";   /* declared but not defined here: the builtin, as GCC has it */
     }
     if (name && (strncmp(name, "__builtin_", 10) == 0 || strncmp(name, "__atomic_", 9) == 0
-            || strncmp(name, "__sync_", 7) == 0) && builtin(e, name, &name, &result)) {
+            || strncmp(name, "__sync_", 7) == 0 || strncmp(name, "__c11_atomic_", 13) == 0) && builtin(e, name, &name, &result)) {
         return result;
     }
 
@@ -1780,17 +3078,46 @@ static int call(AST *e) {
         return result;
     }
 
-    nfixed = fn->has_proto && fn->variadic ? fn->nparams : args->len;
-    if (args->len) {
-        vals = xrealloc(NULL, args->len * sizeof(*vals));
-        by_addr = xrealloc(NULL, args->len * sizeof(*by_addr));
-        types = xrealloc(NULL, args->len * sizeof(*types));
+    if (callee && callee->def && lower_uses_va_arg_pack(callee->def)) {
+        return inline_call(e, callee);      /* __builtin_va_arg_pack: only as part of the caller */
     }
-    for (i = 0; i < args->len; i++) {
+    nfixed = fn->has_proto && fn->variadic ? fn->nparams : args->len;
+    {
+        size_t cap = args->len + (inline_ctx ? (size_t)inline_ctx->npack : 0) + 1;
+        vals = xrealloc(NULL, cap * sizeof(*vals));
+        by_addr = xrealloc(NULL, cap * sizeof(*by_addr));
+        types = xrealloc(NULL, cap * sizeof(*types));
+    }
+    for (i = 0, nvals = 0; i < args->len; i++, nvals++) {
         AST *a = args->items[i];
-        vals[i] = expr(a);
-        by_addr[i] = by_address(a->type);
-        types[i] = a->type;
+        if (is_va_arg_pack(a)) {
+            /* the inlined function's own extra arguments, here */
+            int k;
+            if (!inline_ctx) {
+                diag_error(a->loc, "__builtin_va_arg_pack used outside a function inlined at its call");
+                nvals--;
+                continue;
+            }
+            for (k = 0; k < inline_ctx->npack; k++) {
+                vals[nvals] = inline_ctx->pack_vals[k];
+                by_addr[nvals] = inline_ctx->pack_by_addr[k];
+                types[nvals] = inline_ctx->pack_types[k];
+                nvals++;
+            }
+            nvals--;
+            continue;
+        }
+        vals[nvals] = expr(a);
+        by_addr[nvals] = by_address(a->type);
+        types[nvals] = a->type;
+        if (type_is_record(a->type) && a->type->record->vm) {
+            /* of a size known at run time: a copy's address, as GCC passes one */
+            int copy = ir_unop(F, IR_ALLOCA, IR_I64, size_of(a->type));
+            copy_object(copy, vals[nvals], a->type);
+            vals[nvals] = copy;
+            by_addr[nvals] = 0;
+            types[nvals] = type_pointer(type_basic(TY_VOID));
+        }
     }
     if (!callee) {
         target = expr(f);
@@ -1803,7 +3130,20 @@ static int call(AST *e) {
             result_addr = temp_addr(e);
         }
     }
-    result = emit_call(name, target, (int)args->len, vals, types, by_addr, nfixed, fn->variadic, e->type, sret_addr, result_addr);
+    if (callee && name == callee->name) {
+        name = ir_name(F, codegen_sym_name(callee));    /* its assembler name: an asm label's, or an alias's target */
+    }
+    if (callee && callee->parent_fn && name) {
+        /* a nested function: its static chain, through a slot the optimizer is kept away from */
+        long slot = alloc_slot(8, 8);
+        store_value(type_pointer(type_basic(TY_VOID)), addr_local(slot), frame_of(callee->parent_fn));
+        result = emit_call(name, target, nvals, vals, types, by_addr, nfixed, fn->variadic, e->type, sret_addr, result_addr);
+        F->calls[F->ncalls - 1].chain_slot = slot;
+        F->noopt = 1;
+        nested_call_seen = 1;
+    } else {
+        result = emit_call(name, target, nvals, vals, types, by_addr, nfixed, fn->variadic, e->type, sret_addr, result_addr);
+    }
     free(vals);
     free(by_addr);
     free(types);
@@ -1824,14 +3164,64 @@ static int expr(AST *e) {
     long v;
 
     switch (e->kind) {
+        case N_OFFSETOF: {
+            /* one sema could not fold: a run time index, or a variable length type on the way */
+            Type *t = e->u.desig.init->type;
+            int off = iconst(IR_I64, 0);
+            size_t k;
+            for (k = 0; k < e->u.desig.path->len; k++) {
+                AST *d = e->u.desig.path->items[k];
+                if (d->kind == N_DESIG_MEMBER) {
+                    Member *path[RECORD_PATH_MAX];
+                    size_t depth, j;
+                    Member *m = record_lookup(t->record, d->u.name, path, &depth);
+                    for (j = 0; j < depth; j++) {
+                        off = ir_binop_imm(F, IR_ADD, IR_I64, off, (long)path[j]->offset);
+                    }
+                    if (m->rt_slot) {
+                        off = ir_binop(F, IR_ADD, IR_I64, off, ir_load(F, IR_I64, addr_local(m->rt_slot), 8, 0));
+                    } else {
+                        off = ir_binop_imm(F, IR_ADD, IR_I64, off, (long)m->offset);
+                    }
+                    t = m->type;
+                } else {
+                    int idx = convert(expr(d->u.cast.expr), d->u.cast.expr->type, type_basic(TY_LONG));
+                    off = ir_binop(F, IR_ADD, IR_I64, off, ir_binop(F, IR_MUL, IR_I64, idx, size_of(t->base)));
+                    t = t->base;
+                }
+            }
+            return off;
+        }
+
+        case N_LABEL_ADDR: {
+            int dst = ir_vreg(F, IR_I64);
+            IRInst *i;
+            if (!e->sym) {
+                return iconst(IR_I64, 0);
+            }
+            i = ir_inst(F, ir_emit(F, IR_LABEL_ADDR, IR_I64, dst, -1, -1));
+            i->imm = codegen_label_id(e->sym);
+            return dst;
+        }
+
         case N_STMT_EXPR: {
             ASTList *items = e->u.stmt.body->u.block.items;
             size_t i;
             int result = -1;
             for (i = 0; i < items->len; i++) {
                 AST *item = items->items[i];
-                if (i + 1 == items->len && item->kind == N_EXPR_STMT && item->u.stmt.expr) {
-                    result = expr(item->u.stmt.expr);
+                AST *last = item;
+                while (i + 1 == items->len && last->kind == N_LABEL && last->u.stmt.body) {
+                    last = last->u.stmt.body;
+                }
+                if (i + 1 == items->len && last->kind == N_EXPR_STMT && last->u.stmt.expr) {
+                    /* the value; labels on the statement are placed first */
+                    for (; item != last; item = item->u.stmt.body) {
+                        if (item->sym) {
+                            ir_place(F, label_block(item->sym));
+                        }
+                    }
+                    result = expr(last->u.stmt.expr);
                 } else if (item->kind == N_DECLARATION) {
                     local_decl(item);
                 } else {
@@ -1871,6 +3261,31 @@ static int expr(AST *e) {
             if (!sema_const_eval_float(e, &f)) {
                 diag_error(e->loc, "internal error: constant has no value");
                 f = 0;
+            }
+            if (is_soft(e->type)) {
+                unsigned char b[16];
+                int t = soft_temp(e->type);
+                long w0 = 0, w1 = 0;
+                int k;
+                if (type_is_decimal(e->type)) {
+                    lower_bid_bytes(e->u.text, 0, e->type->kind, b);
+                    if (type_size(e->type) < 16) {
+                        for (k = (int)type_size(e->type) - 1; k >= 0; k--) {
+                            w0 = (long)((unsigned long)w0 << 8 | b[k]);
+                        }
+                        ir_store(F, type_size(e->type) == 4 ? IR_I32 : IR_I64, t, iconst(type_size(e->type) == 4 ? IR_I32 : IR_I64, w0), type_size(e->type));
+                        return t;
+                    }
+                } else {
+                    lower_f128_bytes(f, b);
+                }
+                for (k = 7; k >= 0; k--) {
+                    w0 = (long)((unsigned long)w0 << 8 | b[k]);
+                    w1 = (long)((unsigned long)w1 << 8 | b[8 + k]);
+                }
+                ir_store(F, IR_I64, t, iconst(IR_I64, w0), 8);
+                ir_store(F, IR_I64, ir_binop_imm(F, IR_ADD, IR_I64, t, 8), iconst(IR_I64, w1), 8);
+                return t;
             }
             return float_const(f, e->type);
         }
@@ -1915,11 +3330,12 @@ static int expr(AST *e) {
             return call(e);
 
         case N_INDEX:
-            return load_value(e->loc, e->type, addr(e));
-
         case N_MEMBER:
-            if (sema_is_bitfield(e)) {
+            if (e->kind == N_MEMBER && sema_is_bitfield(e)) {
                 return load_bits(e->u.member.member, e->type, addr(e));
+            }
+            if (reversed_lvalue(e) && is_value_type(e->type)) {
+                return load_reversed(type_unqualified(e->type), addr(e));     /* scalar_storage_order */
             }
             return load_value(e->loc, e->type, addr(e));
 
@@ -2196,6 +3612,8 @@ void lower_init_scalar(long off, Type *t, AST *e) {
     v = expr(e);
     if (by_address(t)) {
         copy_bytes(init_addr(off), v, type_size(t));
+    } else if (lower_init_reverse && type_size(t) > 1) {
+        store_reversed(type_unqualified(t), init_addr(off), v);
     } else {
         store_value(t, init_addr(off), v);
     }
@@ -2214,8 +3632,154 @@ void lower_init_bitfield(long off, Member *m, AST *item) {
     store_bits(m, m->type, a, v);
 }
 
+/*
+ * GNU structs with variable length members. Where the definition is, each
+ * gets a slot for its size and one for each member's offset that is only
+ * known at run time; when the definition is reached, its variable length
+ * members' sizes are worked out and the layout made: each such member at
+ * its alignment after what precedes it, the members after it where the
+ * static layout put them (which counted it as empty), moved on by the
+ * room it takes, rounded to their alignment.
+ */
+static void vm_record_slots(ASTList *specs) {
+    size_t i, k, j;
+    for (i = 0; specs && i < specs->len; i++) {
+        AST *spec = specs->items[i];
+        Record *r;
+        if (spec->kind != N_STRUCT_SPEC || !spec->u.record.has_body || !spec->type || !type_is_record(spec->type)
+                || !(r = spec->type->record)->vm) {
+            continue;
+        }
+        r->size_slot = alloc_slot(8, 8);
+        for (k = 0; k < spec->u.record.members->len; k++) {
+            AST *sdecl = spec->u.record.members->items[k];
+            if (sdecl->kind != N_STRUCT_DECLARATION) {
+                continue;
+            }
+            vm_record_slots(sdecl->u.decl.specs);
+            for (j = 0; j < sdecl->u.decl.declarators->len; j++) {
+                vla_slots(sdecl->u.decl.declarators->items[j]->u.init_decl.declarator);
+            }
+        }
+        for (k = 0; k < r->nmembers; k++) {
+            r->members[k].rt_slot = 0;
+        }
+        {
+            int seen = 0;
+            for (k = 0; k < r->nmembers; k++) {
+                if (seen && r->kind == TY_STRUCT) {
+                    r->members[k].rt_slot = alloc_slot(8, 8);
+                }
+                if (type_is_vla(r->members[k].type)) {
+                    if (!seen && r->kind == TY_STRUCT) {
+                        r->members[k].rt_slot = alloc_slot(8, 8);
+                    }
+                    seen = 1;
+                }
+            }
+        }
+    }
+}
+
+static void vm_record_layout(ASTList *specs) {
+    size_t i, k, j;
+    Type *u = type_basic(TY_ULONG);
+    for (i = 0; specs && i < specs->len; i++) {
+        AST *spec = specs->items[i];
+        Record *r;
+        int size;
+        if (spec->kind != N_STRUCT_SPEC || !spec->u.record.has_body || !spec->type || !type_is_record(spec->type)
+                || !(r = spec->type->record)->vm) {
+            continue;
+        }
+        for (k = 0; k < spec->u.record.members->len; k++) {
+            AST *sdecl = spec->u.record.members->items[k];
+            if (sdecl->kind != N_STRUCT_DECLARATION) {
+                continue;
+            }
+            vm_record_layout(sdecl->u.decl.specs);
+            for (j = 0; j < sdecl->u.decl.declarators->len; j++) {
+                vla_eval(sdecl->u.decl.declarators->items[j]->u.init_decl.declarator);
+            }
+        }
+        if (r->kind == TY_UNION) {
+            size = iconst(IR_I64, (long)r->size);
+            for (k = 0; k < r->nmembers; k++) {
+                Member *m = &r->members[k];
+                if (type_is_vla(m->type)) {
+                    /* the larger of the two */
+                    int ms = size_of(m->type);
+                    int bigger = ir_icmp(F, IR_UGT, IR_I64, ms, size);
+                    int next = ir_vreg(F, IR_I64);
+                    int b1 = ir_block(F), b2 = ir_block(F), join = ir_block(F);
+                    ir_condbr(F, bigger, b1, b2);
+                    ir_place(F, b1);
+                    ir_mov(F, next, ms);
+                    ir_br(F, join);
+                    ir_place(F, b2);
+                    ir_mov(F, next, size);
+                    ir_place(F, join);
+                    size = next;
+                }
+            }
+        } else {
+            /*
+             * From the first variable length member on, each member at its alignment after the
+             * one before (bit-fields that shared a unit in the static layout share one here),
+             * as GCC lays them out; the members before it are where the static layout put them.
+             */
+            int cur = -1;
+            int prev_off = -1;
+            const Member *prev = NULL;
+            for (k = 0; k < r->nmembers; k++) {
+                Member *m = &r->members[k];
+                size_t al = r->packed ? 1 : type_align(m->type);
+                int off;
+                if (!m->rt_slot) {
+                    continue;
+                }
+                if (cur < 0) {
+                    cur = iconst(IR_I64, (long)m->offset);
+                }
+                if (m->bits >= 0 && prev && prev->bits >= 0 && prev->offset == m->offset && prev_off >= 0) {
+                    off = prev_off;     /* the same unit as the bit-field before */
+                } else {
+                    off = al > 1 ? ir_binop_imm(F, IR_AND, IR_I64, ir_binop_imm(F, IR_ADD, IR_I64, cur, (long)al - 1), -(long)al) : cur;
+                }
+                store_value(u, addr_local(m->rt_slot), off);
+                if (m->bits >= 0) {
+                    long used = r->packed ? (long)(m->bit_offset + (unsigned)m->bits + 7) / 8 : (long)m->unit;
+                    int end = ir_binop_imm(F, IR_ADD, IR_I64, off, used);
+                    /* the furthest a bit-field of the unit reaches */
+                    int later = ir_icmp(F, IR_UGT, IR_I64, end, cur);
+                    int next = ir_vreg(F, IR_I64);
+                    int b1 = ir_block(F), b2 = ir_block(F), join = ir_block(F);
+                    ir_condbr(F, later, b1, b2);
+                    ir_place(F, b1);
+                    ir_mov(F, next, end);
+                    ir_br(F, join);
+                    ir_place(F, b2);
+                    ir_mov(F, next, cur);
+                    ir_place(F, join);
+                    cur = next;
+                } else {
+                    cur = ir_binop(F, IR_ADD, IR_I64, off, size_of(m->type));
+                }
+                prev = m;
+                prev_off = off;
+            }
+            size = cur >= 0 ? cur : iconst(IR_I64, (long)r->size);
+        }
+        if (r->align > 1) {
+            size = ir_binop_imm(F, IR_AND, IR_I64, ir_binop_imm(F, IR_ADD, IR_I64, size, (long)r->align - 1), -(long)r->align);
+        }
+        store_value(u, addr_local(r->size_slot), size);
+    }
+}
+
 static void local_decl(AST *decl) {
     size_t i;
+    vm_record_layout(decl->u.decl.specs);
     for (i = 0; i < decl->u.decl.declarators->len; i++) {
         AST *id = decl->u.decl.declarators->items[i];
         Symbol *s = id->sym;
@@ -2321,6 +3885,315 @@ static int label_block(Symbol *s) {
         s->label = ir_block(F) + 1;
     }
     return s->label - 1;
+}
+
+/*
+ * GNU label addresses. Each label of the function whose address is taken
+ * (in its code or in a static initializer) gets its block now, marked
+ * with the label's assembler name, and a `goto *p` may go to any of them.
+ * The optimizer leaves such a function alone.
+ */
+static int *addr_label_blocks = NULL;
+static int naddr_labels = 0;
+static int asm_goto_seen = 0;   /* the function has an asm goto: the optimizer leaves it alone */
+
+static void addr_labels_begin(Scope *scope) {
+    Symbol *s;
+    naddr_labels = 0;
+    asm_goto_seen = 0;
+    nested_call_seen = 0;
+    for (s = scope ? scope->first : NULL; s; s = s->next) {
+        if (s->ns == NS_LABEL && s->addr_taken) {
+            int b = label_block(s);
+            F->blocks[b].addr_label = codegen_label_id(s);
+            addr_label_blocks = xrealloc(addr_label_blocks, (size_t)(naddr_labels + 1) * sizeof(int));
+            addr_label_blocks[naddr_labels++] = b;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* asm statements (see IRAsm in src/ir.h)                              */
+/* ------------------------------------------------------------------ */
+
+static int asm_value_size(Type *t) {
+    if (type_is_floating(t) && !type_is_complex(t) && t->kind != TY_FLOAT128) {
+        return (int)type_size(t);     /* a long double too, for the x87 constraints */
+    }
+    return is_value_type(t) && !type_is_complex(t) && !type_is_wide(t) && type_size(t) <= 8 ? (int)type_size(t) : 0;
+}
+
+/* the index of the operand named `name` (len bytes), or -1 */
+static int asm_named(const IRAsm *a, const char *name, size_t len) {
+    int k;
+    for (k = 0; k < a->nops; k++) {
+        if (a->ops[k].name && strlen(a->ops[k].name) == len && strncmp(a->ops[k].name, name, len) == 0) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+static void asm_stmt(AST *s) {
+    IRAsm a;
+    ASTList *outs = s->u.asmst.outputs;
+    ASTList *ins = s->u.asmst.inputs;
+    int nouts = outs ? (int)outs->len : 0;
+    int nins = ins ? (int)ins->len : 0;
+    int *lv_addr = NULL;        /* outputs in registers: where the value goes after, from lvalue_addr */
+    int *args = NULL;
+    Type **arg_types = NULL;
+    int nargs = 0;
+    int k, idx;
+    Type *vp = type_pointer(type_basic(TY_VOID));
+
+    memset(&a, 0, sizeof(a));
+    if (s->u.asmst.text) {
+        char *text = sema_asm_text(s->u.asmst.text, s->loc);
+        if (!text) {
+            return;
+        }
+        a.text = ir_name(F, text);
+        free(text);
+        a.basic = 1;
+    } else {
+        char *text = NULL;
+        sema_string_bytes(s->u.asmst.tmpl->u.text, &text);
+        a.text = ir_name(F, text);
+        free(text);
+    }
+    {
+        const char *p = a.text;
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (*p) {
+            codegen_user_asm = 1;
+        }
+    }
+    a.nops = nouts + nins;
+    a.ops = a.nops ? xcalloc((size_t)a.nops, sizeof(IRAsmOp)) : NULL;
+    args = xmalloc((size_t)(2 * a.nops + 1) * sizeof(int));
+    arg_types = xmalloc((size_t)(2 * a.nops + 1) * sizeof(Type *));
+    lv_addr = xmalloc((size_t)(nouts + 1) * sizeof(int));
+    for (k = 0; k < a.nops; k++) {
+        AST *op = k < nouts ? outs->items[k] : ins->items[k - nouts];
+        IRAsmOp *o = &a.ops[k];
+        o->match = -1;
+        o->name = op->u.asmop.name ? ir_name(F, op->u.asmop.name) : NULL;
+    }
+    /* the outputs: their lvalues first, then what an in-out one holds */
+    for (k = 0; k < nouts; k++) {
+        AST *op = outs->items[k];
+        AST *e = op->u.asmop.expr;
+        IRAsmOp *o = &a.ops[k];
+        AsmConstraint c;
+        char *text = NULL;
+        int size = asm_value_size(e->type);
+        sema_string_bytes(op->u.asmop.constraint->u.text, &text);
+        sema_asm_constraint(text, &c);
+        free(text);
+        o->is_output = 1;
+        o->is_input = (char)c.inout;
+        o->size = size;
+        lv_addr[k] = -1;
+        if (c.reg && size && !sema_is_bitfield(e) && (size <= 8 || c.specific == 't' || c.specific == 'u')) {
+            o->kind = 'r';
+            o->specific = c.specific;
+            o->fp = (char)(c.fp && type_is_floating(e->type));
+            o->slot = alloc_slot(16, 16);
+            lv_addr[k] = lvalue_addr(e);
+            if (c.inout) {
+                store_value(type_unqualified(e->type), addr_local(o->slot), lvalue_load(e, lv_addr[k]));
+            }
+        } else {
+            int ad = addr(e);
+            o->kind = 'm';
+            o->slot = alloc_slot(16, 16);
+            store_value(vp, addr_local(o->slot), ad);
+            args[nargs] = ad;
+            arg_types[nargs++] = vp;
+        }
+        args[nargs] = addr_local(o->slot);
+        arg_types[nargs++] = vp;
+    }
+    /* the inputs */
+    for (k = 0; k < nins; k++) {
+        AST *op = ins->items[k];
+        AST *e = op->u.asmop.expr;
+        IRAsmOp *o = &a.ops[nouts + k];
+        AsmConstraint c;
+        char *text = NULL;
+        long cv;
+        int size = asm_value_size(e->type);
+        sema_string_bytes(op->u.asmop.constraint->u.text, &text);
+        sema_asm_constraint(text, &c);
+        free(text);
+        o->is_input = 1;
+        o->size = size;
+        if (c.match_name) {
+            c.match = asm_named(&a, c.match_name, c.match_len);
+        }
+        if (c.imm && type_is_integer(e->type) && sema_const_eval(e, &cv) && c.match < 0) {
+            o->kind = 'i';
+            o->imm = sema_fit(cv, e->type);
+            continue;
+        }
+        if ((c.reg || c.match >= 0) && size && (size <= 8 || c.specific == 't' || c.specific == 'u'
+                || (c.match >= 0 && c.match < nouts && (a.ops[c.match].specific == 't' || a.ops[c.match].specific == 'u')))) {
+            Type *t = type_unqualified(e->type);
+            o->kind = 'r';
+            o->specific = c.specific;
+            o->fp = (char)(c.fp && type_is_floating(t));
+            o->match = c.match;
+            if (c.match >= 0 && c.match < nouts) {
+                o->fp = a.ops[c.match].fp;
+                o->size = a.ops[c.match].size;
+                if (a.ops[c.match].kind != 'r') {
+                    o->kind = 'm';     /* tied to an output in memory: the same memory */
+                    o->slot = a.ops[c.match].slot;
+                    continue;
+                }
+            }
+            o->slot = alloc_slot(16, 16);
+            store_value(t, addr_local(o->slot), expr(e));
+        } else {
+            /* memory: the object, or a temporary holding the value */
+            int ad;
+            if (e->lvalue > 0) {
+                ad = addr(e);
+            } else {
+                long tmp = alloc_slot(type_size(e->type) ? type_size(e->type) : 1, 16);
+                ad = addr_local(tmp);
+                if (by_address(e->type)) {
+                    copy_bytes(ad, expr(e), type_size(e->type));
+                } else {
+                    store_value(type_unqualified(e->type), ad, expr(e));
+                }
+            }
+            o->kind = 'm';
+            o->slot = alloc_slot(16, 16);
+            store_value(vp, addr_local(o->slot), ad);
+            args[nargs] = ad;
+            arg_types[nargs++] = vp;
+        }
+        args[nargs] = addr_local(o->slot);
+        arg_types[nargs++] = vp;
+    }
+    if (s->u.asmst.clobbers) {
+        a.nclobbers = (int)s->u.asmst.clobbers->len;
+        a.clobbers = xmalloc((size_t)a.nclobbers * sizeof(char *));
+        for (k = 0; k < a.nclobbers; k++) {
+            char *text = NULL;
+            sema_string_bytes(s->u.asmst.clobbers->items[k]->u.text, &text);
+            a.clobbers[k] = ir_name(F, text);
+            free(text);
+        }
+    }
+    a.nlabels = s->u.asmst.labels ? (int)s->u.asmst.labels->len : 0;
+
+    idx = ir_add_asm(F, &a);
+    emit_call(ir_name(F, "__jcc_asm"), -1, nargs, args, arg_types, NULL, (size_t)nargs, 0, type_basic(TY_VOID), -1, -1);
+    F->calls[F->ncalls - 1].asm_index = idx + 1;
+    if (a.nlabels) {
+        /* asm goto: the asm may jump to its labels, else it goes on */
+        int *targets = xmalloc((size_t)(a.nlabels + 1) * sizeof(int));
+        int next = ir_block(F);
+        IRInst *i;
+        targets[0] = next;
+        for (k = 0; k < a.nlabels; k++) {
+            Symbol *l = s->u.asmst.labels->items[k]->sym;
+            targets[k + 1] = l ? label_block(l) : next;
+        }
+        i = ir_inst(F, ir_emit(F, IR_ASMBR, IR_VOID, -1, -1, -1));
+        i->imm = ir_add_switch(F, targets, a.nlabels + 1);
+        free(targets);
+        ir_place(F, next);
+        asm_goto_seen = 1;
+    }
+    /* the outputs in registers, to their lvalues */
+    for (k = 0; k < nouts; k++) {
+        AST *e = outs->items[k]->u.asmop.expr;
+        if (a.ops[k].kind == 'r') {
+            Type *t = type_unqualified(e->type);
+            lvalue_store(e, lv_addr[k], load_value(e->loc, t, addr_local(a.ops[k].slot)));
+        }
+    }
+    free(lv_addr);
+    free(args);
+    free(arg_types);
+}
+
+/*
+ * The functions nested directly in this one: it keeps the optimizer away,
+ * and a nested one whose address is taken gets its trampoline here, in
+ * this frame, made at entry: code that loads the static chain (this frame)
+ * and jumps to the function. x86_64 only, and the stack must then be
+ * executable (codegen_exec_stack).
+ */
+static void nested_trampoline(Symbol *s) {
+    static const unsigned char head[] = { 0x49, 0xbb };     /* movabs $chain, %r11 */
+    static const unsigned char mid[] = { 0x49, 0xba };      /* movabs $fn, %r10 */
+    static const unsigned char tail[] = { 0x41, 0xff, 0xe2, 0x90 };   /* jmp *%r10; nop */
+    Type *u16 = type_basic(TY_USHORT);
+    Type *u32 = type_basic(TY_UINT);
+    Type *vp = type_pointer(type_basic(TY_VOID));
+    long t;
+    if (strcmp(arch_info->name, "x86_64") != 0) {
+        return;     /* no executable stack (Apple arm64): the address cannot be taken (see addr) */
+    }
+    t = alloc_slot(32, 16);
+    s->tramp_off = t;
+    store_value(u16, addr_local(t), iconst(IR_I32, head[0] | head[1] << 8));
+    store_value(vp, addr_local(t + 2), addr_local(0));
+    store_value(u16, addr_local(t + 10), iconst(IR_I32, mid[0] | mid[1] << 8));
+    store_value(vp, addr_local(t + 12), addr_global(s));
+    store_value(u32, addr_local(t + 20), iconst(IR_I32, (long)((unsigned long)tail[0] | (unsigned long)tail[1] << 8
+                                                                 | (unsigned long)tail[2] << 16 | (unsigned long)tail[3] << 24)));
+    codegen_exec_stack = 1;
+}
+
+static void nested_functions_begin(AST *n) {
+    size_t i;
+    if (!n) {
+        return;
+    }
+    switch (n->kind) {
+        case N_FUNCTION_DEF:
+            nested_call_seen = 1;
+            if (n->sym && n->sym->addr_taken && n->sym->used) {
+                nested_trampoline(n->sym);
+            }
+            return;     /* (its own nested ones are its business) */
+        case N_COMPOUND:
+            for (i = 0; i < n->u.block.items->len; i++) {
+                nested_functions_begin(n->u.block.items->items[i]);
+            }
+            return;
+        case N_IF:
+            nested_functions_begin(n->u.cond.then);
+            nested_functions_begin(n->u.cond.otherwise);
+            return;
+        case N_FOR:
+            nested_functions_begin(n->u.loop.body);
+            return;
+        case N_LABEL: case N_CASE: case N_DEFAULT: case N_SWITCH: case N_WHILE: case N_DO:
+            nested_functions_begin(n->u.stmt.body);
+            return;
+        default:
+            return;
+    }
+}
+
+static void computed_goto(AST *s) {
+    int v = expr(s->u.stmt.expr);
+    IRInst *i;
+    if (!naddr_labels) {
+        ir_emit(F, IR_UNREACHABLE, IR_VOID, -1, -1, -1);    /* no label's address is taken: nowhere to go */
+        return;
+    }
+    i = ir_inst(F, ir_emit(F, IR_IJMP, IR_VOID, -1, v, -1));
+    i->imm = ir_add_switch(F, addr_label_blocks, naddr_labels);
 }
 
 /*
@@ -2466,6 +4339,22 @@ static int rotate(const AST *cond) {
 static void return_stmt(AST *s) {
     AST *e = s->u.stmt.expr;
     IRInst *i;
+    if (inline_ctx) {
+        /* in a function inlined at its call: the result, then on after the call */
+        InlineCtx *c = inline_ctx;
+        if (e) {
+            int v = expr(e);
+            if (c->result >= 0 && v >= 0) {
+                if (by_address(c->ret)) {
+                    copy_object(c->result, v, c->ret);
+                } else {
+                    ir_mov(F, c->result, convert(v, e->type, c->ret));
+                }
+            }
+        }
+        ir_br(F, c->end);
+        return;
+    }
     if (!e) {
         ir_emit(F, IR_RET, IR_VOID, -1, -1, -1);
         return;
@@ -2645,8 +4534,28 @@ static void stmt(AST *s) {
             stmt(s->u.stmt.body);
             break;
 
+        case N_ASM_STMT:
+            asm_stmt(s);
+            break;
+
+        case N_FUNCTION_DEF:
+            break;      /* a GNU nested function: lowered on its own, after this one (src/codegen.c) */
+
         case N_GOTO:
-            if (s->sym) {
+            if (s->u.stmt.expr) {
+                computed_goto(s);
+            } else if (s->sym && s->sym->owner_fn && s->sym->owner_fn != cur_fsym) {
+                /* out of this nested function, to its label in the enclosing function: that frame, its stack pointer */
+                Symbol *o = s->sym->owner_fn;
+                int fp = frame_of(o);
+                int target = ir_vreg(F, IR_I64);
+                IRInst *i = ir_inst(F, ir_emit(F, IR_LABEL_ADDR, IR_I64, target, -1, -1));
+                i->imm = codegen_label_id(s->sym);
+                i = ir_inst(F, ir_emit(F, IR_NLGOTO, IR_VOID, -1, fp, target));
+                i->imm = o->nl_sp_off;
+                F->noopt = 1;
+                nested_call_seen = 1;
+            } else if (s->sym) {
                 jump(label_block(s->sym));
             }
             break;
@@ -2736,7 +4645,7 @@ static int temp_addr(const AST *e) {
 
 /* can this local live in a register: a scalar whose address is never taken, in a function without setjmp */
 static int promotable(const Symbol *s) {
-    if (all_in_memory || s->vreg == -1 || s->by_ref || !s->type) {
+    if (all_in_memory || s->vreg == -1 || s->by_ref || !s->type || s->captured) {
         return 0;
     }
     if (s->type->quals & TQ_VOLATILE) {
@@ -2883,9 +4792,32 @@ static void mark_memory(AST *n) {
         case N_WHILE:
         case N_DO:
         case N_RETURN:
+        case N_GOTO:
             mark_memory(n->u.stmt.expr);
             mark_memory(n->u.stmt.body);
             break;
+        case N_ASM_STMT: {
+            /* an operand the asm reads or writes in memory: its object stays there */
+            ASTList *lists[2];
+            size_t k;
+            lists[0] = n->u.asmst.outputs;
+            lists[1] = n->u.asmst.inputs;
+            for (k = 0; k < 2; k++) {
+                for (i = 0; lists[k] && i < lists[k]->len; i++) {
+                    AST *op = lists[k]->items[i];
+                    AsmConstraint c;
+                    char *text = NULL;
+                    sema_string_bytes(op->u.asmop.constraint->u.text, &text);
+                    sema_asm_constraint(text, &c);
+                    free(text);
+                    if (c.mem && !(c.reg || (c.imm && k == 1))) {
+                        mark_base(op->u.asmop.expr);
+                    }
+                    mark_memory(op->u.asmop.expr);
+                }
+            }
+            break;
+        }
         case N_FOR:
             mark_memory(n->u.loop.init);
             mark_memory(n->u.loop.cond);
@@ -2989,6 +4921,7 @@ static void assign_locals(AST *s) {
     }
     switch (s->kind) {
         case N_DECLARATION:
+            vm_record_slots(s->u.decl.specs);
             for (i = 0; i < s->u.decl.declarators->len; i++) {
                 AST *id = s->u.decl.declarators->items[i];
                 Symbol *sym = id->sym;
@@ -3057,7 +4990,16 @@ static void assign_locals(AST *s) {
             break;
         case N_EXPR_STMT:
         case N_RETURN:
+        case N_GOTO:
             assign_temps(s->u.stmt.expr);
+            break;
+        case N_ASM_STMT:
+            for (i = 0; s->u.asmst.outputs && i < s->u.asmst.outputs->len; i++) {
+                assign_temps(s->u.asmst.outputs->items[i]->u.asmop.expr);
+            }
+            for (i = 0; s->u.asmst.inputs && i < s->u.asmst.inputs->len; i++) {
+                assign_temps(s->u.asmst.inputs->items[i]->u.asmop.expr);
+            }
             break;
         default:
             break;
@@ -3102,13 +5044,24 @@ IRFunc *lower_function(AST *fdef) {
     }
 
     F = ir_func_new(s->name);
-    F->is_global = s->storage != STORAGE_STATIC;
+    F->name = ir_name(F, codegen_sym_name(s));     /* its assembler name: an asm label's, or a nested function's */
+    F->is_global = s->storage == STORAGE_STATIC ? 0 : s->weak ? 2 : 1;
     F->is_variadic = t->variadic;
+    F->align = s->type && s->type->kind == TY_FUNC ? s->type->align : 0;
     F->is_main = strcmp(s->name, "main") == 0;
     F->opt_level = codegen_opt_level;
     frame_off = 0;
     sret_off = 0;
-    all_in_memory = 0;
+    all_in_memory = s->nonlocal_target;     /* a nested function may jump back into this frame: registers do not survive */
+    cur_fsym = s;
+    if (strcmp(arch_info->name, "x86_64") == 0 && calls_named(fdef->u.func.body, "__builtin_apply_args")) {
+        F->apply_args_off = alloc_slot(192, 16);
+    }
+    if (s->parent_fn) {
+        /* a GNU nested function: the prologue stores its static chain here */
+        s->chain_off = alloc_slot(8, 8);
+        F->chain_off = s->chain_off;
+    }
     break_block = -1;
     continue_block = -1;
     cur_switch = NULL;
@@ -3173,7 +5126,7 @@ IRFunc *lower_function(AST *fdef) {
             p->offset = alloc_slot(8, 8);
             ip->offset = p->offset;
         } else if (by_address(p->type)) {
-            p->offset = alloc_slot(8 * ip->loc.nregs, type_align(p->type) > 8 ? type_align(p->type) : 8);
+            p->offset = alloc_slot(p->type->kind == TY_FLOAT128 ? 16 : 8 * ip->loc.nregs, type_align(p->type) > 8 ? type_align(p->type) : 8);
             ip->offset = p->offset;
         } else if (promotable(p)) {
             p->vreg = ir_vreg_local(F, ty(p->type), p->name) + 1;
@@ -3205,7 +5158,23 @@ IRFunc *lower_function(AST *fdef) {
     for (i = 0; i < nparams; i++) {
         ir_param_add(F, &ps[i]);
     }
+    if (F->apply_args_off) {
+        /* where the stack arguments start, beside the registers the prologue saved */
+        ir_store(F, IR_I64, addr_local(F->apply_args_off), addr_local(cg->stack_param_offset(0)), 8);
+    }
+    addr_labels_begin(fdef->u.func.scope);
+    if (s->nonlocal_target) {
+        /* a nested function jumps to a label here: the stack pointer is kept for it (and everything is in memory) */
+        F->save_all = 1;
+        s->nl_sp_off = alloc_slot(8, 8);
+        {
+            int sp = ir_vreg(F, IR_I64);
+            ir_emit(F, IR_SPSAVE, IR_I64, sp, -1, -1);
+            ir_store(F, IR_I64, addr_local(s->nl_sp_off), sp, 8);
+        }
+    }
     assign_locals(fdef->u.func.body);
+    nested_functions_begin(fdef->u.func.body);
 
     /* the entry: parameters that the prologue cannot place itself */
     for (i = 0; i < nparams; i++) {
@@ -3254,7 +5223,7 @@ IRFunc *lower_function(AST *fdef) {
     F->locals_size = (-frame_off + 15) & ~15L;
 
     /* a function calling setjmp keeps every value as -O0 would, since longjmp restores registers to their old values */
-    F->noopt = all_in_memory;
+    F->noopt = all_in_memory || naddr_labels > 0 || asm_goto_seen || nested_call_seen;
     free(psyms);
     free(ps);
     f = F;

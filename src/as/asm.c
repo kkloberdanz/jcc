@@ -176,8 +176,9 @@ static int as_is_ident_start(int c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '.';
 }
 
+/* `$` inside a name, as Darwin's symbol variants have it (realpath$DARWIN_EXTSN); an x86 immediate starts with one */
 static int is_ident(int c) {
-    return as_is_ident_start(c) || (c >= '0' && c <= '9');
+    return as_is_ident_start(c) || (c >= '0' && c <= '9') || c == '$';
 }
 
 int as_tok_is(const AsmTok *t, const char *s) {
@@ -407,7 +408,11 @@ static int directive(As *a, const AsmTok *t, size_t n) {
             }
         }
         if (n == 9 && as_tok_is(&t[1], ".note.GNU") && t[2].punct == '-' && as_tok_is(&t[3], "stack") && t[4].punct == ','
-                && t[5].kind == ATOK_STRING && t[5].len == 0 && t[6].punct == ',' && t[7].punct == '@' && as_tok_is(&t[8], "progbits")) {
+                && t[5].kind == ATOK_STRING && (t[5].len == 0 || (t[5].len == 1 && t[5].s[0] == 'x'))
+                && t[6].punct == ',' && t[7].punct == '@' && as_tok_is(&t[8], "progbits")) {
+            if (t[5].len == 1) {
+                a->exec_stack = 1;
+            }
             return set_section(a, SEC_NOTE);
         }
         as_error(a, "unsupported section");
@@ -425,6 +430,14 @@ static int directive(As *a, const AsmTok *t, size_t n) {
         if (n != 2 || t[1].kind != ATOK_IDENT) goto junk;
         sym = as_symbol(a, t[1].s, t[1].len);
         a->syms[sym].global = 1;
+        a->syms[sym].weak = 1;
+        return 0;
+    }
+    if ((as_tok_is(d, ".weak_definition") || as_tok_is(d, ".weak_reference")) && a->arch->secsym != SECSYM_SECTION) {
+        /* Mach-O: N_WEAK_DEF on a definition (with .globl), N_WEAK_REF on an undefined symbol */
+        int sym;
+        if (n != 2 || t[1].kind != ATOK_IDENT) goto junk;
+        sym = as_symbol(a, t[1].s, t[1].len);
         a->syms[sym].weak = 1;
         return 0;
     }
@@ -488,9 +501,15 @@ static int directive(As *a, const AsmTok *t, size_t n) {
             it->u.diff.b = as_symbol(a, t[3].s, t[3].len);
             return 0;
         }
-        if (parse_int(t, &i, &v) != 0 || i != n) goto junk;
-        add_int(a, v, size);
-        return 0;
+        /* one number, or a list of them separated by commas */
+        for (;;) {
+            if (parse_int(t, &i, &v) != 0) goto junk;
+            add_int(a, v, size);
+            if (i == n) {
+                return 0;
+            }
+            if (t[i].kind != ATOK_PUNCT || t[i].punct != ',' || ++i == n) goto junk;
+        }
     }
     if (as_tok_is(d, ".ascii")) {
         if (n != 2 || t[1].kind != ATOK_STRING) goto junk;
@@ -984,8 +1003,8 @@ static void as_emit(As *a) {
                     const AsmSym *y = &a->syms[it->u.diff.b];
                     unsigned long v;
                     size_t k;
-                    if (x->section != sec || y->section != sec) {
-                        as_error(a, "the labels of .long %s-%s are not both in this section", x->name, y->name);
+                    if (x->section < 0 || x->section != y->section) {
+                        as_error(a, "the labels of .long %s-%s are not both in one section of this unit", x->name, y->name);
                         break;
                     }
                     v = (unsigned long)((long)x->off - (long)y->off);

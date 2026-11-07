@@ -35,6 +35,8 @@
 #define S_ATTR_SOME_INSTRUCTIONS 0x00000400ul
 #define N_EXT 0x01
 #define N_SECT 0x0e
+#define N_WEAK_REF 0x40     /* n_desc of an undefined symbol that may stay undefined */
+#define N_WEAK_DEF 0x80     /* n_desc of a definition another may replace */
 
 enum {
     ARM64_RELOC_UNSIGNED = 0,
@@ -418,7 +420,8 @@ int macho_write(As *a, char **out, size_t *out_len) {
             const AsmSym *s = tab[k];
             put32(&b, strx);
             if (s->section < 0) {
-                macho_put(&b, "\1\0\0\0", 4);         /* N_UNDF | N_EXT, no section, n_desc 0 */
+                /* N_UNDF | N_EXT, no section, n_desc 0 or N_WEAK_REF */
+                macho_put(&b, s->weak ? "\1\0\100\0" : "\1\0\0\0", 4);
                 put64(&b, 0);
             } else {
                 unsigned char t[4];
@@ -427,7 +430,7 @@ int macho_write(As *a, char **out, size_t *out_len) {
                 }
                 t[0] = (unsigned char)(N_SECT | (s->global ? N_EXT : 0));
                 t[1] = (unsigned char)(n + 1);
-                t[2] = 0;
+                t[2] = (unsigned char)(s->weak ? N_WEAK_DEF : 0);
                 t[3] = 0;
                 macho_put(&b, t, 4);
                 put64(&b, secs[n].addr + s->off);
