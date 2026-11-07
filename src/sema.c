@@ -1618,18 +1618,44 @@ static void convert_assign(AST **slot, Type *to, const char *what) {
  * arithmetic on it wraps at that width (Type.bits), and jcc does too where
  * gcc is the platform's compiler. The member keeps its declared type for
  * assignment; this is for operands.
+ *
+ * The value of an assignment, a compound assignment or a prefix ++ or -- to
+ * a bit-field, and of a comma expression ending in one, has the bit-field's
+ * type and promotes the same way, as gcc and clang have it. Postfix ++ and
+ * -- are where they differ: gcc promotes by the width, clang keeps the
+ * declared type.
  */
+static int bitfield_value_bits(const AST *e) {
+    for (;;) {
+        if (sema_is_bitfield(e)) {
+            return e->u.member.member->bits;
+        }
+        if (e->kind == N_ASSIGN) {
+            e = e->u.binary.left;
+        } else if (e->kind == N_BINARY && e->u.binary.op == OP_COMMA) {
+            e = e->u.binary.right;
+        } else if (e->kind == N_UNARY
+                   && (e->u.unary.op == OP_PREINC || e->u.unary.op == OP_PREDEC
+                       || (target->gcc && (e->u.unary.op == OP_POSTINC || e->u.unary.op == OP_POSTDEC)))) {
+            e = e->u.unary.operand;
+        } else {
+            return -1;
+        }
+    }
+}
+
 static Type *promote_bitfield(AST **slot) {
     AST *e = *slot;
     size_t int_bits;
     size_t bits;
+    int b = bitfield_value_bits(e);
     Type *p;
 
-    if (!sema_is_bitfield(e) || !type_is_integer(e->type)) {
+    if (b < 0 || !type_is_integer(e->type)) {
         return e->type;
     }
     int_bits = type_size(int_type()) * 8;
-    bits = (size_t)e->u.member.member->bits;
+    bits = (size_t)b;
     if (bits < int_bits || (bits == int_bits && !type_is_unsigned(e->type))) {
         p = int_type();
     } else if (bits == int_bits) {
@@ -1917,10 +1943,10 @@ static Type *sema_binary(AST *e) {
     }
     lt = sema_rvalue(l);
     rt = sema_rvalue(r);
-    if (sema_is_bitfield(*l)) {
+    if (bitfield_value_bits(*l) >= 0) {
         lt = promote_bitfield(l);
     }
-    if (sema_is_bitfield(*r)) {
+    if (bitfield_value_bits(*r) >= 0) {
         rt = promote_bitfield(r);
     }
 
@@ -2128,6 +2154,13 @@ static Type *sema_cond(AST *e) {
     at = sema_rvalue(a);
     bt = sema_rvalue(b);
     if (type_is_arithmetic(at) && type_is_arithmetic(bt)) {
+        /* the usual arithmetic conversions, which promote a bit-field by its width */
+        if (bitfield_value_bits(*a) >= 0) {
+            at = promote_bitfield(a);
+        }
+        if (bitfield_value_bits(*b) >= 0) {
+            bt = promote_bitfield(b);
+        }
         Type *common = type_arith_common(at, bt);
         coerce(a, common);
         coerce(b, common);
