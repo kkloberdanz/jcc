@@ -13,6 +13,11 @@
 # stage is dist/jcc.c (make amalgamation) and the driver, so jcc compiles
 # the whole library in one translation unit. JCCFLAGS (say -O1) is passed
 # to every compile of stages 2 and 3, so the optimizer builds jcc too.
+# Each stage is linked by the compiler that built it (jcc's driver runs
+# the system linker), so stage 3 is jcc throughout, and its binary must
+# match stage 2's too. When every check passes, stage 3 is kept as
+# ./jcc-selfhost (./jcc-selfhost-O1 with JCCFLAGS=-O1,
+# ./jcc-selfhost-amalgamation in that mode): a self-hosted jcc to use.
 cd "$(dirname "$0")/.." || exit 1
 mode=${1:-sources}
 . tests/target-defs.sh
@@ -29,7 +34,7 @@ build() {
     if [ "$mode" = amalgamation ]; then
         "$1" $JCCFLAGS -std=gnu89 $TARGET_DEFS -c -o "$2/jcc.o" dist/jcc.c || return 1
         "$1" $JCCFLAGS -std=gnu89 -c -o "$2/main.o" src/main.c || return 1
-        cc -o "$2/jcc" "$2/main.o" "$2/jcc.o"
+        "$1" -o "$2/jcc" "$2/main.o" "$2/jcc.o"
         return
     fi
     for src in src/*.c y.tab.c; do
@@ -47,7 +52,7 @@ build() {
     done
     rm -f "$2/libjcc.a"
     ar rcs "$2/libjcc.a" $(ls "$2"/*.o | grep -v '/main\.o$') || return 1
-    cc -o "$2/jcc" "$2/main.o" "$2/libjcc.a"
+    "$1" -o "$2/jcc" "$2/main.o" "$2/libjcc.a"
 }
 
 echo "stage 2: building jcc ($mode) with ./jcc"
@@ -63,7 +68,11 @@ for obj in "$tmp"/stage2/*.o; do
         fail=1
     fi
 done
-[ "$fail" -eq 0 ] && echo "stage 2 and stage 3 objects are identical"
+if ! cmp -s "$tmp/stage2/jcc" "$tmp/stage3/jcc"; then
+    echo "FAIL: the jcc binary differs between stage 2 and stage 3"
+    fail=1
+fi
+[ "$fail" -eq 0 ] && echo "stage 2 and stage 3 objects and binaries are identical"
 
 echo "running tests/run.sh with stage 2"
 if JCC="$tmp/stage2/jcc" sh tests/run.sh >"$tmp/run.out" 2>&1; then
@@ -82,5 +91,11 @@ else
     echo "FAIL: the JIT test against stage 2's library"
     fail=1
 fi
-[ "$fail" -eq 0 ] && echo "SELFHOST OK"
+if [ "$fail" -eq 0 ]; then
+    keep=jcc-selfhost
+    [ "$mode" = amalgamation ] && keep=$keep-amalgamation
+    [ -n "$JCCFLAGS" ] && keep=$keep$(echo $JCCFLAGS | tr -d ' ')
+    cp "$tmp/stage3/jcc" "$keep" && echo "kept stage 3 as ./$keep"
+    echo "SELFHOST OK"
+fi
 exit "$fail"

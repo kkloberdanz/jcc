@@ -185,6 +185,7 @@ TARGET_VARS=ARM64_MACOS_SYSROOT='$(ARM64_MACOS_SYSROOT)' ARM64_MACOS_RESOURCE_IN
     X86_64_LINUX_SYSROOT='$(X86_64_LINUX_SYSROOT)' X86_64_LINUX_GCC_DIR='$(X86_64_LINUX_GCC_DIR)' \
     X86_64_FREEBSD_SYSROOT='$(X86_64_FREEBSD_SYSROOT)'
 
+# jcc built by jcc, then by that build; the checks passed, the last stage is kept as ./jcc-selfhost
 .PHONY: selfhost
 selfhost: jcc
 	$(TARGET_VARS) sh tests/selfhost.sh
